@@ -28,6 +28,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+# Specify GTK version before importing to avoid PyGIWarning
+import gi
+gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gio, Gtk
 
 from dhtrack import bencode as bencode_module
@@ -204,20 +207,34 @@ def _compact_peer_decode(data: bytes) -> tuple[str, int, bool]:
 class TokenSecret:
     """Manages a rotating secret for token generation.
 
-    The secret rotates every SECRET_ROTATION_INTERVAL seconds.
-    Tokens are accepted up to TOKEN_MAX_AGE seconds old.
+    BEP 5: The secret rotates every 5 minutes. Tokens are accepted up to
+    10 minutes old, meaning we must keep the previous secret available for
+    validation during the overlap window.
+
+    The token is SHA1(ip + secret)[:20] bytes.
     """
 
     def __init__(self) -> None:
-        self._secret: bytes = os.urandom(20)
-        self._rotation_time: float = time.time()
+        self._secrets: list[tuple[float, bytes]] = []  # (rotation_time, secret)
+        self._rotate()
+
+    def _rotate(self) -> None:
+        """Generate a new secret and maintain the rotation history."""
+        self._secrets.append((time.time(), os.urandom(20)))
+        # Keep only the current and previous secret (10 minutes total)
+        now = time.time()
+        # Remove secrets older than TOKEN_MAX_AGE
+        self._secrets = [
+            (t, s) for t, s in self._secrets if now - t < TOKEN_MAX_AGE
+        ]
 
     def rotate_if_needed(self) -> None:
         """Rotate the secret if the rotation interval has elapsed."""
         now = time.time()
-        if now - self._rotation_time >= SECRET_ROTATION_INTERVAL:
-            self._secret = os.urandom(20)
-            self._rotation_time = now
+        if self._secrets:
+            last_time = self._secrets[-1][0]
+            if now - last_time >= SECRET_ROTATION_INTERVAL:
+                self._rotate()
 
     def generate_token(self, ip: str) -> bytes:
         """Generate a token for the given IP address.
@@ -236,7 +253,9 @@ class TokenSecret:
             The token (first 20 bytes of SHA1).
         """
         self.rotate_if_needed()
-        return hashlib.sha1(self._secret + ip.encode("ascii")).digest()[:20]
+        # Use the most recent secret for token generation
+        _, secret = self._secrets[-1]
+        return hashlib.sha1(secret + ip.encode("ascii")).digest()[:20]
 
     def validate_token(self, token: bytes, ip: str) -> bool:
         """Validate a token against an IP address.
@@ -246,7 +265,7 @@ class TokenSecret:
         Parameters
         ----------
         token : bytes
-            The token to validate.
+            The token to validate (must be exactly 20 bytes).
         ip : str
             The IP address to validate against.
 
@@ -255,23 +274,21 @@ class TokenSecret:
         bool
             True if the token is valid and not too old.
         """
+        if not token or len(token) != 20:
+            return False
+
         self.rotate_if_needed()
-        now = time.time()
-        max_age = TOKEN_MAX_AGE
 
-        # Check current secret
-        current_token = hashlib.sha1(self._secret + ip.encode("ascii")).digest()[:20]
-        if token == current_token:
-            return True
-
-        # Check previous secret (for tokens up to 5 minutes old)
-        # We need to keep the previous secret for TOKEN_MAX_AGE seconds
-        # For simplicity, we check if the token age is within bounds
-        elapsed = now - self._rotation_time
-        if elapsed <= SECRET_ROTATION_INTERVAL:
-            # The previous secret was active before the current one
-            # We'd need to store it, but for simplicity we just check current
-            pass
+        # Check all active secrets (current + previous)
+        for rotation_time, secret in self._secrets:
+            expected = hashlib.sha1(secret + ip.encode("ascii")).digest()[:20]
+            if token == expected:
+                # Ensure token is not older than TOKEN_MAX_AGE
+                age = time.time() - rotation_time
+                if age <= TOKEN_MAX_AGE:
+                    return True
+                # If the secret is too old, no need to check older ones
+                break
 
         return False
 
@@ -843,6 +860,7 @@ class DHTPeer:
         """Handle an incoming query from a peer.
 
         BEP 5: Process ping, find_node, get_peers, and announce_peer queries.
+        The 'v' (version) field is optional and may be used for client identification.
 
         Parameters
         ----------
@@ -850,14 +868,23 @@ class DHTPeer:
             The parsed BEncode message.
         """
         query_type = parsed.get("q")
-        transaction_id = parsed.get("t", b"")
-
-        if not transaction_id:
-            logger.debug("Missing transaction ID from %s", self.endpoint)
+        if not isinstance(query_type, (bytes, str)):
+            logger.debug("Invalid query type from %s", self.endpoint)
             return
+
+        transaction_id = parsed.get("t", b"")
+        if not transaction_id or not isinstance(transaction_id, (bytes, str)):
+            logger.debug("Missing or invalid transaction ID from %s", self.endpoint)
+            return
+
+        # Normalize transaction_id to bytes
+        if isinstance(transaction_id, str):
+            transaction_id = transaction_id.encode("latin-1")
 
         # Validate node ID length
         args = parsed.get("a", {})
+        if not isinstance(args, dict):
+            args = {}
         query_id = args.get("id", b"")
         if isinstance(query_id, str):
             query_id = query_id.encode("latin-1")
@@ -866,6 +893,9 @@ class DHTPeer:
             error_msg = _encode_dht_error(transaction_id, 203, "Invalid node ID")
             self.write(error_msg)
             return
+
+        # Handle v field - log client version if present (BEP 5 optional)
+        # We don't reject non-compliant clients based on version string
 
         if query_type in (b"ping", "ping"):
             self._handle_ping(transaction_id, args)
@@ -881,13 +911,15 @@ class DHTPeer:
             self.write(error_msg)
 
         # Update node status - received a query
-        self.dht_node.routing_table.get_nodes_by_status(NodeStatus.GOOD)
         self._mark_node_received_query()
 
     def _mark_node_received_query(self) -> None:
-        """Mark this node as having received a query (for good node tracking)."""
+        """Mark this node as having received a query (for good node tracking).
+
+        BEP 5: Increment the RPC counter to track that this node sent us a query.
+        """
         if self.node_id:
-            self.dht_node.routing_table.get_closest_nodes(self.dht_node.node_id)
+            self.dht_node.routing_table.increment_rpc_counter(self.node_id)
 
     def _handle_ping(self, transaction_id: bytes, args: dict) -> None:
         """Handle a ping query.
@@ -1221,7 +1253,8 @@ class DHTPeer:
         bytes
             The transaction ID.
         """
-        transaction_id = os.urandom(2)
+        # BEP 5: Transaction ID must be a 2-byte hex string (4 ASCII chars)
+        transaction_id = os.urandom(2).hex().encode("ascii")
         args = args or {}
         args["id"] = self.dht_node.node_id
 

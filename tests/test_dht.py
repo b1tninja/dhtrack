@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import binascii
+import os
 import socket
 import struct
 import time
@@ -237,11 +238,35 @@ class TestTokenSecret:
     def test_rotate_if_needed(self):
         """Secret should rotate after the interval."""
         ts = TokenSecret()
-        initial_secret = ts._secret
-        # Force rotation
-        ts._rotation_time = time.time() - 600  # 10 minutes ago
+        # Get initial secrets
+        initial_secrets = list(ts._secrets)
+        # Force rotation by setting a very old time
+        ts._secrets = [(time.time() - 600, ts._secrets[0][1])] if ts._secrets else []
         ts.rotate_if_needed()
-        assert ts._secret != initial_secret or ts._rotation_time > time.time() - 10
+        # Should have added a new secret
+        assert len(ts._secrets) > len(initial_secrets) or ts._secrets[0][0] > time.time() - 10
+
+    def test_token_validation_with_previous_secret(self):
+        """Tokens generated with previous secret should be valid during overlap window."""
+        ts = TokenSecret()
+        # Generate a token with current secret
+        token = ts.generate_token("127.0.0.1")
+        assert ts.validate_token(token, "127.0.0.1") is True
+
+    def test_token_10_minute_acceptance(self):
+        """Tokens from the last rotation interval should still be valid."""
+        ts = TokenSecret()
+        # Simulate having a secret from 7 minutes ago (within 10-min window but older than 5-min rotation)
+        old_secret = os.urandom(20)
+        old_time = time.time() - 420  # 7 minutes ago
+        ts._secrets.insert(0, (old_time, old_secret))
+        # Keep current secret fresh
+        ts._secrets.append((time.time(), os.urandom(20)))
+
+        # Generate token with old secret
+        import hashlib
+        token = hashlib.sha1(old_secret + b"192.168.1.1").digest()[:20]
+        assert ts.validate_token(token, "192.168.1.1") is True
 
 
 # ============================================================================
@@ -550,20 +575,30 @@ class TestKRPCMessageEncoding:
 
     def test_encode_query(self):
         """Query should include all required fields."""
-        tid = b"\x00\x01"
+        # BEP 5: transaction ID must be hex-encoded (4 ASCII chars for 2 bytes)
+        tid = b"0a1b"
         args = {"id": b"\x02" * 20}
         result = _encode_dht_query("ping", args, tid)
-        decoded = result  # In production, this would be BEncode.decode
         # Just verify it encodes without error
         assert result is not None
 
     def test_encode_query_includes_version(self):
         """Query should include the version string."""
-        tid = b"\x00\x01"
+        tid = b"0a1b"
         args = {"id": b"\x02" * 20}
         result = _encode_dht_query("ping", args, tid)
         # The version string should be in the encoded output
         assert CLIENT_VERSION_STRING.encode("ascii") in result
+
+    def test_encode_query_hex_transaction_id(self):
+        """Transaction ID should be stored as hex string in BEncode."""
+        tid = b"abcd"
+        args = {"id": b"\x02" * 20}
+        result = _encode_dht_query("ping", args, tid)
+        from dhtrack.bencode import decode
+        decoded = decode(result)
+        # Transaction ID in BEncode should match what we passed in
+        assert decoded["t"] == tid
 
     def test_encode_response(self):
         """Response should include all required fields."""
@@ -679,9 +714,12 @@ class TestDHTPeer:
         assert "UNKNOWN" in repr(peer)
 
     def test_query_creates_transaction_id(self, peer):
-        """Query should generate a transaction ID."""
+        """Query should generate a hex-encoded transaction ID (4 ASCII chars per BEP 5)."""
         tid = peer.query("ping")
-        assert len(tid) == 2
+        # BEP 5: transaction ID is a 2-byte hex string = 4 ASCII characters
+        assert len(tid) == 4
+        # Should be valid hex
+        int(tid, 16)
 
     def test_query_stores_in_queue(self, peer):
         """Query should store query info in the peer's queue."""
@@ -871,8 +909,8 @@ class TestDHTIntegration:
         endpoint = Endpoint("127.0.0.1", 6881)
         peer = DHTPeer(dht_node=mock_node, endpoint=endpoint, node_id=b"\x02" * 20)
 
-        # Create a ping query
-        tid = b"\x00\x01"
+        # Create a ping query (BEP 5: transaction ID is hex string)
+        tid = b"0a1b"
         args = {"id": b"\x02" * 20}
         query_bytes = _encode_dht_query("ping", args, tid)
 
@@ -896,7 +934,7 @@ class TestDHTIntegration:
         endpoint = Endpoint("127.0.0.1", 6881)
         peer = DHTPeer(dht_node=mock_node, endpoint=endpoint, node_id=b"\x03" * 20)
 
-        tid = b"\x00\x01"
+        tid = b"0a1b"  # BEP 5 hex-encoded transaction ID
         args = {"id": b"\x03" * 20, "target": target}
         query_bytes = _encode_dht_query("find_node", args, tid)
 
@@ -922,7 +960,7 @@ class TestDHTIntegration:
         endpoint = Endpoint("127.0.0.1", 6881)
         peer = DHTPeer(dht_node=mock_node, endpoint=endpoint, node_id=b"\x04" * 20)
 
-        tid = b"\x00\x01"
+        tid = b"0a1b"  # BEP 5 hex-encoded transaction ID
         args = {"id": b"\x04" * 20, "info_hash": info_hash}
         query_bytes = _encode_dht_query("get_peers", args, tid)
 
@@ -948,7 +986,7 @@ class TestDHTIntegration:
         endpoint = Endpoint("127.0.0.1", 6881)
         peer = DHTPeer(dht_node=mock_node, endpoint=endpoint, node_id=b"\x04" * 20)
 
-        tid = b"\x00\x01"
+        tid = b"0a1b"  # BEP 5 hex-encoded transaction ID
         args = {
             "id": b"\x04" * 20,
             "info_hash": info_hash,
@@ -977,7 +1015,7 @@ class TestDHTIntegration:
         endpoint = Endpoint("127.0.0.1", 6881)
         peer = DHTPeer(dht_node=mock_node, endpoint=endpoint, node_id=b"\x04" * 20)
 
-        tid = b"\x00\x01"
+        tid = b"0a1b"  # BEP 5 hex-encoded transaction ID
         args = {
             "id": b"\x04" * 20,
             "info_hash": b"\x02" * 20,
@@ -992,7 +1030,7 @@ class TestDHTIntegration:
 
     def test_response_encoding(self):
         """Response encoding should be valid BEncode."""
-        tid = b"\x00\x01"
+        tid = b"0a1b"  # BEP 5 hex-encoded transaction ID
         result = {"id": b"\x02" * 20, "nodes": b"\x03" * 26}
         encoded = _encode_dht_response(tid, result)
 
@@ -1004,7 +1042,7 @@ class TestDHTIntegration:
 
     def test_error_encoding(self):
         """Error encoding should be valid BEncode."""
-        tid = b"\x00\x01"
+        tid = b"0a1b"  # BEP 5 hex-encoded transaction ID
         encoded = _encode_dht_error(tid, 203, "Invalid token")
 
         from dhtrack.bencode import decode
