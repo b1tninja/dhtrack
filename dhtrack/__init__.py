@@ -179,6 +179,21 @@ from dhtrack.lsd import (
     LSD_PORT,
 )
 
+# BEP 36: Torrent RSS feeds
+from dhtrack.rss_feed import (
+    RSSFeed,
+    RSSFeedError,
+    RSSParseError,
+    TorrentFeedItem,
+    create_rss_feed,
+    create_torrent_item_rss,
+    detect_magnet_uri,
+    detect_torrent_url,
+    extract_info_hash_from_magnet,
+    parse_item,
+    parse_rss_feed,
+)
+
 # BEP 29: uTorrent Transport Protocol (uTP)
 from dhtrack.utp import (
     # Packet types
@@ -403,4 +418,16 @@ __all__ = [
     "PendingPacket",
     "UTPConnection",
     "UTPSocket",
+    # BEP 36
+    "RSSFeed",
+    "RSSFeedError",
+    "RSSParseError",
+    "TorrentFeedItem",
+    "create_rss_feed",
+    "create_torrent_item_rss",
+    "detect_magnet_uri",
+    "detect_torrent_url",
+    "extract_info_hash_from_magnet",
+    "parse_item",
+    "parse_rss_feed",
 ]
