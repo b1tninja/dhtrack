@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import random
 from contextlib import closing
 from pathlib import Path
 from typing import Any, ClassVar, Optional
@@ -184,6 +185,273 @@ class Torrent:
                             trackers.append(tracker)
 
         return trackers
+
+    # ---- BEP 12: Multitracker Metadata Extension ----
+
+    def get_raw_announce_list(self) -> Any:
+        """Get the raw announce-list value from the torrent metadata.
+
+        Returns
+        -------
+        Any
+            The raw value of the 'announce-list' key, or None if not present.
+        """
+        return self._get_key(self._normalized_dict, 'announce-list', b'announce-list')
+
+    def has_announce_list(self) -> bool:
+        """Check if the torrent uses the multitracker format (BEP 12).
+
+        Returns
+        -------
+        bool
+            True if 'announce-list' is present in the torrent metadata.
+            Per BEP 12, when present, the 'announce' key should be ignored.
+
+        Notes
+        -----
+        This checks for 'announce-list' (the standard BEP 12 key) as well
+        as 'announcelist' (legacy non-standard key).
+        """
+        if self.get_raw_announce_list() is not None:
+            return True
+        return self._get_key(self._normalized_dict, 'announcelist', b'announcelist') is not None
+
+    def set_announce_list(self, tiers: list[list[str]]) -> None:
+        """Set the announce-list for the torrent metadata.
+
+        This replaces or creates the 'announce-list' key in the torrent's
+        top-level metadata dictionary. After calling this method, the
+        torrent will use multitracker format per BEP 12.
+
+        Parameters
+        ----------
+        tiers : list[list[str]]
+            A list of tiers, where each tier is a list of tracker URL strings.
+
+        Examples
+        --------
+        Single tier with multiple trackers::
+
+            torrent.set_announce_list([
+                ["http://tracker1.com/announce", "http://tracker2.com/announce"]
+            ])
+
+        Multiple tiers with fallback::
+
+            torrent.set_announce_list([
+                ["http://primary1.com/announce", "http://primary2.com/announce"],
+                ["http://backup1.com/announce"],
+            ])
+        """
+        # Convert to bytes for BEncode compatibility
+        encoded_tiers: list[list[bytes]] = []
+        for tier in tiers:
+            encoded_tier: list[bytes] = []
+            for url in tier:
+                if isinstance(url, str):
+                    encoded_tier.append(url.encode('utf-8'))
+                elif isinstance(url, bytes):
+                    encoded_tier.append(url)
+            encoded_tiers.append(encoded_tier)
+
+        # Set on the raw dictionary (using string key for compatibility)
+        self._normalized_dict['announce-list'] = encoded_tiers
+
+        # Also set on the raw dict - try both key types
+        raw_dict = self.dict
+        raw_dict['announce-list'] = encoded_tiers
+
+    def shuffle_tier(self, tier_index: int) -> list[str]:
+        """Shuffle a specific tier and return the shuffled tracker URLs.
+
+        Per BEP 12, URLs within each tier are shuffled when first read,
+        and the shuffled order is maintained for subsequent announces.
+
+        Parameters
+        ----------
+        tier_index : int
+            The 0-based index of the tier to shuffle.
+
+        Returns
+        -------
+        list[str]
+            The shuffled tracker URLs for the specified tier.
+
+        Raises
+        ------
+        ValueError
+            If the tier_index is out of range.
+
+        Examples
+        --------
+        >>> torrent.shuffle_tier(0)  # Shuffle the first tier
+        ['http://tracker2.com/announce', 'http://tracker1.com/announce']
+        """
+        announce_list = self.get_raw_announce_list()
+        if not isinstance(announce_list, list):
+            raise ValueError("No announce-list found in torrent metadata")
+
+        if tier_index < 0 or tier_index >= len(announce_list):
+            raise ValueError(
+                f"Tier index {tier_index} out of range (0-{len(announce_list) - 1})"
+            )
+
+        tier = announce_list[tier_index]
+        if isinstance(tier, list):
+            # Extract string URLs
+            urls: list[str] = []
+            for tracker in tier:
+                if isinstance(tracker, bytes):
+                    urls.append(tracker.decode('utf-8', errors='replace'))
+                elif isinstance(tracker, str):
+                    urls.append(tracker)
+
+            # Shuffle in place (BEP 12: shuffle once on first read)
+            random.shuffle(urls)
+
+            # Update the tier in the announce-list
+            for i, url in enumerate(urls):
+                tier[i] = url.encode('utf-8') if isinstance(tier[i], bytes) else url
+
+            return urls
+
+        return []
+
+    def record_announce_success(self, tier_index: int, tracker_url: str) -> None:
+        """Record that a tracker successfully responded and move it to the front.
+
+        Per BEP 12, if a connection with a tracker is successful, the tracker
+        is moved to the front of its tier for future announces.
+
+        Parameters
+        ----------
+        tier_index : int
+            The 0-based index of the tier containing the tracker.
+        tracker_url : str
+            The URL of the tracker that successfully responded.
+
+        Raises
+        ------
+        ValueError
+            If the tier is not found or the tracker is not in the tier.
+        """
+        announce_list = self.get_raw_announce_list()
+        if not isinstance(announce_list, list):
+            raise ValueError("No announce-list found in torrent metadata")
+
+        if tier_index < 0 or tier_index >= len(announce_list):
+            raise ValueError(
+                f"Tier index {tier_index} out of range (0-{len(announce_list) - 1})"
+            )
+
+        tier = announce_list[tier_index]
+        if not isinstance(tier, list):
+            raise ValueError(f"Tier {tier_index} is not a list")
+
+        # Find the tracker URL and move to front
+        target_url = tracker_url.encode('utf-8') if isinstance(tracker_url, str) else tracker_url
+        found_index = None
+        for i, tracker in enumerate(tier):
+            tracker_str = tracker.decode('utf-8', errors='replace') if isinstance(tracker, bytes) else tracker
+            if tracker_str == tracker_url or tracker == target_url:
+                found_index = i
+                break
+
+        if found_index is None:
+            raise ValueError(
+                f"Tracker '{tracker_url}' not found in tier {tier_index}"
+            )
+
+        # Move to front
+        if found_index != 0:
+            tier.insert(0, tier.pop(found_index))
+
+    def shuffle_all_tiers(self) -> list[list[str]]:
+        """Shuffle all tiers in the announce-list.
+
+        Per BEP 12, each tier is shuffled independently when first read.
+        This method shuffles all tiers and returns the shuffled results.
+
+        Returns
+        -------
+        list[list[str]]
+            All tiers with URLs shuffled within each tier.
+
+        Raises
+        ------
+        ValueError
+            If no announce-list is found in torrent metadata.
+        """
+        announce_list = self.get_raw_announce_list()
+        if not isinstance(announce_list, list):
+            raise ValueError("No announce-list found in torrent metadata")
+
+        all_shuffled: list[list[str]] = []
+        for tier in announce_list:
+            if not isinstance(tier, list):
+                continue
+            urls: list[str] = []
+            for tracker in tier:
+                if isinstance(tracker, bytes):
+                    urls.append(tracker.decode('utf-8', errors='replace'))
+                elif isinstance(tracker, str):
+                    urls.append(tracker)
+            random.shuffle(urls)
+
+            # Update the tier in place
+            for i, url in enumerate(urls):
+                tier[i] = url.encode('utf-8') if isinstance(tier[i], bytes) else url
+
+            all_shuffled.append(urls)
+
+        return all_shuffled
+
+    @property
+    def tracker_tiers(self) -> list[list[str]]:
+        """Get the tracker URLs organized by tiers.
+
+        Returns
+        -------
+        list[list[str]]
+            A list of tiers, where each tier is a list of tracker URLs.
+            If no announce-list is present, returns a single tier with
+            the announce URL (if any).
+
+        Notes
+        -----
+        Per BEP 12, tiers are processed sequentially. URLs within each
+        tier are shuffled on first read and successful trackers move
+        to the front of their tier.
+        """
+        announce_list = self._get_key(self._normalized_dict, 'announce-list', b'announce-list')
+        if announce_list is None:
+            # Fallback to legacy key name
+            announce_list = self._get_key(self._normalized_dict, 'announcelist', b'announcelist')
+
+        if isinstance(announce_list, list):
+            tiers: list[list[str]] = []
+            for tier in announce_list:
+                if isinstance(tier, list):
+                    tier_urls: list[str] = []
+                    for tracker in tier:
+                        if isinstance(tracker, bytes):
+                            tier_urls.append(tracker.decode('utf-8', errors='replace'))
+                        elif isinstance(tracker, str):
+                            tier_urls.append(tracker)
+                    if tier_urls:
+                        tiers.append(tier_urls)
+            if tiers:
+                return tiers
+
+        # Fallback: return single announce as a single-tier list
+        announce = self._get_key(self._normalized_dict, 'announce', b'announce')
+        if announce is not None:
+            if isinstance(announce, bytes):
+                return [[announce.decode('utf-8', errors='replace')]]
+            elif isinstance(announce, str):
+                return [[announce]]
+
+        return []
 
     @property
     def file_count(self) -> int:

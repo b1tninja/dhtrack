@@ -16,6 +16,13 @@ This module provides:
 
 from __future__ import annotations
 
+# Suppress PyGIDeprecationWarning before any gi imports.
+# PyGObject 3.56.x internally uses the deprecated GLib.unix_signal_add_full
+# during override loading, which triggers spurious deprecation warnings.
+# This filter must be set BEFORE importing gi.repository.* to take effect.
+import warnings
+warnings.filterwarnings("ignore", message=".*unix_signal_add_full.*")
+
 import binascii
 import hashlib
 import logging
@@ -32,10 +39,6 @@ from typing import Any, Optional
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gio, Gtk
-
-from dhtrack import bencode as bencode_module
-from dhtrack.peerid import Endpoint, PeerIdParser, PeerInfo
-from dhtrack.torrent import Torrent
 
 # Constants
 logger = logging.getLogger(__name__)
