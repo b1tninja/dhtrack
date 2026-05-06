@@ -58,6 +58,16 @@ from dhtrack.piece_selector import (
     string_to_bitfield,
 )
 
+# BEP 48: Tracker Scrape Extension
+from dhtrack.tracker import (
+    TrackerClient,
+    TrackerError,
+    ScrapeError,
+    TrackerClientError,
+    ScrapeResponse,
+    ScrapeInfo,
+)
+
 __all__ = [
     # Peer connection
     "ExtensionNegotiator",
@@ -99,4 +109,11 @@ __all__ = [
     "Gap",
     "bitfield_to_string",
     "string_to_bitfield",
+    # BEP 48 Tracker Scrape
+    "TrackerClient",
+    "TrackerError",
+    "ScrapeError",
+    "TrackerClientError",
+    "ScrapeResponse",
+    "ScrapeInfo",
 ]
