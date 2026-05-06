@@ -14,7 +14,8 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, ClassVar, Optional
 
-from dhtrack.bencode import BEncode, BEncodeValue
+from dhtrack import bencode as bencode_module
+from dhtrack.bencode import BEncodeValue
 
 
 try:
@@ -90,7 +91,7 @@ class Torrent:
             }
 
         # Compute infohash
-        self.infohash: bytes = hashlib.sha1(BEncode.encode([b'info'])).digest()
+        self.infohash: bytes = hashlib.sha1(bencode_module.encode([b'info'])).digest()
 
     @property
     def name(self) -> Optional[str]:
@@ -161,7 +162,7 @@ class Torrent:
         Torrent
             The parsed Torrent object.
         """
-        data = BEncode.parse(buffer)
+        data = bencode_module.decode(buffer)
         return cls(data)
 
     @classmethod
@@ -197,7 +198,7 @@ class Torrent:
         bytes
             The 20-byte infohash.
         """
-        return hashlib.sha1(BEncode.encode(info)).digest()
+        return hashlib.sha1(bencode_module.encode(info)).digest()
 
     def __repr__(self) -> str:
         name = self.name or 'unknown'

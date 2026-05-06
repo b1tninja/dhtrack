@@ -26,14 +26,13 @@ from typing import Any, Optional
 
 from gi.repository import Gio, GLib, Gtk
 
-from dhtrack.bencode import BEncode
 from dhtrack.dht import (
     DHTNode,
     DHTPeer,
-    Endpoint,
     DEFAULT_BOOTSTRAP_NODES,
     DEFAULT_PEERS_FILE,
 )
+from dhtrack.peerid import Endpoint
 from dhtrack.torrent import Torrent
 
 logger = logging.getLogger(__name__)

@@ -30,13 +30,19 @@ from typing import Any, Optional
 
 from gi.repository import GLib, Gio, Gtk
 
-from dhtrack.bencode import BEncode
+from dhtrack import bencode as bencode_module
+from dhtrack.peerid import Endpoint, PeerIdParser, PeerInfo
 from dhtrack.torrent import Torrent
 
 # Constants
 logger = logging.getLogger(__name__)
 
 MTU = 1438
+
+# BEP 5 client version string identifier
+CLIENT_VERSION = b"dh"
+CLIENT_VERSION_STRING = "dh01"
+
 K = 8  # Maximum number of nodes in a bucket / closest nodes
 BUCKET_SIZE = K
 TIMEOUT = 3  # seconds before a query times out
@@ -54,12 +60,6 @@ DEFAULT_BOOTSTRAP_NODES: list[tuple[str, int]] = [
     ("router.bitcomet.com", 6881),
     ("dht.transmissionbt.com", 6881),
 ]
-
-# BEP 5 client version string identifier
-CLIENT_VERSION = b"dh"
-CLIENT_VERSION_STRING = "dh01"
-
-
 def _xor_distance(a: bytes, b: bytes) -> int:
     """Compute XOR distance between two node IDs.
 
@@ -713,7 +713,7 @@ def _encode_dht_query(method: str, args: dict[str, Any], transaction_id: bytes) 
         "a": args,
         "v": CLIENT_VERSION_STRING,
     }
-    return BEncode.encode(query)
+    return bencode_module.encode(query)
 
 
 def _encode_dht_response(transaction_id: bytes, result: dict[str, Any]) -> bytes:
@@ -737,7 +737,7 @@ def _encode_dht_response(transaction_id: bytes, result: dict[str, Any]) -> bytes
         "r": result,
         "v": CLIENT_VERSION_STRING,
     }
-    return BEncode.encode(response)
+    return bencode_module.encode(response)
 
 
 def _encode_dht_error(transaction_id: bytes, error_code: int, error_message: str) -> bytes:
@@ -768,7 +768,7 @@ def _encode_dht_error(transaction_id: bytes, error_code: int, error_message: str
         "y": "e",
         "e": [error_code, error_message],
     }
-    return BEncode.encode(error)
+    return bencode_module.encode(error)
 
 
 # ---------------------------------------------------------------------------
@@ -820,7 +820,7 @@ class DHTPeer:
             The raw received data.
         """
         try:
-            parsed = BEncode.parse(data)
+            parsed = bencode_module.decode(data)
         except Exception:
             logger.debug("Failed to parse bencoded data from %s", self.endpoint)
             return

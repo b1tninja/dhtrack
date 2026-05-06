@@ -16,7 +16,6 @@ from dhtrack.dht import (
     CLIENT_VERSION_STRING,
     DHTNode,
     DHTPeer,
-    Endpoint,
     KBucket,
     NodeStatus,
     PeerStore,
@@ -33,6 +32,7 @@ from dhtrack.dht import (
     _encode_dht_response,
     _xor_distance,
 )
+from dhtrack.peerid import Endpoint, PeerIdParser, PeerInfo
 
 
 # ============================================================================
@@ -1014,3 +1014,843 @@ class TestDHTIntegration:
         assert "e" in decoded
         assert isinstance(decoded["e"], list)
         assert decoded["e"][0] == 203
+
+
+# ============================================================================
+# PeerIdParser Tests (BEP 0020)
+# ============================================================================
+
+
+class TestPeerIdParser:
+    """Tests for the PeerIdParser class (BEP 0020)."""
+
+    def test_empty_peer_id(self):
+        """Empty peer ID should return Unknown."""
+        info = PeerIdParser.parse(b"")
+        assert info.client_name == "Unknown"
+        assert info.client_code == ""
+        assert info.peer_id_format == "unknown"
+
+    def test_none_peer_id(self):
+        """None peer ID should return Unknown."""
+        info = PeerIdParser.parse(None)
+        assert info.client_name == "Unknown"
+
+    def test_short_peer_id(self):
+        """Very short peer ID should return Unknown."""
+        info = PeerIdParser.parse(b"\x00" * 5)
+        assert info.client_name == "Unknown"
+
+    def test_raw_peer_id_preserved(self):
+        """Raw peer ID should be preserved in PeerInfo."""
+        peer_id = b"M4-3-6--\x00\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.raw_peer_id == peer_id
+
+    # --- Mainline format ---
+
+    def test_mainline_format(self):
+        """Mainline format: M4-3-6--"""
+        peer_id = b"M4-3-6--\x00\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Mainline"
+        assert info.client_code == "M"
+        assert info.peer_id_format == "mainline"
+        assert info.version == (4, 3, 6)
+
+    def test_mainline_format_newer(self):
+        """Mainline format with newer version: M4-20-8-"""
+        peer_id = b"M4-20-8-\x00\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Mainline"
+        assert info.peer_id_format == "mainline"
+        assert info.version == (4, 20, 8)
+
+    def test_mainline_format_single_digit(self):
+        """Mainline format with single digit version: M5-----"""
+        peer_id = b"M5-----\x00\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Mainline"
+        assert info.peer_id_format == "mainline"
+        assert info.version == (5,)
+
+    # --- uTorrent format ---
+
+    def test_utorrent_format(self):
+        """uTorrent format: uT0000-"""
+        peer_id = b"uT0500-\x00\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "µTorrent"
+        assert info.client_code == "uT"
+        assert info.peer_id_format == "utorrent"
+        assert info.version == (0, 5, 0)
+
+    def test_utorrent_format_v2(self):
+        """uTorrent format: uT2240-"""
+        peer_id = b"uT2240-\x00\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "µTorrent"
+        assert info.peer_id_format == "utorrent"
+        assert info.version == (2, 2, 4)
+
+    # --- Shadow/BitTornado format ---
+
+    def test_shadow_format(self):
+        """Shadow format: S58B-----"""
+        peer_id = b"S58B-----\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Shadow's client"
+        assert info.client_code == "S"
+        assert info.peer_id_format == "shadow"
+
+    def test_bittornado_format(self):
+        """BitTornado format: T4000-----"""
+        peer_id = b"T4000-----\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitTornado"
+        assert info.client_code == "T"
+        assert info.peer_id_format == "shadow"
+
+    def test_abc_format(self):
+        """ABC format: A-----"""
+        peer_id = b"A-----\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "ABC"
+        assert info.client_code == "A"
+        assert info.peer_id_format == "shadow"
+
+    def test_tribler_format(self):
+        """Tribler format: R-----"""
+        peer_id = b"R-----\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Tribler"
+        assert info.client_code == "R"
+        assert info.peer_id_format == "shadow"
+
+    # --- BitComet format ---
+
+    def test_bitcomet_format(self):
+        """BitComet format: exbc + version bytes"""
+        peer_id = b"exbc\x03\x06" + b"\x00" * 14
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitComet"
+        assert info.client_code == "exbc"
+        assert info.peer_id_format == "bitcomet"
+        assert info.version == (3, 6)
+
+    def test_bitcomet_format_v100(self):
+        """BitComet format: version 1.0.0"""
+        peer_id = b"exbc\x01\x00" + b"\x00" * 14
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitComet"
+        assert info.peer_id_format == "bitcomet"
+        assert info.version == (1, 0)
+
+    # --- BitLord format ---
+
+    def test_bitlord_format(self):
+        """BitLord format: exbcLORD + version bytes"""
+        peer_id = b"exbcLORD\x01\x00" + b"\x00" * 10
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitLord"
+        assert info.client_code == "exbc"
+        assert info.peer_id_format == "bitlord"
+        assert info.version == (1, 0)
+
+    # --- XBT format ---
+
+    def test_xbt_format(self):
+        """XBT format: XBT054d-"""
+        peer_id = b"XBT054d-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "XBT"
+        assert info.client_code == "XB"
+        assert info.peer_id_format == "xbt"
+        assert info.version == (0, 5, 4)
+        assert info.is_debug is True
+        assert info.comment == "Debug build"
+
+    def test_xbt_release_format(self):
+        """XBT release format: XBT054--"""
+        peer_id = b"XBT054--\x00\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "XBT"
+        assert info.peer_id_format == "xbt"
+        assert info.version == (0, 5, 4)
+        assert info.is_debug is False
+
+    # --- Opera format ---
+
+    def test_opera_format(self):
+        """Opera format: OP + build number"""
+        peer_id = b"OP1234" + b"\x00" * 14
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Opera"
+        assert info.client_code == "OP"
+        assert info.peer_id_format == "opera"
+        assert info.build == 1234
+
+    # --- MLdonkey format ---
+
+    def test_mldonkey_format(self):
+        """MLdonkey format: -ML2.7.2-"""
+        peer_id = b"-ML2.7.2-kgjjfkd"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "MLdonkey"
+        assert info.client_code == "ML"
+        assert info.peer_id_format == "mldonkey"
+        assert info.version == (2, 7, 2)
+
+    # --- Bits on Wheels format ---
+
+    def test_bow_format(self):
+        """Bits on Wheels format: -BOWA0C-"""
+        peer_id = b"-BOWA0C-" + b"\x00" * 8
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Bits on Wheels"
+        assert info.client_code == "BOW"
+        assert info.peer_id_format == "bow"
+        assert info.comment is not None
+
+    # --- Queen Bee format ---
+
+    def test_queenbee_format(self):
+        """Queen Bee format: Q1-0-0--"""
+        peer_id = b"Q1-0-0--\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Queen Bee"
+        assert info.client_code == "Q"
+        assert info.peer_id_format == "queenbee"
+        assert info.version == (1, 0, 0)
+
+    # --- BitTyrant format ---
+
+    def test_bittyrant_format(self):
+        """BitTyrant format: AZ2500BT + random"""
+        peer_id = b"AZ2500BT" + b"\x00" * 12
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitTyrant"
+        assert info.client_code == "BT"
+        assert info.peer_id_format == "bittyrant"
+        assert info.comment == "Azureus fork"
+
+    # --- TorrenTopia format ---
+
+    def test_torrentopia_format(self):
+        """TorrenTopia format: 346------"""
+        peer_id = b"346------\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "TorrenTopia"
+        assert info.peer_id_format == "torrentopia"
+        assert info.comment == "Claims to be Mainline 3.4.6"
+
+    # --- BitSpirit format ---
+
+    def test_bitspirit_format(self):
+        """BitSpirit format: \\0\\3BS"""
+        peer_id = b"\x00\x03BS" + b"\x00" * 16
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitSpirit"
+        assert info.client_code == "BS"
+        assert info.peer_id_format == "bitspirit"
+
+    # --- Rufus format ---
+
+    def test_rufus_format(self):
+        """Rufus format: ASCII version + RS + nickname"""
+        peer_id = b"12RS" + b"mypip" + b"\x00" * 13
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Rufus"
+        assert info.client_code == "RS"
+        assert info.peer_id_format == "rufus"
+        assert info.nickname == "mypip"
+        assert info.version == (49, 50)  # ASCII values '1' and '2'
+
+    # --- G3 Torrent format ---
+
+    def test_g3_format(self):
+        """G3 Torrent format: -G3 + nickname"""
+        peer_id = b"-G3myuser" + b"\x00" * 12
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "G3 Torrent"
+        assert info.client_code == "G3"
+        assert info.peer_id_format == "g3"
+        assert info.nickname == "myuser"
+
+    # --- FlashGet format ---
+
+    def test_flashget_format(self):
+        """FlashGet format: FG + version"""
+        peer_id = b"FG0180" + b"\x00" * 14
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "FlashGet"
+        assert info.client_code == "FG"
+        assert info.peer_id_format == "flashget"
+        assert info.version == (1, 80)
+
+    # --- AllPeers format ---
+
+    def test_allpeers_format(self):
+        """AllPeers format: AP + version + -"""
+        peer_id = b"AP123-" + b"\x00" * 14
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "AllPeers"
+        assert info.client_code == "AP"
+        assert info.peer_id_format == "allpeers"
+        assert info.version == (123,)
+
+    # --- Dash-style format ---
+
+    def test_dash_format_azureus(self):
+        """Azureus dash format: -AZ2060-"""
+        peer_id = b"-AZ2060-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Azureus"
+        assert info.client_code == "AZ"
+        assert info.peer_id_format == "dash"
+        assert info.version == (20, 60)
+
+    def test_dash_format_transmission(self):
+        """Transmission dash format: -TR2750-"""
+        peer_id = b"-TR2750-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Transmission"
+        assert info.client_code == "TR"
+        assert info.peer_id_format == "dash"
+        assert info.version == (27, 50)
+
+    def test_dash_format_deluge(self):
+        """Deluge dash format: -DE1310-"""
+        peer_id = b"-DE1310-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "DelugeTorrent"
+        assert info.client_code == "DE"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_qbittorrent(self):
+        """qBittorrent dash format: -qB4320-"""
+        peer_id = b"-qB4320-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "qBittorrent"
+        assert info.client_code == "qB"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_webtorrent(self):
+        """WebTorrent dash format: -WW1000-"""
+        peer_id = b"-WW1000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "WebTorrent"
+        assert info.client_code == "WW"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_libtorrent(self):
+        """libtorrent dash format: -LT0916-"""
+        peer_id = b"-LT0916-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "libtorrent"
+        assert info.client_code == "LT"
+        assert info.peer_id_format == "libtorrent"
+
+    def test_dash_format_utorrent_short(self):
+        """µTorrent dash format: -UT0000-"""
+        peer_id = b"-UT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "µTorrent"
+        assert info.client_code == "UT"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_shareaza(self):
+        """Shareaza dash format: -SZ0000-"""
+        peer_id = b"-SZ0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Shareaza"
+        assert info.client_code == "SZ"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_limewire(self):
+        """LimeWire dash format: -LW0000-"""
+        peer_id = b"-LW0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "LimeWire"
+        assert info.client_code == "LW"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_frostwire(self):
+        """FrostWire dash format: -FW0000-"""
+        peer_id = b"-FW0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "FrostWire"
+        assert info.client_code == "FW"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_ktorrent(self):
+        """KTorrent dash format: -KT0000-"""
+        peer_id = b"-KT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "KTorrent"
+        assert info.client_code == "KT"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_bitcomet(self):
+        """BitComet dash format: -BC0000-"""
+        peer_id = b"-BC0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitComet"
+        assert info.client_code == "BC"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_bitflu(self):
+        """Bitflu dash format: -BF0000-"""
+        peer_id = b"-BF0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Bitflu"
+        assert info.client_code == "BF"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_ares(self):
+        """Ares dash format: -AG0000-"""
+        peer_id = b"-AG0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Ares"
+        assert info.client_code == "AG"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_vagaa(self):
+        """Vagaa dash format: -VG0000-"""
+        peer_id = b"-VG0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Vagaa"
+        assert info.client_code == "VG"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_xunlei(self):
+        """Xunlei dash format: -XL0000-"""
+        peer_id = b"-XL0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Xunlei"
+        assert info.client_code == "XL"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_webtorrent_desktop(self):
+        """WebTorrent Desktop dash format: -WD0000-"""
+        peer_id = b"-WD0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "WebTorrent Desktop"
+        assert info.client_code == "WD"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_utleencher(self):
+        """uLeecher! dash format: -UL0000-"""
+        peer_id = b"-UL0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "uLeecher!"
+        assert info.client_code == "UL"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_halflife(self):
+        """Halite dash format: -HL0000-"""
+        peer_id = b"-HL0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Halite"
+        assert info.client_code == "HL"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_miro(self):
+        """Miro dash format: -MR0000-"""
+        peer_id = b"-MR0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Miro"
+        assert info.client_code == "MR"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_mono(self):
+        """MonoTorrent dash format: -MO0000-"""
+        peer_id = b"-MO0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "MonoTorrent"
+        assert info.client_code == "MO"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_pando(self):
+        """Pando dash format: -PD0000-"""
+        peer_id = b"-PD0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Pando"
+        assert info.client_code == "PD"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_gstorrent(self):
+        """GSTorrent dash format: -GS0000-"""
+        peer_id = b"-GS0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "GSTorrent"
+        assert info.client_code == "GS"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_hydranode(self):
+        """Hydranode dash format: -HN0000-"""
+        peer_id = b"-HN0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Hydranode"
+        assert info.client_code == "HN"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_kget(self):
+        """KGet dash format: -KG0000-"""
+        peer_id = b"-KG0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "KGet"
+        assert info.client_code == "KG"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_net_transport(self):
+        """Net Transport dash format: -NX0000-"""
+        peer_id = b"-NX0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Net Transport"
+        assert info.client_code == "NX"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_electric_sheep(self):
+        """electric Sheep dash format: -ES0000-"""
+        peer_id = b"-ES0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "electric Sheep"
+        assert info.client_code == "ES"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_bitbuddy(self):
+        """BitBuddy dash format: -BB0000-"""
+        peer_id = b"-BB0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitBuddy"
+        assert info.client_code == "BB"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_bitrocket(self):
+        """BitRocket dash format: -BR0000-"""
+        peer_id = b"-BR0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitRocket"
+        assert info.client_code == "BR"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_bitpump(self):
+        """BitPump dash format: -AX0000-"""
+        peer_id = b"-AX0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitPump"
+        assert info.client_code == "AX"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_enhanced_ctorrent(self):
+        """Enhanced CTorrent dash format: -CD0000-"""
+        peer_id = b"-CD0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Enhanced CTorrent"
+        assert info.client_code == "CD"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_ctorrent(self):
+        """CTorrent dash format: -CT0000-"""
+        peer_id = b"-CT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "CTorrent"
+        assert info.client_code == "CT"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_ebit(self):
+        """EBit dash format: -EB0000-"""
+        peer_id = b"-EB0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "EBit"
+        assert info.client_code == "EB"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_foxtorrent(self):
+        """FoxTorrent dash format: -FT0000-"""
+        peer_id = b"-FT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "FoxTorrent"
+        assert info.client_code == "FT"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_freelbox(self):
+        """Freebox BitTorrent dash format: -FX0000-"""
+        peer_id = b"-FX0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Freebox BitTorrent"
+        assert info.client_code == "FX"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_moopolic(self):
+        """MooPolice dash format: -MP0000-"""
+        peer_id = b"-MP0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "MooPolice"
+        assert info.client_code == "MP"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_propagate(self):
+        """Propagate Data Client dash format: -DP0000-"""
+        peer_id = b"-DP0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Propagate Data Client"
+        assert info.client_code == "DP"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_qqdownload(self):
+        """QQDownload dash format: -QD0000-"""
+        peer_id = b"-QD0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "QQDownload"
+        assert info.client_code == "QD"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_qt4torrent(self):
+        """Qt 4 Torrent example dash format: -QT0000-"""
+        peer_id = b"-QT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Qt 4 Torrent example"
+        assert info.client_code == "QT"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_retriever(self):
+        """Retriever dash format: -RT0000-"""
+        peer_id = b"-RT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Retriever"
+        assert info.client_code == "RT"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_swiftbit(self):
+        """Swiftbit dash format: -SB0000-"""
+        peer_id = b"-SB0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Swiftbit"
+        assert info.client_code == "SB"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_swarmscope(self):
+        """SwarmScope dash format: -SS0000-"""
+        peer_id = b"-SS0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "SwarmScope"
+        assert info.client_code == "SS"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_symtorrent(self):
+        """SymTorrent dash format: -ST0000-"""
+        peer_id = b"-ST0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "SymTorrent"
+        assert info.client_code == "ST"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_torrentdotnet(self):
+        """TorrentDotNET dash format: -TN0000-"""
+        peer_id = b"-TN0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "TorrentDotNET"
+        assert info.client_code == "TN"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_torrentstorm(self):
+        """Torrentstorm dash format: -TS0000-"""
+        peer_id = b"-TS0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Torrentstorm"
+        assert info.client_code == "TS"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_toutu(self):
+        """TuoTu dash format: -TT0000-"""
+        peer_id = b"-TT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "TuoTu"
+        assert info.client_code == "TT"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_xan_torrent(self):
+        """XanTorrent dash format: -XT0000-"""
+        peer_id = b"-XT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "XanTorrent"
+        assert info.client_code == "XT"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_xtorrent(self):
+        """Xtorrent dash format: -XX0000-"""
+        peer_id = b"-XX0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Xtorrent"
+        assert info.client_code == "XX"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_ziptorrent(self):
+        """ZipTorrent dash format: -ZT0000-"""
+        peer_id = b"-ZT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "ZipTorrent"
+        assert info.client_code == "ZT"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_arctic(self):
+        """Arctic dash format: -AR0000-"""
+        peer_id = b"-AR0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Arctic"
+        assert info.client_code == "AR"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_avicora(self):
+        """Avicora dash format: -AV0000-"""
+        peer_id = b"-AV0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Avicora"
+        assert info.client_code == "AV"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_btg(self):
+        """BTG (Rasterbar libtorrent) dash format: -BG0000-"""
+        peer_id = b"-BG0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BTG"
+        assert info.client_code == "BG"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_btslave(self):
+        """BTSlave dash format: -BS0000-"""
+        peer_id = b"-BS0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BTSlave"
+        assert info.client_code == "BS"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_bittorrent_x(self):
+        """Bittorrent X dash format: -BX0000-"""
+        peer_id = b"-BX0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Bittorrent X"
+        assert info.client_code == "BX"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_shareaza_alpha(self):
+        """Shareaza alpha/beta dash format: -S~0000-"""
+        peer_id = b"-S~0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Shareaza"
+        assert info.client_code == "S~"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_lphant(self):
+        """Lphant dash format: -LP0000-"""
+        peer_id = b"-LP0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "Lphant"
+        assert info.client_code == "LP"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_lh_abc(self):
+        """LH-ABC dash format: -LH0000-"""
+        peer_id = b"-LH0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "LH-ABC"
+        assert info.client_code == "LH"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_sharktorrent(self):
+        """sharktorrent dash format: -st0000-"""
+        peer_id = b"-st0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "sharktorrent"
+        assert info.client_code == "st"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_firetorrent(self):
+        """FireTorrent dash format: -WY0000-"""
+        peer_id = b"-WY0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "FireTorrent"
+        assert info.client_code == "WY"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_bitlet(self):
+        """BitLet dash format: -WT0000-"""
+        peer_id = b"-WT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "BitLet"
+        assert info.client_code == "WT"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_utorrent_web(self):
+        """µTorrent Web dash format: -UW0000-"""
+        peer_id = b"-UW0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "µTorrent Web"
+        assert info.client_code == "UW"
+        assert info.peer_id_format == "dash"
+
+    def test_dash_format_moonlight(self):
+        """MoonlightTorrent dash format: -MT0000-"""
+        peer_id = b"-MT0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "MoonlightTorrent"
+        assert info.client_code == "MT"
+        assert info.peer_id_format == "dash"
+
+    def test_libtorrent_lt_format(self):
+        """libTorrent (lowercase lt) format: -lt0000-"""
+        peer_id = b"-lt0000-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.client_name == "libTorrent"
+        assert info.client_code == "lt"
+        assert info.peer_id_format == "libtorrent"
+
+    # --- identify() method ---
+
+    def test_identify_mainline(self):
+        """identify() should return human-readable string."""
+        peer_id = b"M4-3-6--\x00\x00\x00\x00\x00\x00\x00\x00"
+        result = PeerIdParser.identify(peer_id)
+        assert "Mainline" in result
+        assert "v4" in result
+
+    def test_identify_utorrent(self):
+        """identify() for uTorrent."""
+        peer_id = b"uT0500-\x00\x00\x00\x00\x00\x00\x00\x00"
+        result = PeerIdParser.identify(peer_id)
+        assert "µTorrent" in result
+
+    def test_identify_xbt_debug(self):
+        """identify() for XBT debug build."""
+        peer_id = b"XBT054d-\x00\x00\x00\x00\x00\x00\x00"
+        result = PeerIdParser.identify(peer_id)
+        assert "XBT" in result
+        assert "debug" in result
+
+    def test_identify_unknown(self):
+        """identify() for unknown format."""
+        peer_id = b"\x00" * 20
+        result = PeerIdParser.identify(peer_id)
+        assert "Unknown" in result
+
+    # --- Client map completeness ---
+
+    def test_client_map_has_expected_clients(self):
+        """CLIENT_MAP should contain well-known clients."""
+        expected = {"AZ", "TR", "DE", "UT", "qB", "LT", "WW", "TR", "BC", "SZ"}
+        for code in expected:
+            assert code in PeerIdParser.CLIENT_MAP, f"{code} not in CLIENT_MAP"
+
+    def test_dash_style_detection(self):
+        """Dash-style peer IDs should be detected by format."""
+        peer_id = b"-AZ2060-\x00\x00\x00\x00\x00\x00\x00"
+        info = PeerIdParser.parse(peer_id)
+        assert info.peer_id_format == "dash"
+
+    def test_known_dash_clients_set(self):
+        """DASH_CLIENTS should contain known codes."""
+        assert "AZ" in PeerIdParser.DASH_CLIENTS
+        assert "TR" in PeerIdParser.DASH_CLIENTS
+        assert "DE" in PeerIdParser.DASH_CLIENTS
