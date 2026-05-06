@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         PEXManager,
         PeerConnection,
     )
+    from dhtrack.peerid import Endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -406,21 +407,35 @@ class HolePunchExtension(Extension):
 
     This extension enables peers behind NAT to establish
     direct connections through a relay.
+
+    Message types (BEP 55):
+        0x00 - rendezvous: initiate holepunch via relay
+        0x01 - connect: instruct peer to connect to another peer
+        0x02 - error: report failure
+
+    The extension uses binary payload format per BEP 55 spec.
     """
 
     NAME = ExtensionType.HOLEPUNCH
-    SUPPORTED_MSG_TYPES = {1, 2, 3}  # CONNECT, CONNECTRESP, FAIL
+    SUPPORTED_MSG_TYPES = {0, 1, 2}  # RENDEZVOUS, CONNECT, ERROR
 
-    def __init__(self, holepunch_handler: HolePunchHandler) -> None:
+    def __init__(
+        self,
+        holepunch_handler: HolePunchHandler,
+        is_relay: bool = False,
+    ) -> None:
         """Initialize the holepunch extension.
 
         Parameters
         ----------
         holepunch_handler : HolePunchHandler
             The holepunch handler instance.
+        is_relay : bool
+            Whether this peer acts as a relaying peer.
         """
         super().__init__()
         self._handler = holepunch_handler
+        self._is_relay = is_relay
 
     def create_handshake_payload(self) -> dict[str, Any]:
         """Create the handshake payload.
@@ -432,30 +447,142 @@ class HolePunchExtension(Extension):
         """
         return {}
 
+    def on_handshake(self, data: bytes) -> bool:
+        """Handle an incoming handshake.
+
+        Parameters
+        ----------
+        data : bytes
+            The handshake data.
+
+        Returns
+        -------
+        bool
+            True always (holepunch has no handshake payload).
+        """
+        return True
+
     def on_message(self, msg_type: int, payload: bytes) -> Optional[bytes]:
-        """Handle an incoming holepunch message.
+        """Handle an incoming binary holepunch message (BEP 55).
 
         Parameters
         ----------
         msg_type : int
-            Message type (1=CONNECT, 2=CONNECTRESP, 3=FAIL).
+            Message type: 0=RENDEZVOUS, 1=CONNECT, 2=ERROR.
         payload : bytes
-            The message payload.
+            The binary message payload.
 
         Returns
         -------
         bytes or None
-            Response if applicable.
+            Response payload if applicable (error responses).
         """
         try:
-            from dhtrack import bencode as bencode_module
-            result = self._handler.handle_holepunch(payload)
-            if result.get("type") == "connect":
-                # We would initiate the holepunch connection here
-                logger.info("Holepunch connect requested for peer")
+            if msg_type == 0:  # RENDEZVOUS
+                # This is a relay receiving a rendezvous request
+                if not self._is_relay:
+                    return None
+                decoded, _ = self._handler.handle_rendezvous(payload)
+                # The relay checks if it's connected to the target and
+                # sends connect messages to both sides
+                # Response is handled by the caller via the decoded data
+                return None
+
+            elif msg_type == 1:  # CONNECT
+                decoded = self._handler.handle_connect(payload)
+                # The callback on_holepunch_connect handles the connection
+                return None
+
+            elif msg_type == 2:  # ERROR
+                decoded = self._handler.handle_error(payload)
+                # Error is stored, no response needed
+                return None
+
         except Exception as exc:
             logger.debug("Error handling holepunch message: %s", exc)
         return None
+
+    def create_rendezvous(self, target_ip: str, target_port: int) -> bytes:
+        """Create a rendezvous message payload.
+
+        Parameters
+        ----------
+        target_ip : str
+            Target peer's IP address.
+        target_port : int
+            Target peer's port.
+
+        Returns
+        -------
+        bytes
+            Binary rendezvous message.
+        """
+        return self._handler.create_rendezvous_message(target_ip, target_port)
+
+    def create_connect(self, peer_ip: str, peer_port: int) -> bytes:
+        """Create a connect message payload.
+
+        Parameters
+        ----------
+        peer_ip : str
+            Peer's IP address to connect to.
+        peer_port : int
+            Peer's port.
+
+        Returns
+        -------
+        bytes
+            Binary connect message.
+        """
+        return self._handler.create_connect_message(peer_ip, peer_port)
+
+    def create_error(
+        self,
+        ip: str,
+        port: int,
+        err_code: int,
+    ) -> bytes:
+        """Create an error message payload.
+
+        Parameters
+        ----------
+        ip : str
+            The endpoint IP (echoed back).
+        port : int
+            The endpoint port (echoed back).
+        err_code : int
+            Error code.
+
+        Returns
+        -------
+        bytes
+            Binary error message.
+        """
+        return self._handler.create_error_message(ip, port, err_code)
+
+    def set_relay_mode(self, is_relay: bool) -> None:
+        """Set whether this peer acts as a relay.
+
+        Parameters
+        ----------
+        is_relay : bool
+            True if this peer should process rendezvous messages.
+        """
+        self._is_relay = is_relay
+
+    def set_callback(
+        self,
+        callback,
+    ) -> None:
+        """Set the connect callback.
+
+        Parameters
+        ----------
+        callback : callable or None
+            Callback invoked when a CONNECT message is received.
+            Signature: callback(target_ip, target_port, is_ipv6)
+        """
+        self._handler.on_holepunch_connect = callback
 
 
 # ---------------------------------------------------------------------------

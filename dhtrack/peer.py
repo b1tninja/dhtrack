@@ -334,12 +334,164 @@ MAX_PEX_PEERS = 50
 
 UT_HOLEPUNCH = b"ut_holepunch"
 
-HOLEPUNCH_CONNECT = 1
-HOLEPUNCH_CONNECTRESP = 2
-HOLEPUNCH_FAIL = 3
+# Message types (BEP 55)
+HOLEPUNCH_RENDEZVOUS = 0x00
+HOLEPUNCH_CONNECT = 0x01
+HOLEPUNCH_ERROR = 0x02
 
-HOLEPUNCH_ECN_ENABLE = 0
-HOLEPUNCH_ECN_DISABLE = 1
+# Error codes (BEP 55)
+HOLEPUNCH_ERR_NO_PEER = 0x01
+HOLEPUNCH_ERR_NOT_CONNECTED = 0x02
+HOLEPUNCH_ERR_NO_SUPPORT = 0x03
+HOLEPUNCH_ERR_NO_SELF = 0x04
+
+# Address types (BEP 55)
+HOLEPUNCH_ADDR_IPV4 = 0x00
+HOLEPUNCH_ADDR_IPV6 = 0x01
+
+# Minimum and maximum message sizes
+HOLEPUNCH_MSG_MIN_SIZE = 9   # 1 + 1 + 4 + 2 + 1 (min for ipv4, no err_code)
+HOLEPUNCH_MSG_MIN_SIZE_V6 = 13  # 1 + 1 + 16 + 2 (ipv6, no err_code)
+HOLEPUNCH_MSG_WITH_ERROR = 13  # 9 + 4 bytes err_code for ipv4
+HOLEPUNCH_MSG_WITH_ERROR_V6 = 17  # 13 + 4 bytes err_code for ipv6
+
+
+# ---------------------------------------------------------------------------
+# BEP 55: Hole Punch binary payload encoding/decoding
+# ---------------------------------------------------------------------------
+
+
+def encode_holepunch_message(
+    msg_type: int,
+    target_ip: str,
+    target_port: int,
+    err_code: int = 0,
+) -> bytes:
+    """Encode a BEP 55 holepunch message payload.
+
+    Binary format:
+        msg_type (1 byte)
+        addr_type (1 byte): 0x00 for IPv4, 0x01 for IPv6
+        addr (4 bytes for IPv4, 16 bytes for IPv6)
+        port (2 bytes, big-endian)
+        err_code (4 bytes, big-endian, only in error messages)
+
+    Parameters
+    ----------
+    msg_type : int
+        Message type: HOLEPUNCH_RENDEZVOUS (0x00), HOLEPUNCH_CONNECT (0x01),
+        or HOLEPUNCH_ERROR (0x02).
+    target_ip : str
+        Target IP address (IPv4 or IPv6).
+    target_port : int
+        Target port number (0-65535).
+    err_code : int
+        Error code (only used when msg_type is HOLEPUNCH_ERROR).
+
+    Returns
+    -------
+    bytes
+        Encoded binary payload.
+
+    Raises
+    ------
+    ExtensionError
+        If the message is malformed.
+    """
+    if msg_type not in (HOLEPUNCH_RENDEZVOUS, HOLEPUNCH_CONNECT, HOLEPUNCH_ERROR):
+        raise ExtensionError(f"Invalid holepunch message type: {msg_type}")
+
+    if target_port < 0 or target_port > 65535:
+        raise ExtensionError(f"Invalid port number: {target_port}")
+
+    # Determine address type from IP string
+    try:
+        # Try IPv4 first
+        addr_bytes = socket.inet_aton(target_ip)
+        addr_type = HOLEPUNCH_ADDR_IPV4
+    except OSError:
+        try:
+            addr_bytes = socket.inet_pton(socket.AF_INET6, target_ip)
+            addr_type = HOLEPUNCH_ADDR_IPV6
+        except OSError:
+            raise ExtensionError(f"Invalid IP address: {target_ip}")
+
+    payload = bytearray()
+    payload.append(msg_type)
+    payload.append(addr_type)
+    payload.extend(addr_bytes)
+    payload.extend(struct.pack("!H", target_port))
+
+    if msg_type == HOLEPUNCH_ERROR:
+        payload.extend(struct.pack("!I", err_code))
+
+    return bytes(payload)
+
+
+def decode_holepunch_message(data: bytes) -> dict[str, Any]:
+    """Decode a BEP 55 holepunch message payload.
+
+    Parameters
+    ----------
+    data : bytes
+        The binary payload bytes.
+
+    Returns
+    -------
+    dict[str, Any]
+        Dictionary with keys: msg_type, addr_type, ip, port, err_code.
+
+    Raises
+    ------
+    ExtensionError
+        If the message is malformed.
+    """
+    if len(data) < 7:
+        raise ExtensionError(f"Holepunch message too short: {len(data)} bytes (minimum 7)")
+
+    msg_type = data[0]
+    if msg_type not in (HOLEPUNCH_RENDEZVOUS, HOLEPUNCH_CONNECT, HOLEPUNCH_ERROR):
+        raise ExtensionError(f"Invalid holepunch message type: {msg_type}")
+
+    addr_type = data[1]
+    if addr_type not in (HOLEPUNCH_ADDR_IPV4, HOLEPUNCH_ADDR_IPV6):
+        raise ExtensionError(f"Invalid holepunch address type: {addr_type}")
+
+    if addr_type == HOLEPUNCH_ADDR_IPV4:
+        # IPv4: msg_type(1) + addr_type(1) + ip(4) + port(2) = 8 bytes
+        if len(data) < 8:
+            raise ExtensionError(
+                f"IPv4 holepunch message too short: {len(data)} bytes (minimum 8)"
+            )
+        ip = socket.inet_ntop(socket.AF_INET, data[2:6])
+        port = struct.unpack("!H", data[6:8])[0]
+        err_code = 0
+        if msg_type == HOLEPUNCH_ERROR and len(data) >= 12:
+            err_code = struct.unpack("!I", data[8:12])[0]
+    else:  # IPv6
+        # IPv6: msg_type(1) + addr_type(1) + ip(16) + port(2) = 20 bytes
+        if len(data) < 20:
+            raise ExtensionError(
+                f"IPv6 holepunch message too short: {len(data)} bytes (minimum 20)"
+            )
+        ip = socket.inet_ntop(socket.AF_INET6, data[2:18])
+        port = struct.unpack("!H", data[18:20])[0]
+        err_code = 0
+        if msg_type == HOLEPUNCH_ERROR and len(data) >= 24:
+            err_code = struct.unpack("!I", data[20:24])[0]
+
+    result: dict[str, Any] = {
+        "msg_type": msg_type,
+        "addr_type": addr_type,
+        "ip": ip,
+        "port": port,
+    }
+
+    if msg_type == HOLEPUNCH_ERROR:
+        result["err_code"] = err_code
+
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Extension Protocol Errors
@@ -1122,124 +1274,244 @@ class PEXManager:
 class HolePunchHandler:
     """Handles BEP 55 NAT holepunching.
 
+    The holepunch protocol enables peers behind NAT/firewall to connect
+    via a relaying peer. The flow is:
+
+    1. Initiating peer sends rendezvous to relay (with target's endpoint)
+    2. Relay sends connect to both peers
+    3. Both peers initiate uTP connection to each other
+
     Attributes
     ----------
+    peer_id : bytes
+        This peer's 20-byte peer ID.
+    endpoint : Endpoint
+        This peer's network endpoint.
     pending_requests : dict[bytes, dict]
         Pending holepunch requests keyed by request ID.
+    on_holepunch_connect : callable or None
+        Callback invoked when a CONNECT message is received.
+        Signature: ``callback(target_ip, target_port, is_ipv6)``
     """
 
+    peer_id: bytes = field(default_factory=lambda: b"")
+    endpoint: Optional[Endpoint] = None
     pending_requests: dict[bytes, dict] = field(default_factory=dict)
+    on_holepunch_connect: Optional[Any] = None
 
-    def create_holepunch_message(
+    def create_rendezvous_message(
         self,
-        target_peer_id: bytes,
-        request_id: bytes,
-        message_type: int = HOLEPUNCH_CONNECT,
-        target_ip: Optional[str] = None,
-        target_port: Optional[int] = None,
+        target_ip: str,
+        target_port: int,
     ) -> bytes:
-        """Create a holepunch message (BEP 55).
+        """Create a BEP 55 rendezvous message payload.
+
+        Sent by the initiating peer to the relaying peer, requesting
+        a connection to the target peer.
 
         Parameters
         ----------
-        target_peer_id : bytes
-            The target peer's 20-byte peer ID.
-        request_id : bytes
-            A unique request identifier.
-        message_type : int
-            Message type: HOLEPUNCH_CONNECT (1), HOLEPUNCH_CONNECTRESP (2),
-            or HOLEPUNCH_FAIL (3).
-        target_ip : str, optional
-            Target IP address (for CONNECT messages).
-        target_port : int, optional
-            Target port (for CONNECT messages).
+        target_ip : str
+            Target peer's IP address (IPv4 or IPv6).
+        target_port : int
+            Target peer's port number.
 
         Returns
         -------
         bytes
-            Bencoded holepunch message.
+            Binary rendezvous message payload.
+
+        Raises
+        ------
+        ExtensionError
+            If parameters are invalid.
         """
-        msg = {
-            "msg_type": message_type,
-            "reqid": request_id,
-            "target_peer": target_peer_id,
-        }
+        return encode_holepunch_message(
+            HOLEPUNCH_RENDEZVOUS, target_ip, target_port
+        )
 
-        if message_type == HOLEPUNCH_CONNECT and target_ip and target_port:
-            if ":" in target_ip:
-                msg["target_ip"] = socket.inet_pton(socket.AF_INET6, target_ip)
-            else:
-                msg["target_ip"] = socket.inet_aton(target_ip)
-            msg["target_port"] = struct.pack("!H", target_port)
+    def create_connect_message(
+        self,
+        peer_ip: str,
+        peer_port: int,
+    ) -> bytes:
+        """Create a BEP 55 connect message payload.
 
-        return bencode_module.encode(msg)
+        Sent to both peers to instruct them to connect to each other.
 
-    def handle_holepunch(self, data: bytes) -> dict[str, Any]:
-        """Process an incoming holepunch message.
+        Parameters
+        ----------
+        peer_ip : str
+            The peer IP to connect to.
+        peer_port : int
+            The peer port to connect to.
+
+        Returns
+        -------
+        bytes
+            Binary connect message payload.
+
+        Raises
+        ------
+        ExtensionError
+            If parameters are invalid.
+        """
+        return encode_holepunch_message(
+            HOLEPUNCH_CONNECT, peer_ip, peer_port
+        )
+
+    def create_error_message(
+        self,
+        target_ip: str,
+        target_port: int,
+        err_code: int,
+    ) -> bytes:
+        """Create a BEP 55 error message payload.
+
+        Sent when a rendezvous or connect request cannot be fulfilled.
+
+        Parameters
+        ----------
+        target_ip : str
+            The endpoint that caused the error (echoed back).
+        target_port : int
+            The port that caused the error (echoed back).
+        err_code : int
+            Error code: HOLEPUNCH_ERR_NO_PEER, HOLEPUNCH_ERR_NOT_CONNECTED,
+            HOLEPUNCH_ERR_NO_SUPPORT, or HOLEPUNCH_ERR_NO_SELF.
+
+        Returns
+        -------
+        bytes
+            Binary error message payload.
+
+        Raises
+        ------
+        ExtensionError
+            If parameters are invalid.
+        """
+        return encode_holepunch_message(
+            HOLEPUNCH_ERROR, target_ip, target_port, err_code
+        )
+
+    def handle_rendezvous(self, data: bytes) -> tuple[dict[str, Any], Optional[bytes]]:
+        """Handle an incoming rendezvous message.
+
+        Parses the rendezvous message and returns the decoded data.
+        The caller should check if connected to the target peer and
+        send a connect message back, or an error if not possible.
 
         Parameters
         ----------
         data : bytes
-            Bencoded holepunch message.
+            The raw binary rendezvous message.
 
         Returns
         -------
-        dict[str, Any]
-            Parsed holepunch message data.
+        tuple[dict[str, Any], Optional[bytes]]
+            A tuple of (decoded_data, response_message).
+            response_message is None if no response needed (caller handles).
+            decoded_data contains ip, port of the target peer.
 
         Raises
         ------
         ExtensionError
             If the message is malformed.
         """
-        try:
-            parsed = bencode_module.decode(data)
-        except Exception as exc:
-            raise ExtensionError(f"Failed to decode holepunch message: {exc}") from exc
+        decoded = decode_holepunch_message(data)
 
-        if not isinstance(parsed, dict):
-            raise ExtensionError("Holepunch message is not a dictionary")
+        if decoded["msg_type"] != HOLEPUNCH_RENDEZVOUS:
+            raise ExtensionError(
+                f"Expected rendezvous message, got type {decoded['msg_type']}"
+            )
 
-        msg_type = parsed.get("msg_type")
-        if msg_type == HOLEPUNCH_CONNECT:
-            self.pending_requests[parsed.get("reqid", b"")] = {
-                "type": "connect",
-                "target_peer": parsed.get("target_peer"),
-                "target_ip": parsed.get("target_ip"),
-                "target_port": struct.unpack("!H", parsed.get("target_port", b"\x00\x00"))[0],
-            }
-        elif msg_type == HOLEPUNCH_CONNECTRESP:
-            self.pending_requests[parsed.get("reqid", b"")] = {
-                "type": "connect_response",
-                "peer_ip": parsed.get("peer_ip"),
-                "peer_port": struct.unpack("!H", parsed.get("peer_port", b"\x00\x00"))[0],
-            }
-        elif msg_type == HOLEPUNCH_FAIL:
-            self.pending_requests[parsed.get("reqid", b"")] = {
-                "type": "fail",
-                "reason": parsed.get("reason", "unknown"),
-            }
+        return decoded, None
 
-        return parsed
+    def handle_connect(self, data: bytes) -> dict[str, Any]:
+        """Handle an incoming connect message.
 
-    def cancel_request(self, request_id: bytes) -> bytes:
-        """Create a CANCEL message for a pending request.
+        Parses the connect message and invokes the on_holepunch_connect
+        callback if set.
 
         Parameters
         ----------
-        request_id : bytes
-            The request ID to cancel.
+        data : bytes
+            The raw binary connect message.
 
         Returns
         -------
-        bytes
-            Bencoded cancel message.
+        dict[str, Any]
+            Decoded message data with ip, port keys.
+
+        Raises
+        ------
+        ExtensionError
+            If the message is malformed.
         """
-        return bencode_module.encode({
-            "msg_type": HOLEPUNCH_FAIL,
-            "reqid": request_id,
-            "reason": "cancelled",
-        })
+        decoded = decode_holepunch_message(data)
+
+        if decoded["msg_type"] != HOLEPUNCH_CONNECT:
+            raise ExtensionError(
+                f"Expected connect message, got type {decoded['msg_type']}"
+            )
+
+        # Invoke callback if set
+        if self.on_holepunch_connect:
+            is_ipv6 = decoded["addr_type"] == HOLEPUNCH_ADDR_IPV6
+            try:
+                self.on_holepunch_connect(decoded["ip"], decoded["port"], is_ipv6)
+            except Exception as exc:
+                logger.debug("Error in on_holepunch_connect callback: %s", exc)
+
+        return decoded
+
+    def handle_error(self, data: bytes) -> dict[str, Any]:
+        """Handle an incoming error message.
+
+        Parses the error message and stores the result in pending_requests.
+
+        Parameters
+        ----------
+        data : bytes
+            The raw binary error message.
+
+        Returns
+        -------
+        dict[str, Any]
+            Decoded message data with ip, port, err_code keys.
+
+        Raises
+        ------
+        ExtensionError
+            If the message is malformed.
+        """
+        decoded = decode_holepunch_message(data)
+
+        if decoded["msg_type"] != HOLEPUNCH_ERROR:
+            raise ExtensionError(
+                f"Expected error message, got type {decoded['msg_type']}"
+            )
+
+        return decoded
+
+    def is_self_address(self, ip: str, port: int) -> bool:
+        """Check if the given address belongs to this peer.
+
+        Parameters
+        ----------
+        ip : str
+            IP address to check.
+        port : int
+            Port to check.
+
+        Returns
+        -------
+        bool
+            True if the address matches this peer's endpoint.
+        """
+        if self.endpoint is None:
+            return False
+        return self.endpoint.ip == ip and self.endpoint.port == port
 
 
 # ---------------------------------------------------------------------------
