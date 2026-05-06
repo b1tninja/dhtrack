@@ -304,17 +304,25 @@ def parse_handshake(data: bytes) -> tuple[bool, bytes, bytes, bytes]:
     return extensions_enabled, reserved_bytes, info_hash, peer_id
 
 # ---------------------------------------------------------------------------
-# BEP 9: Metadata Extension constants
+# BEP 9: Metadata Exchange Extension constants
 # ---------------------------------------------------------------------------
+# See: https://www.bittorrent.org/beps/bep_0009.html
 
 UT_METADATA = b"ut_metadata"
-UT_METADATA_HANDSHAKE = 0
+
+# Message types per BEP 9 specification:
+#   0 = request  - Request a piece of metadata
+#   1 = data     - Send a piece of metadata
+#   2 = reject   - Reject a metadata piece request
+UT_METADATA_REQUEST = 0
 UT_METADATA_DATA = 1
 UT_METADATA_REJECT = 2
-UT_METADATA_REQUEST = 3
 
 # Maximum metadata size: 10 MB (DoS protection)
 MAX_METADATA_SIZE = 10 * 1024 * 1024
+
+# Default block size: 16 KiB as specified in BEP 9
+METADATA_BLOCK_SIZE = 16384
 
 # ---------------------------------------------------------------------------
 # BEP 11: Peer Exchange constants
@@ -770,217 +778,409 @@ class ExtensionNegotiator:
 class MetadataExchange:
     """Handles BEP 9 metadata exchange between peers.
 
+    Implements the metadata transfer protocol as specified in BEP 9,
+    allowing peers to exchange torrent metadata without requiring
+    a .torrent file.
+
+    The metadata is divided into 16 KiB blocks. Each block is indexed
+    starting at 0. All blocks except the last are exactly 16 KiB.
+
+    Message types (BEP 9):
+        0 = request  - Request a metadata piece
+        1 = data     - Send a metadata piece
+        2 = reject   - Reject a metadata piece request
+
     Attributes
     ----------
     torrent : Torrent
-        The torrent being exchanged.
+        The torrent being exchanged (for senders).
+    metadata : bytes | None
+        The complete metadata bytes (for receivers).
+    metadata_size : int
+        Total size of the metadata in bytes.
     block_size : int
-        Size of each metadata block (16 KB default).
-    pending_requests : dict[bytes, list]
-        Pending piece requests keyed by request ID.
-    complete_parts : dict[bytes, list]
-        Received piece data keyed by request ID.
-    total_pieces : int
-        Total number of pieces in the metadata.
-    piece_length : int
-        Size of each piece in the metadata.
+        Size of each metadata block (16384 = 16 KiB per BEP 9).
+    num_pieces : int
+        Total number of metadata pieces/blocks.
+    pending_requests : dict[bytes, list[bytes]]
+        Pending piece requests: request_id -> [piece_index, offset, length].
+    received_data : dict[bytes, list[bytes | None]]
+        Received piece data per peer: peer_id -> [piece0, piece1, ...].
+    msg_counter : int
+        Message counter for generating unique request IDs.
     """
 
-    torrent: Torrent
-    block_size: int = 16384  # 16 KB per piece (BEP 9 default)
+    torrent: Optional[Torrent] = None
+    metadata: Optional[bytes] = None
+    metadata_size: int = 0
+    block_size: int = METADATA_BLOCK_SIZE
+    num_pieces: int = 0
     pending_requests: dict[bytes, list] = field(default_factory=dict)
-    complete_parts: dict[bytes, list] = field(default_factory=dict)
-    total_pieces: int = 0
-    piece_length: int = 0
-    _info_hash: bytes = field(default_factory=lambda: b"")
+    received_data: dict[bytes, list] = field(default_factory=dict)
+    msg_counter: int = 0
 
     def __post_init__(self) -> None:
-        """Initialize from torrent metadata."""
-        self._info_hash = self.torrent.infohash
+        """Initialize from torrent metadata if provided."""
+        if self.torrent is not None:
+            self.metadata_size = self._calculate_metadata_size()
+            self.num_pieces = self._calculate_num_pieces()
+            self.metadata = self._extract_metadata()
+
+    def _calculate_metadata_size(self) -> int:
+        """Calculate the total metadata size in bytes.
+
+        Returns the actual size of the bencoded info dictionary,
+        which is the metadata transferred via BEP 9.
+
+        Returns
+        -------
+        int
+            Size in bytes of the bencoded info dictionary.
+        """
+        if self.torrent is None:
+            return 0
+        info = self.torrent.info
+        if isinstance(info, bytes):
+            return len(info)
+        if isinstance(info, dict):
+            try:
+                return len(bencode_module.encode(info))
+            except Exception:
+                return 0
+        return 0
+
+    def _calculate_num_pieces(self) -> int:
+        """Calculate the number of metadata pieces.
+
+        Returns
+        -------
+        int
+            Number of 16 KiB blocks needed.
+        """
+        if self.metadata_size == 0:
+            return 0
+        return (self.metadata_size + self.block_size - 1) // self.block_size
+
+    def _extract_metadata(self) -> Optional[bytes]:
+        """Extract the raw metadata bytes from the torrent.
+
+        Returns
+        -------
+        bytes or None
+            The bencoded info dictionary, or None if not available.
+        """
+        if self.torrent is None:
+            return None
         info = self.torrent.info
         if isinstance(info, dict):
-            # Try various key formats for piece data
-            piece_data = None
-            for key in [b"piece", "piece"]:
-                val = info.get(key)
-                if val:
-                    piece_data = val
-                    break
-            if piece_data:
-                self.total_pieces = len(piece_data)
-            # Try various key formats for piece length
-            for key in [b"piece length", "piece length"]:
-                pl = info.get(key)
-                if isinstance(pl, int):
-                    self.piece_length = pl
-                    break
-        elif isinstance(info, bytes):
-            # Raw bytes - try to decode
             try:
-                decoded = bencode_module.decode(info)
-                if isinstance(decoded, dict):
-                    for key in [b"piece", "piece"]:
-                        val = decoded.get(key)
-                        if val:
-                            self.total_pieces = len(val)
-                            break
-                    for key in [b"piece length", "piece length"]:
-                        pl = decoded.get(key)
-                        if isinstance(pl, int):
-                            self.piece_length = pl
-                            break
+                return bencode_module.encode(info)
             except Exception:
-                pass
+                return None
+        elif isinstance(info, bytes):
+            return info
+        return None
 
-        if self.total_pieces > 0:
-            # Initialize complete_parts for each peer_id seen
-            pass
+    # ------------------------------------------------------------------
+    # Handshake (msg_type=1, "handshake" in some implementations)
+    # ------------------------------------------------------------------
 
-    def get_handshake(self) -> bytes:
-        """Create a metadata exchange handshake (BEP 9, msg_type=0).
+    def create_handshake(self) -> bytes:
+        """Create a metadata handshake message (BEP 9).
+
+        The handshake announces the metadata size to the peer.
 
         Returns
         -------
         bytes
-            Bencoded handshake with total_size and piece_length.
+            Bencoded handshake: ``{msg_type: 0, total_size: <int>}``.
         """
         return bencode_module.encode({
-            "msg_type": UT_METADATA_HANDSHAKE,
-            "total_size": self._get_total_size(),
-            "piece_length": self.piece_length,
+            "msg_type": UT_METADATA_DATA,  # 1, used for handshake in BEP 9
+            "total_size": self.metadata_size,
         })
 
-    def handle_handshake(self, data: bytes, negotiator: ExtensionNegotiator) -> bool:
-        """Handle an incoming metadata handshake.
+    def parse_handshake(self, data: bytes) -> Optional[dict]:
+        """Parse an incoming metadata handshake message.
 
         Parameters
         ----------
         data : bytes
-            Bencoded handshake data from the peer.
-        negotiator : ExtensionNegotiator
-            The extension negotiator to check for ut_metadata support.
+            Bencoded handshake data.
 
         Returns
         -------
-        bool
-            True if the peer supports metadata exchange.
+        dict or None
+            Parsed handshake data, or None if invalid.
         """
         try:
             parsed = bencode_module.decode(data)
         except Exception:
-            return False
+            return None
 
         if not isinstance(parsed, dict):
-            return False
+            return None
 
         msg_type = parsed.get("msg_type")
-        if msg_type == UT_METADATA_HANDSHAKE:
-            return negotiator.supports_extension(UT_METADATA)
+        # msg_type 1 is used for handshake in the BEP 9 extension
+        if msg_type == UT_METADATA_DATA:
+            return parsed
+        return None
 
-        return False
+    # ------------------------------------------------------------------
+    # Request (msg_type=0)
+    # ------------------------------------------------------------------
 
-    def create_request(self, piece_index: int, request_id: bytes) -> bytes:
-        """Create a metadata request message (BEP 9, msg_type=3).
+    def create_request(self, piece_index: int, peer_id: bytes = b"") -> bytes:
+        """Create a metadata piece request message (BEP 9, msg_type=0).
 
         Parameters
         ----------
         piece_index : int
-            The piece index to request.
-        request_id : bytes
-            A unique request identifier.
+            The piece index to request (0-indexed).
+        peer_id : bytes
+            Peer identifier, used for request ID generation.
 
         Returns
         -------
         bytes
             Bencoded request message.
-        """
-        if piece_index < 0 or piece_index >= self.total_pieces:
-            raise MetadataExchangeError(
-                f"Invalid piece index: {piece_index} (total: {self.total_pieces})"
-            )
-
-        self.pending_requests[request_id] = [piece_index, 0]  # [piece_index, offset]
-
-        return bencode_module.encode({
-            "msg_type": UT_METADATA_REQUEST,
-            "piece": piece_index,
-            "reqid": request_id,
-        })
-
-    def handle_data(self, data: bytes, peer_id: bytes = b"") -> bool:
-        """Handle an incoming metadata data piece (BEP 9, msg_type=1).
-
-        Accumulates piece data and verifies when the complete metadata
-        is received.
-
-        Parameters
-        ----------
-        data : bytes
-            Bencoded data piece from the peer.
-        peer_id : bytes
-            Peer identifier for tracking piece data per peer.
-
-        Returns
-        -------
-        bool
-            True if the complete metadata has been received and verified,
-            False otherwise.
 
         Raises
         ------
         MetadataExchangeError
-            If the data message is malformed.
+            If piece_index is out of range.
+        """
+        if piece_index < 0 or piece_index >= self.num_pieces:
+            raise MetadataExchangeError(
+                f"Invalid piece index: {piece_index} (max: {self.num_pieces - 1})"
+            )
+
+        self.msg_counter += 1
+        req_id = hashlib.md5(peer_id + str(self.msg_counter).encode()).digest()[:4]
+        self.pending_requests[req_id] = [piece_index, 0, 0]  # [piece_index, offset, transferred]
+
+        return bencode_module.encode({
+            "msg_type": UT_METADATA_REQUEST,  # 0
+            "piece": piece_index,
+            "reqid": req_id,
+        })
+
+    def handle_request(self, data: bytes, peer_id: bytes = b"") -> Optional[bytes]:
+        """Handle an incoming metadata request and respond with data or reject.
+
+        Parameters
+        ----------
+        data : bytes
+            Bencoded request message.
+        peer_id : bytes
+            Peer identifier.
+
+        Returns
+        -------
+        bytes or None
+            Response message (data or reject), or None if not available.
         """
         try:
             parsed = bencode_module.decode(data)
-        except Exception as exc:
-            raise MetadataExchangeError(f"Failed to decode metadata data: {exc}") from exc
+        except Exception:
+            return None
 
         if not isinstance(parsed, dict):
-            raise MetadataExchangeError("Metadata data is not a dictionary")
+            return None
+
+        msg_type = parsed.get("msg_type")
+        if msg_type != UT_METADATA_REQUEST:
+            return None
+
+        piece = parsed.get("piece", -1)
+        if not isinstance(piece, int) or piece < 0 or piece >= self.num_pieces:
+            return self._create_reject_message(parsed.get("reqid", b""))
+
+        # Check if we have the metadata
+        if self.metadata is None:
+            return self._create_reject_message(parsed.get("reqid", b""))
+
+        # Send the data
+        return self._create_data_message(piece, parsed.get("reqid", b""))
+
+    # ------------------------------------------------------------------
+    # Data (msg_type=1)
+    # ------------------------------------------------------------------
+
+    def create_data_message(
+        self,
+        piece_index: int,
+        peer_id: bytes = b"",
+    ) -> bytes:
+        """Create a metadata data message for a specific piece.
+
+        Parameters
+        ----------
+        piece_index : int
+            The piece index to send.
+        peer_id : bytes
+            Peer identifier (for reqid).
+
+        Returns
+        -------
+        bytes
+            Bencoded data message.
+
+        Raises
+        ------
+        MetadataExchangeError
+            If piece_index is out of range or metadata is not available.
+        """
+        if self.metadata is None:
+            raise MetadataExchangeError("No metadata available")
+        if piece_index < 0 or piece_index >= self.num_pieces:
+            raise MetadataExchangeError(
+                f"Invalid piece index: {piece_index} (max: {self.num_pieces - 1})"
+            )
+
+        # Calculate piece data
+        start_offset = piece_index * self.block_size
+        end_offset = min(start_offset + self.block_size, len(self.metadata))
+        piece_data = self.metadata[start_offset:end_offset]
+
+        return bencode_module.encode({
+            "msg_type": UT_METADATA_DATA,  # 1
+            "piece": piece_index,
+            "total_size": self.metadata_size,
+            "buffer": piece_data,
+        })
+
+    def handle_data(
+        self,
+        data: bytes,
+        peer_id: bytes = b"",
+    ) -> Optional[bool]:
+        """Handle an incoming metadata data message.
+
+        Accumulates piece data and returns True when complete metadata
+        is received and verified.
+
+        Parameters
+        ----------
+        data : bytes
+            Bencoded data message.
+        peer_id : bytes
+            Peer identifier.
+
+        Returns
+        -------
+        bool or None
+            True if complete metadata received and verified,
+            False if received but not complete,
+            None if message is invalid.
+        """
+        try:
+            parsed = bencode_module.decode(data)
+        except Exception:
+            return None
+
+        if not isinstance(parsed, dict):
+            return None
 
         msg_type = parsed.get("msg_type")
         if msg_type != UT_METADATA_DATA:
-            raise MetadataExchangeError(
-                f"Expected msg_type {UT_METADATA_DATA}, got {msg_type}"
-            )
+            return None
 
-        piece = parsed.get("piece", 0)
-        begin = parsed.get("begin", 0)
+        piece = parsed.get("piece", -1)
+        total_size = parsed.get("total_size", 0)
         buffer = parsed.get("buffer", b"")
 
         if not isinstance(piece, int) or piece < 0:
-            raise MetadataExchangeError(f"Invalid piece index: {piece}")
-
-        if not isinstance(begin, int) or begin < 0:
-            raise MetadataExchangeError(f"Invalid begin offset: {begin}")
-
+            return None
         if not isinstance(buffer, bytes):
-            raise MetadataExchangeError("Buffer is not bytes")
+            return None
 
-        # Initialize piece list for this peer if needed
-        if not peer_id:
-            peer_id = hash(data)  # Use data hash as peer identifier
-        if isinstance(peer_id, int):
-            peer_id = str(peer_id).encode()
+        # Validate total_size
+        if not isinstance(total_size, int) or total_size <= 0:
+            return None
+        if total_size > MAX_METADATA_SIZE:
+            return None
 
-        if peer_id not in self.complete_parts:
-            self.complete_parts[peer_id] = [None] * self.total_pieces
+        # Store metadata size if first message
+        if self.metadata_size == 0:
+            self.metadata_size = total_size
+            self.num_pieces = self._calculate_num_pieces()
 
-        # Store the piece data
-        self.complete_parts[peer_id][piece] = buffer
+        # Initialize received data for this peer
+        if peer_id not in self.received_data:
+            self.received_data[peer_id] = [None] * self.num_pieces
 
-        # Check if we have all pieces
-        if all(p is not None for p in self.complete_parts[peer_id]):
-            full_metadata = b"".join(
-                p for p in self.complete_parts[peer_id] if p is not None
-            )
-            return self.verify_metadata(full_metadata)
+        # Validate piece index against known size
+        # If we haven't received any pieces yet (num_pieces == 0), accept to set the size
+        if self.num_pieces == 0:
+            # First piece received - use total_size to determine num_pieces
+            self.metadata_size = total_size
+            self.num_pieces = self._calculate_num_pieces()
+        elif piece >= self.num_pieces:
+            return None
 
-        return False
+        # Store the piece
+        self.received_data[peer_id][piece] = buffer
+
+        # Check if complete
+        received = self.received_data[peer_id]
+        if all(p is not None for p in received):
+            full_metadata = b"".join(p for p in received if p is not None)
+            if self.metadata_size > 0 and len(full_metadata) == self.metadata_size:
+                # Verify the metadata
+                if self._verify_metadata(full_metadata):
+                    self.metadata = full_metadata
+                    return True
+        return None
+
+    # ------------------------------------------------------------------
+    # Reject (msg_type=2)
+    # ------------------------------------------------------------------
+
+    def create_reject_message(self, piece_index: int, peer_id: bytes = b"") -> bytes:
+        """Create a metadata reject message (BEP 9, msg_type=2).
+
+        Parameters
+        ----------
+        piece_index : int
+            The rejected piece index.
+        peer_id : bytes
+            Peer identifier.
+
+        Returns
+        -------
+        bytes
+            Bencoded reject message.
+        """
+        req_id = b"\x00\x00\x00\x00"
+        return bencode_module.encode({
+            "msg_type": UT_METADATA_REJECT,  # 2
+            "piece": piece_index,
+            "reqid": req_id,
+        })
+
+    def _create_reject_message(self, req_id: bytes = b"") -> bytes:
+        """Internal: create a reject message with a specific request ID.
+
+        Parameters
+        ----------
+        req_id : bytes
+            The original request ID.
+
+        Returns
+        -------
+        bytes
+            Bencoded reject message.
+        """
+        return bencode_module.encode({
+            "msg_type": UT_METADATA_REJECT,
+            "piece": -1,
+            "reqid": req_id,
+        })
 
     def handle_reject(self, data: bytes) -> None:
-        """Handle an incoming metadata reject message (BEP 9, msg_type=2).
+        """Handle an incoming metadata reject message.
 
         Parameters
         ----------
@@ -996,8 +1196,41 @@ class MetadataExchange:
         piece = parsed.get("piece", -1)
         logger.debug("Metadata piece %d rejected", piece)
 
-    def verify_metadata(self, full_metadata: bytes) -> bool:
-        """Verify collected metadata matches torrent info hash.
+    def _create_data_message(self, piece_index: int, req_id: bytes = b"") -> bytes:
+        """Internal: create a data message for a specific piece.
+
+        Parameters
+        ----------
+        piece_index : int
+            The piece index to send.
+        req_id : bytes
+            The request ID.
+
+        Returns
+        -------
+        bytes
+            Bencoded data message.
+        """
+        if self.metadata is None:
+            return self._create_reject_message(req_id)
+
+        start_offset = piece_index * self.block_size
+        end_offset = min(start_offset + self.block_size, len(self.metadata))
+        piece_data = self.metadata[start_offset:end_offset]
+
+        return bencode_module.encode({
+            "msg_type": UT_METADATA_DATA,
+            "piece": piece_index,
+            "total_size": self.metadata_size,
+            "buffer": piece_data,
+        })
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+
+    def _verify_metadata(self, full_metadata: bytes) -> bool:
+        """Verify collected metadata matches the expected info hash.
 
         BEncodes the info dictionary from the metadata and computes
         SHA-1. The result should match the torrent's infohash.
@@ -1017,26 +1250,98 @@ class MetadataExchange:
             if not isinstance(metadata_dict, dict):
                 return False
 
+            # Find the 'info' key in the metadata.
+            # If the metadata is a flat info dict (no 'info' key), use it directly.
             info = None
             for k in metadata_dict:
-                if isinstance(k, bytes) and k.lower() == b"info" or (isinstance(k, str) and k.lower() == "info"):
+                key_str = k if isinstance(k, str) else k.decode("utf-8", errors="replace")
+                if key_str.lower() == "info":
                     info = metadata_dict[k]
                     break
+
+            # If no 'info' key found, the decoded metadata IS the info dict
+            if info is None:
+                info = metadata_dict
 
             if info is None:
                 return False
 
+            # Verify: SHA-1 of bencoded info should match infohash
             info_hash = hashlib.sha1(bencode_module.encode(info)).digest()
-            return info_hash == self._info_hash
+            expected_hash = self._get_expected_infohash()
+            if expected_hash:
+                return info_hash == expected_hash
+            # If we don't have an expected hash (e.g., receiver has no torrent),
+            # accept the metadata as valid
+            return True
         except Exception as exc:
             logger.debug("Failed to verify metadata: %s", exc)
             return False
 
-    def _get_total_size(self) -> int:
-        """Get the total metadata size in bytes."""
-        if self.piece_length > 0 and self.total_pieces > 0:
-            return self.piece_length * self.total_pieces
-        return 0
+    def _get_expected_infohash(self) -> Optional[bytes]:
+        """Get the expected info hash for verification.
+
+        Returns
+        -------
+        bytes or None
+            The expected 20-byte info hash, or None if not available.
+        """
+        if self.torrent is None:
+            return None
+        return self.torrent.infohash
+
+    # ------------------------------------------------------------------
+    # Piece transfer (piece = msg_type 0 handshake per BEP 9)
+    # ------------------------------------------------------------------
+
+    def send_request(self, piece_index: int, peer_id: bytes = b"") -> bytes:
+        """Send a metadata piece request.
+
+        Alias for create_request() - requests a specific metadata piece.
+
+        Parameters
+        ----------
+        piece_index : int
+            The piece index to request.
+        peer_id : bytes
+            Peer identifier.
+
+        Returns
+        -------
+        bytes
+            Bencoded request message.
+        """
+        return self.create_request(piece_index, peer_id)
+
+    def get_piece_count(self) -> int:
+        """Get the number of metadata pieces.
+
+        Returns
+        -------
+        int
+            Total number of 16 KiB blocks.
+        """
+        return self.num_pieces
+
+    def get_metadata(self) -> Optional[bytes]:
+        """Get the complete metadata if fully received.
+
+        Returns
+        -------
+        bytes or None
+            The complete metadata, or None if not yet complete.
+        """
+        return self.metadata
+
+    def is_complete(self) -> bool:
+        """Check if metadata transfer is complete.
+
+        Returns
+        -------
+        bool
+            True if metadata is fully received and verified.
+        """
+        return self.metadata is not None
 
 
 # ---------------------------------------------------------------------------

@@ -264,10 +264,15 @@ class MetadataExtension(Extension):
 
     This extension enables peers to exchange torrent metadata
     (the info dictionary) without using a tracker.
+
+    Message types (BEP 9):
+        0 = request  - Request a metadata piece
+        1 = data     - Send a metadata piece
+        2 = reject   - Reject a metadata piece request
     """
 
     NAME = ExtensionType.METADATA
-    SUPPORTED_MSG_TYPES = {0, 1, 2, 3}  # HANDSHAKE, DATA, REJECT, REQUEST
+    SUPPORTED_MSG_TYPES = {0, 1, 2}  # REQUEST, DATA, REJECT
 
     def __init__(self, metadata: MetadataExchange) -> None:
         """Initialize the metadata extension.
@@ -286,11 +291,10 @@ class MetadataExtension(Extension):
         Returns
         -------
         dict[str, Any]
-            Payload with total_size and piece_length.
+            Payload with total_size from the metadata exchange.
         """
         return {
-            "total_size": self._metadata._get_total_size(),
-            "piece_length": self._metadata.piece_length,
+            "total_size": self._metadata.metadata_size,
         }
 
     def on_handshake(self, data: bytes) -> bool:
@@ -304,14 +308,10 @@ class MetadataExtension(Extension):
         Returns
         -------
         bool
-            True if accepted.
+            True if the handshake was valid.
         """
-        try:
-            from dhtrack import bencode as bencode_module
-            parsed = bencode_module.decode(data)
-            return isinstance(parsed, dict)
-        except Exception:
-            return False
+        parsed = self._metadata.parse_handshake(data)
+        return parsed is not None
 
     def on_message(self, msg_type: int, payload: bytes) -> Optional[bytes]:
         """Handle an incoming message.
@@ -319,7 +319,7 @@ class MetadataExtension(Extension):
         Parameters
         ----------
         msg_type : int
-            Message type (0=HANDSHAKE, 1=DATA, 2=REJECT, 3=REQUEST).
+            Message type: 0=request, 1=data, 2=reject.
         payload : bytes
             The message payload.
 
@@ -328,15 +328,68 @@ class MetadataExtension(Extension):
         bytes or None
             Response payload if applicable.
         """
-        if msg_type == 1:  # DATA
+        if msg_type == 0:  # REQUEST
+            try:
+                return self._metadata.handle_request(payload)
+            except Exception as exc:
+                logger.debug("Error handling metadata request: %s", exc)
+                return None
+        elif msg_type == 1:  # DATA
             try:
                 from dhtrack import bencode as bencode_module
                 result = self._metadata.handle_data(payload)
-                if result:
+                if result is True:
                     return bencode_module.encode({"status": "complete"})
             except Exception as exc:
                 logger.debug("Error handling metadata data: %s", exc)
+        elif msg_type == 2:  # REJECT
+            self._metadata.handle_reject(payload)
         return None
+
+    def create_request(self, piece_index: int) -> bytes:
+        """Create a metadata piece request message.
+
+        Parameters
+        ----------
+        piece_index : int
+            The piece index to request.
+
+        Returns
+        -------
+        bytes
+            Bencoded request message.
+        """
+        return self._metadata.create_request(piece_index)
+
+    def create_data_message(self, piece_index: int) -> bytes:
+        """Create a metadata data message for a specific piece.
+
+        Parameters
+        ----------
+        piece_index : int
+            The piece index to send.
+
+        Returns
+        -------
+        bytes
+            Bencoded data message.
+        """
+        return self._metadata.create_data_message(piece_index)
+
+    def create_reject_message(self, piece_index: int) -> bytes:
+        """Create a metadata reject message.
+
+        Parameters
+        ----------
+        piece_index : int
+            The rejected piece index.
+
+        Returns
+        -------
+        bytes
+            Bencoded reject message.
+        """
+        return self._metadata.create_reject_message(piece_index)
 
 
 class PEXExtension(Extension):

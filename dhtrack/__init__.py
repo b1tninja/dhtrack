@@ -58,14 +58,26 @@ from dhtrack.piece_selector import (
     string_to_bitfield,
 )
 
+# BEP 15: UDP Tracker Protocol
+from dhtrack.udp_tracker import (
+    UDPTrackerClient,
+    TrackerError,
+    TrackerConnectionError,
+    TrackerProtocolError,
+    TrackerResponseError,
+    TrackerClientError,
+    IPPeer,
+    AnnounceEvent,
+    AnnounceRequest,
+    AnnounceResponse,
+    ScrapeInfo,
+    ScrapeResponse,
+)
+
 # BEP 48: Tracker Scrape Extension
 from dhtrack.tracker import (
     TrackerClient,
-    TrackerError,
     ScrapeError,
-    TrackerClientError,
-    ScrapeResponse,
-    ScrapeInfo,
 )
 
 __all__ = [
@@ -109,11 +121,20 @@ __all__ = [
     "Gap",
     "bitfield_to_string",
     "string_to_bitfield",
+    # BEP 15 UDP Tracker
+    "UDPTrackerClient",
+    "TrackerError",
+    "TrackerConnectionError",
+    "TrackerProtocolError",
+    "TrackerResponseError",
+    "TrackerClientError",
+    "IPPeer",
+    "AnnounceEvent",
+    "AnnounceRequest",
+    "AnnounceResponse",
+    "ScrapeInfo",
+    "ScrapeResponse",
     # BEP 48 Tracker Scrape
     "TrackerClient",
-    "TrackerError",
     "ScrapeError",
-    "TrackerClientError",
-    "ScrapeResponse",
-    "ScrapeInfo",
 ]
