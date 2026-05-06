@@ -1016,9 +1016,11 @@ class DHTPeer:
         """Mark this node as having received a query (for good node tracking).
 
         BEP 5: Increment the RPC counter to track that this node sent us a query.
+        BEP 32: Use the correct routing table based on the peer's address family.
         """
         if self.node_id:
-            self.dht_node.routing_table.increment_rpc_counter(self.node_id)
+            rt = self.dht_node._get_routing_table(self.endpoint.is_ipv6)
+            rt.increment_rpc_counter(self.node_id)
 
     def _handle_ping(self, transaction_id: bytes, args: dict) -> None:
         """Handle a ping query.
@@ -1033,7 +1035,11 @@ class DHTPeer:
         """Handle a find_node query.
 
         BEP 5: Respond with the target node or K closest nodes to the target.
+        BEP 32: Include nodes6 when the request includes 'n6' in want or
+        the request came from IPv6.
         """
+        from dhtrack.bep32 import parse_want, WANT_N4, WANT_N6
+
         target = args.get("target", b"")
         if isinstance(target, str):
             target = target.encode("latin-1")
@@ -1043,23 +1049,49 @@ class DHTPeer:
             self.write(error_msg)
             return
 
-        # Get K closest nodes to the target
-        closest_nodes = self.dht_node.routing_table.get_closest_nodes(target, K)
+        # Determine response format per BEP-32
+        want = parse_want(args)
+        has_want = bool(want)
 
-        if closest_nodes:
-            nodes_data = b"".join(
-                _compact_node_encode(
-                    n.node_id,
-                    n.endpoint.ip,
-                    n.endpoint.port,
-                    n.endpoint.is_ipv6,
-                )
-                for n in closest_nodes
-            )
-            response = {"id": self.dht_node.node_id, "nodes": nodes_data}
+        if has_want:
+            include_n4 = WANT_N4 in want
+            include_n6 = WANT_N6 in want
         else:
-            # Return empty nodes if no nodes found
-            response = {"id": self.dht_node.node_id, "nodes": b""}
+            # Default: nodes for IPv4 requests, nodes6 for IPv6
+            include_n4 = not self.endpoint.is_ipv6
+            include_n6 = self.endpoint.is_ipv6
+
+        response: dict[str, Any] = {"id": self.dht_node.node_id}
+
+        if include_n4:
+            closest_nodes = self.dht_node.routing_table_v4.get_closest_nodes(target, K)
+            if closest_nodes:
+                response["nodes"] = b"".join(
+                    _compact_node_encode(
+                        n.node_id,
+                        n.endpoint.ip,
+                        n.endpoint.port,
+                        n.endpoint.is_ipv6,
+                    )
+                    for n in closest_nodes
+                )
+            else:
+                response["nodes"] = b""
+
+        if include_n6:
+            closest_nodes6 = self.dht_node.routing_table_v6.get_closest_nodes(target, K)
+            if closest_nodes6:
+                response["nodes6"] = b"".join(
+                    _compact_node_encode(
+                        n.node_id,
+                        n.endpoint.ip,
+                        n.endpoint.port,
+                        n.endpoint.is_ipv6,
+                    )
+                    for n in closest_nodes6
+                )
+            else:
+                response["nodes6"] = b""
 
         resp_bytes = _encode_dht_response(transaction_id, response)
         self.write(resp_bytes)
@@ -1070,12 +1102,17 @@ class DHTPeer:
         BEP 5: Respond with peers for the infohash, or closest nodes if no peers,
         plus a token for announce_peer.
 
+        BEP 32: Include nodes6 when the request includes 'n6' in want or
+        the request came from IPv6.  Include nodes for IPv4 requests similarly.
+
         BEP 33: If scrape=1 is set, include bloom filter fields (BFsd, BFpe) in
         the response when database entries exist for the infohash.
 
         BEP 33: If noseed=1 is set, try to fill the values list with non-seed
         items on a best-effort basis.
         """
+        from dhtrack.bep32 import parse_want, WANT_N4, WANT_N6
+
         info_hash = args.get("info_hash", b"")
         if isinstance(info_hash, str):
             info_hash = info_hash.encode("latin-1")
@@ -1102,57 +1139,62 @@ class DHTPeer:
         # Check our peer store for peers
         peers = self.dht_node.peer_store.get_peers(info_hash)
 
-        # If scrape=1 and we have entries, include bloom filters (BEP 33)
+        response: dict[str, Any] = {"id": self.dht_node.node_id, "token": token}
+
         if scrape and peers:
             bf_seed = self.dht_node.peer_store.get_seed_bloom_filter(info_hash)
             bf_peer = self.dht_node.peer_store.get_peer_bloom_filter(info_hash)
-
-            response = {
-                "id": self.dht_node.node_id,
-                "token": token,
-            }
             if bf_seed:
                 response["BFsd"] = bf_seed.to_bytes()
             if bf_peer:
                 response["BFpe"] = bf_peer.to_bytes()
+        elif peers:
+            values = []
+            for peer in peers:
+                peer_data = _compact_peer_encode(peer.ip, peer.port, peer.is_ipv6)
+                values.append(peer_data)
+            response["values"] = values
         else:
-            # Standard get_peers response
-            if peers:
-                values = []
-                for peer in peers:
-                    peer_data = _compact_peer_encode(peer.ip, peer.port, peer.is_ipv6)
-                    values.append(peer_data)
+            # No peers - return node info based on BEP-32 rules
+            want = parse_want(args)
+            has_want = bool(want)
 
-                # If noseed=1, we would filter out seeds here on a best-effort
-                # basis (requires knowing which are seeds vs peers)
-                response = {
-                    "id": self.dht_node.node_id,
-                    "values": values,
-                    "token": token,
-                }
+            if has_want:
+                include_n4 = WANT_N4 in want
+                include_n6 = WANT_N6 in want
             else:
-                # Return closest nodes instead
-                closest_nodes = self.dht_node.routing_table.get_closest_nodes(info_hash, K)
-                if closest_nodes:
-                    nodes_data = b"".join(
+                include_n4 = not self.endpoint.is_ipv6
+                include_n6 = self.endpoint.is_ipv6
+
+            if include_n4:
+                closest_v4 = self.dht_node.routing_table_v4.get_closest_nodes(info_hash, K)
+                if closest_v4:
+                    response["nodes"] = b"".join(
                         _compact_node_encode(
                             n.node_id,
                             n.endpoint.ip,
                             n.endpoint.port,
                             n.endpoint.is_ipv6,
                         )
-                        for n in closest_nodes
+                        for n in closest_v4
                     )
-                    response = {
-                        "id": self.dht_node.node_id,
-                        "nodes": nodes_data,
-                        "token": token,
-                    }
                 else:
-                    response = {
-                        "id": self.dht_node.node_id,
-                        "token": token,
-                    }
+                    response["nodes"] = b""
+
+            if include_n6:
+                closest_v6 = self.dht_node.routing_table_v6.get_closest_nodes(info_hash, K)
+                if closest_v6:
+                    response["nodes6"] = b"".join(
+                        _compact_node_encode(
+                            n.node_id,
+                            n.endpoint.ip,
+                            n.endpoint.port,
+                            n.endpoint.is_ipv6,
+                        )
+                        for n in closest_v6
+                    )
+                else:
+                    response["nodes6"] = b""
 
         resp_bytes = _encode_dht_response(transaction_id, response)
         self.write(resp_bytes)
@@ -1466,10 +1508,15 @@ class DHTNode:
     """DHT node that participates in the BitTorrent Kademlia network.
 
     Manages socket connections, peer discovery, and peer storage.
-    Implements the full Kademlia routing table protocol per BEP 5.
+    Implements the full Kademlia routing table protocol per BEP 5 and BEP 32.
 
     Per BEP-27, a DHT node MUST NOT perform DHT operations (find_node,
     get_peers, announce_peer) for private torrents.
+
+    Per BEP-32, this node maintains separate IPv4 and IPv6 DHT routing tables
+    with independent query semantics. During steady-state operation, IPv4 nodes
+    only exchange IPv4 node info and IPv6 nodes only exchange IPv6 node info,
+    unless the requestor explicitly asks for both via the "want" parameter.
 
     Parameters
     ----------
@@ -1494,8 +1541,9 @@ class DHTNode:
         # must not use DHT, PEX, or LSD for peer discovery).
         self._private_mode: bool = False
 
-        # Kademlia routing table
-        self.routing_table = RoutingTable(self.node_id)
+        # BEP-32: Separate IPv4 and IPv6 routing tables
+        self.routing_table_v4: RoutingTable = RoutingTable(self.node_id)
+        self.routing_table_v6: RoutingTable = RoutingTable(self.node_id)
 
         # Peer store for infohash -> peers mapping
         self.peer_store = PeerStore()
@@ -1657,6 +1705,39 @@ class DHTNode:
                 return data, addr
         raise OSError("Socket not found for file descriptor")
 
+    def _is_ipv6_addr(self, addr: tuple) -> bool:
+        """Check if an address tuple represents an IPv6 address.
+
+        Parameters
+        ----------
+        addr : tuple
+            The sender address (ip, port) or (ip, port, flowinfo, scopeid).
+
+        Returns
+        -------
+        bool
+            True if IPv6, False if IPv4.
+        """
+        # AF_INET6 addresses may have 4-tuple form; AF_INET has 2-tuple
+        return len(addr) > 2 or ":" in addr[0]
+
+    def _get_routing_table(self, is_ipv6: bool) -> RoutingTable:
+        """Get the appropriate routing table for the address family.
+
+        Parameters
+        ----------
+        is_ipv6 : bool
+            Whether this is an IPv6 address.
+
+        Returns
+        -------
+        RoutingTable
+            The IPv4 or IPv6 routing table.
+        """
+        if is_ipv6:
+            return self.routing_table_v6
+        return self.routing_table_v4
+
     def _handle_datagram(self, data: bytes, addr: tuple) -> None:
         """Handle an incoming datagram.
 
@@ -1668,7 +1749,8 @@ class DHTNode:
             The sender address (ip, port).
         """
         ip, port = addr[0], addr[1]
-        endpoint = Endpoint(ip, port)
+        is_ipv6 = self._is_ipv6_addr(addr)
+        endpoint = Endpoint(ip, port, is_ipv6=is_ipv6)
 
         # Check if we know this peer
         peer_key = (ip, port)
@@ -1677,7 +1759,7 @@ class DHTNode:
         else:
             # New data from unknown peer - add and ping to verify
             logger.debug("Data from unknown peer: %s", addr)
-            peer = self.add_peer(None, ip, port)
+            peer = self.add_peer(None, ip, port, is_ipv6=is_ipv6)
             if peer:
                 peer.ping()
 
@@ -1774,6 +1856,7 @@ class DHTNode:
             self.peers[peer_key] = peer
 
             # Also add to routing table if we have a node_id
+            # BEP-32: Add to the appropriate routing table based on address family
             if node_id and len(node_id) == 20:
                 bucket_node = BucketNode(
                     node_id=node_id,
@@ -1781,7 +1864,8 @@ class DHTNode:
                     status=NodeStatus.GOOD,
                     last_contacted=time.time(),
                 )
-                self.routing_table.add_node(bucket_node)
+                rt = self._get_routing_table(is_ipv6)
+                rt.add_node(bucket_node)
 
             return peer
         return None
