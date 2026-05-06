@@ -35,6 +35,29 @@ from dhtrack.extension import (
     HolePunchExtension,
 )
 
+# BEP 19 WebSeed support
+from dhtrack.webseed import (
+    WebSeedManager,
+    DownloadState,
+    HTTPDownloadThread,
+    FTPDownloadThread,
+    WebSeedError,
+    WebSeedTimeout,
+    WebSeedConnectionError,
+    WebSeedChecksumError,
+    WebSeedEmptyError,
+    WebSeedHTTPError,
+    WebSeedFTPError,
+)
+
+# BEP 19 Piece Selection algorithms
+from dhtrack.piece_selector import (
+    PieceSelector,
+    Gap,
+    bitfield_to_string,
+    string_to_bitfield,
+)
+
 __all__ = [
     # Peer connection
     "ExtensionNegotiator",
@@ -59,4 +82,21 @@ __all__ = [
     "UT_METADATA",
     "UT_PEX",
     "UT_HOLEPUNCH",
+    # BEP 19 WebSeed
+    "WebSeedManager",
+    "DownloadState",
+    "HTTPDownloadThread",
+    "FTPDownloadThread",
+    "WebSeedError",
+    "WebSeedTimeout",
+    "WebSeedConnectionError",
+    "WebSeedChecksumError",
+    "WebSeedEmptyError",
+    "WebSeedHTTPError",
+    "WebSeedFTPError",
+    # BEP 19 Piece Selection
+    "PieceSelector",
+    "Gap",
+    "bitfield_to_string",
+    "string_to_bitfield",
 ]

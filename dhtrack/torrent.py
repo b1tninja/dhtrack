@@ -7,16 +7,15 @@ infohashes used in BitTorrent and DHT protocols.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import os
 import random
 from contextlib import closing
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, Optional
 
 from dhtrack import bencode as bencode_module
 from dhtrack.bencode import BEncodeValue
+from dhtrack import bep47
 
 
 try:
@@ -80,7 +79,7 @@ class Torrent:
         if not isinstance(data, dict):
             raise TorrentParseError("Torrent data must be a dictionary")
 
-        # Get info — handle both byte and string keys
+        # Get info - handle both byte and string keys
         info_value = None
         for key in data:
             if isinstance(key, bytes) and key.lower() == b'info' or (isinstance(key, str) and key.lower() == 'info'):
@@ -169,7 +168,7 @@ class Torrent:
             elif isinstance(announce, str):
                 trackers.append(announce)
 
-        # Tracker tiers (BEP 12) — 'announce-list' takes priority
+        # Tracker tiers (BEP 12) - 'announce-list' takes priority
         announce_list = self._get_key(self._normalized_dict, 'announce-list', b'announce-list')
         if announce_list is None:
             # Fallback to legacy key name
@@ -227,21 +226,6 @@ class Torrent:
         ----------
         tiers : list[list[str]]
             A list of tiers, where each tier is a list of tracker URL strings.
-
-        Examples
-        --------
-        Single tier with multiple trackers::
-
-            torrent.set_announce_list([
-                ["http://tracker1.com/announce", "http://tracker2.com/announce"]
-            ])
-
-        Multiple tiers with fallback::
-
-            torrent.set_announce_list([
-                ["http://primary1.com/announce", "http://primary2.com/announce"],
-                ["http://backup1.com/announce"],
-            ])
         """
         # Convert to bytes for BEncode compatibility
         encoded_tiers: list[list[bytes]] = []
@@ -281,11 +265,6 @@ class Torrent:
         ------
         ValueError
             If the tier_index is out of range.
-
-        Examples
-        --------
-        >>> torrent.shuffle_tier(0)  # Shuffle the first tier
-        ['http://tracker2.com/announce', 'http://tracker1.com/announce']
         """
         announce_list = self.get_raw_announce_list()
         if not isinstance(announce_list, list):
@@ -639,6 +618,477 @@ class Torrent:
             if files is not None and isinstance(files, list):
                 return len(files)
         return 1  # Single-file torrent
+
+    # ---- BEP-47: Padding Files and Extended File Attributes ----
+
+    def _get_files_list(self) -> Optional[list[dict[str, Any]]]:
+        """Get the files list from the info dictionary.
+
+        Returns
+        -------
+        list of dict or None
+            The files list for multi-file torrents, or None for single-file torrents.
+        """
+        info = self.info
+        if not isinstance(info, dict):
+            return None
+
+        files = self._get_key(info, 'files', b'files')
+        if not isinstance(files, list):
+            return None
+
+        return files  # type: ignore[return-value]
+
+    def _get_normalized_file_entry(self, file_index: int) -> Optional[dict[str, Any]]:
+        """Get a normalized file entry at the given index.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+
+        Returns
+        -------
+        dict or None
+            Normalized file entry, or None if not found.
+        """
+        files = self._get_files_list()
+        if files is None or file_index < 0 or file_index >= len(files):
+            return None
+
+        return bep47.normalize_file_entry(files[file_index])
+
+    def get_file_attribute(self, file_index: int) -> str:
+        """Get the attribute string for a file.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+
+        Returns
+        -------
+        str
+            The attribute string (e.g., "hx" for hidden+executable),
+            or empty string if no attributes are set.
+        """
+        entry = self._get_normalized_file_entry(file_index)
+        if entry is None:
+            return ""
+        return entry.get("attr", "")
+
+    def has_file_attribute(self, file_index: int, attr: str) -> bool:
+        """Check if a file has a specific attribute.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+        attr : str
+            The attribute character to check ('l', 'x', 'h', 'p').
+
+        Returns
+        -------
+        bool
+            True if the file has the specified attribute.
+        """
+        attr_str = self.get_file_attribute(file_index)
+        return bep47.has_attribute(attr_str, attr)
+
+    def set_file_attribute(self, file_index: int, attr: str, set_value: bool = True) -> None:
+        """Set or unset an attribute on a file entry.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+        attr : str
+            The attribute character to set ('l', 'x', 'h', 'p').
+        set_value : bool, optional
+            True to set the attribute, False to unset it. Defaults to True.
+        """
+        files = self._get_files_list()
+        if files is None or file_index < 0 or file_index >= len(files):
+            return
+
+        entry = files[file_index]
+        if not isinstance(entry, dict):
+            return
+
+        # Normalize attr field
+        current_attr = entry.get("attr", "") or entry.get(b"attr", "")
+        if isinstance(current_attr, bytes):
+            current_attr = current_attr.decode("utf-8", errors="replace")
+
+        current_attr = str(current_attr)
+
+        if set_value:
+            new_attr = current_attr + attr if attr not in current_attr else current_attr
+        else:
+            new_attr = "".join(c for c in current_attr if c != attr)
+
+        entry["attr"] = new_attr
+
+    def get_file_sha1(self, file_index: int) -> Optional[bytes]:
+        """Get the SHA1 hash for a file.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+
+        Returns
+        -------
+        bytes or None
+            The 20-byte SHA1 digest, or None if not set.
+        """
+        entry = self._get_normalized_file_entry(file_index)
+        if entry is None:
+            return None
+        return bep47.get_file_sha1(entry)
+
+    def set_file_sha1(self, file_index: int, sha1: bytes) -> None:
+        """Set the SHA1 hash for a file.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+        sha1 : bytes
+            The 20-byte SHA1 digest.
+
+        Raises
+        ------
+        ValueError
+            If sha1 is not exactly 20 bytes.
+        """
+        files = self._get_files_list()
+        if files is None or file_index < 0 or file_index >= len(files):
+            return
+
+        entry = files[file_index]
+        if not isinstance(entry, dict):
+            return
+
+        bep47.set_file_sha1(entry, sha1)
+
+    def compute_file_sha1(self, file_index: int, data: bytes) -> bytes:
+        """Compute and store the SHA1 hash for a file.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+        data : bytes
+            The file data to hash.
+
+        Returns
+        -------
+        bytes
+            The computed 20-byte SHA1 digest.
+        """
+        sha1 = bep47.compute_sha1(data)
+        self.set_file_sha1(file_index, sha1)
+        return sha1
+
+    def get_symlink_path(self, file_index: int) -> Optional[list[str]]:
+        """Get the symlink target path for a file.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+
+        Returns
+        -------
+        list[str] or None
+            The symlink target path components, or None if not a symlink.
+        """
+        entry = self._get_normalized_file_entry(file_index)
+        if entry is None:
+            return None
+        return bep47.get_symlink_path(entry)
+
+    def is_symlink(self, file_index: int) -> bool:
+        """Check if a file is a symlink.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+
+        Returns
+        -------
+        bool
+            True if the file is a symlink.
+        """
+        entry = self._get_normalized_file_entry(file_index)
+        if entry is None:
+            return False
+        return bep47.is_symlink(entry)
+
+    def is_padding_file(self, file_index: int) -> bool:
+        """Check if a file is a padding file.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+
+        Returns
+        -------
+        bool
+            True if the file is a padding file.
+        """
+        entry = self._get_normalized_file_entry(file_index)
+        if entry is None:
+            return False
+        return bep47.is_padding_file(entry)
+
+    def get_padding_length(self, file_index: int) -> int:
+        """Get the padding length for a padding file.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+
+        Returns
+        -------
+        int
+            The padding length in bytes, or 0 if not a padding file.
+        """
+        entry = self._get_normalized_file_entry(file_index)
+        if entry is None:
+            return 0
+        if self.is_padding_file(file_index):
+            return entry.get("length", 0)
+        return 0
+
+    def get_piece_length(self) -> int:
+        """Get the piece length from the torrent.
+
+        Returns
+        -------
+        int
+            The piece length, or 0 if not available.
+        """
+        info = self.info
+        if isinstance(info, dict):
+            piece_length = self._get_key(info, 'piece length', b'piece length')
+            if isinstance(piece_length, int) and piece_length > 0:
+                return piece_length
+        return 0
+
+    def add_padding_file(self, file_index: int) -> Optional[dict[str, Any]]:
+        """Add a padding file before the specified file to align it to a piece boundary.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file to align with padding.
+
+        Returns
+        -------
+        dict or None
+            The padding file entry, or None if no padding is needed.
+        """
+        files = self._get_files_list()
+        if files is None:
+            return None
+
+        if file_index < 0 or file_index >= len(files):
+            return None
+
+        piece_length = self.get_piece_length()
+        if piece_length <= 0:
+            return None
+
+        cumulative_length = 0
+        for i in range(file_index):
+            entry = files[i]
+            if isinstance(entry, dict):
+                length = entry.get("length", entry.get(b"length", 0))
+                if isinstance(length, int):
+                    cumulative_length += length
+
+        padding_entry = bep47.create_padding_file_entry(
+            piece_length, cumulative_length
+        )
+
+        if padding_entry is None:
+            return None
+
+        files.insert(file_index, padding_entry)
+
+        return padding_entry
+
+    def generate_padding_files(
+        self,
+        exclude_existing_padding: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Generate padding files for all files that need them.
+
+        Parameters
+        ----------
+        exclude_existing_padding : bool
+            If True, skip padding for files that already have padding
+            attributes or are already aligned. Defaults to True.
+
+        Returns
+        -------
+        list of dict
+            The list of generated padding file entries.
+        """
+        files = self._get_files_list()
+        if files is None:
+            return []
+
+        piece_length = self.get_piece_length()
+        if piece_length <= 0:
+            return []
+
+        padding_entries: list[dict[str, Any]] = []
+        cumulative_length = 0
+        insert_positions: list[tuple[int, dict[str, Any]]] = []
+
+        for i, entry in enumerate(files):
+            if not isinstance(entry, dict):
+                cumulative_length += entry.get("length", entry.get(b"length", 0))
+                continue
+
+            if exclude_existing_padding and self.is_padding_file(i):
+                cumulative_length += entry.get("length", 0)
+                continue
+
+            padding_len = bep47.create_padding_length(piece_length, cumulative_length)
+            if padding_len > 0:
+                padding_entry = bep47.create_padding_file_entry(
+                    piece_length, cumulative_length
+                )
+                if padding_entry is not None:
+                    insert_positions.insert(0, (i, padding_entry))
+
+            entry_length = entry.get("length", entry.get(b"length", 0))
+            if isinstance(entry_length, int):
+                cumulative_length += entry_length
+
+        for position, padding_entry in sorted(insert_positions, key=lambda x: x[0], reverse=True):
+            files.insert(position, padding_entry)
+            padding_entries.append(padding_entry)
+
+        return padding_entries
+
+    def has_extended_attributes(self) -> bool:
+        """Check if any file in the torrent has extended attributes.
+
+        Returns
+        -------
+        bool
+            True if any file has extended attributes (attr, sha1, symlink path).
+        """
+        files = self._get_files_list()
+        if files is None:
+            return False
+
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            attr = entry.get("attr") or entry.get(b"attr")
+            sha1 = entry.get("sha1") or entry.get(b"sha1")
+            symlink = entry.get("symlink path") or entry.get(b"symlink path")
+            if attr or sha1 or symlink:
+                return True
+
+        return False
+
+    def get_file_count_by_attr(self, attr: str) -> int:
+        """Get the count of files with a specific attribute.
+
+        Parameters
+        ----------
+        attr : str
+            The attribute character to count ('l', 'x', 'h', 'p').
+
+        Returns
+        -------
+        int
+            Number of files with the specified attribute.
+        """
+        count = 0
+        files = self._get_files_list()
+        if files is None:
+            return 0
+
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            file_attr = entry.get("attr") or entry.get(b"attr")
+            if file_attr and isinstance(file_attr, str) and attr in file_attr:
+                count += 1
+
+        return count
+
+    @property
+    def symlink_count(self) -> int:
+        """Get the number of symlink files in the torrent.
+
+        Returns
+        -------
+        int
+            Number of symlinks.
+        """
+        return self.get_file_count_by_attr(bep47.FileAttribute.SYMLINK)
+
+    @property
+    def executable_count(self) -> int:
+        """Get the number of executable files in the torrent.
+
+        Returns
+        -------
+        int
+            Number of executable files.
+        """
+        return self.get_file_count_by_attr(bep47.FileAttribute.EXECUTABLE)
+
+    @property
+    def hidden_count(self) -> int:
+        """Get the number of hidden files in the torrent.
+
+        Returns
+        -------
+        int
+            Number of hidden files.
+        """
+        return self.get_file_count_by_attr(bep47.FileAttribute.HIDDEN)
+
+    @property
+    def padding_file_count(self) -> int:
+        """Get the number of padding files in the torrent.
+
+        Returns
+        -------
+        int
+            Number of padding files.
+        """
+        return self.get_file_count_by_attr(bep47.FileAttribute.PADDING)
+
+    @property
+    def total_padding_bytes(self) -> int:
+        """Get the total number of bytes used by padding files.
+
+        Returns
+        -------
+        int
+            Total bytes used by all padding files.
+        """
+        total = 0
+        for i in range(self.file_count):
+            if self.is_padding_file(i):
+                entry = self._get_normalized_file_entry(i)
+                if entry:
+                    total += entry.get("length", 0)
+        return total
 
     @classmethod
     def parse(cls, buffer: bytes) -> Torrent:
