@@ -79,54 +79,103 @@ class Torrent:
         if not isinstance(data, dict):
             raise TorrentParseError("Torrent data must be a dictionary")
 
-        if b'info' not in data:
+        # Get info — handle both byte and string keys
+        info_value = None
+        for key in data:
+            if isinstance(key, bytes) and key.lower() == b'info' or (isinstance(key, str) and key.lower() == 'info'):
+                info_value = data[key]
+                break
+
+        if info_value is None:
             raise TorrentParseError("Torrent data missing 'info' field")
 
-        self.dict: dict[str, Any] = data if isinstance(data, dict) else {}
-        if isinstance(self.dict, dict):
-            # Convert byte keys to string keys for consistency
-            self.dict = {
-                k.decode('utf-8') if isinstance(k, bytes) else k: v
-                for k, v in self.dict.items()
-            }
+        # Store raw dict (preserve original key types)
+        self.dict: dict[Any, Any] = data
 
-        # Compute infohash
-        self.infohash: bytes = hashlib.sha1(bencode_module.encode([b'info'])).digest()
+        # Normalize to string keys for convenience (but keep raw dict too)
+        self._normalized_dict: dict[str, Any] = {}
+        if isinstance(self.dict, dict):
+            for k, v in self.dict.items():
+                str_key = k.decode('utf-8') if isinstance(k, bytes) else k
+                self._normalized_dict[str_key] = v
+
+        # Compute infohash: SHA-1 of the bencoded info dictionary (BEP 3)
+        self.infohash: bytes = hashlib.sha1(bencode_module.encode(info_value)).digest()
 
     @property
     def name(self) -> Optional[str]:
-        """Get the torrent name, if available."""
-        info = self.dict.get(b'info' if isinstance(b'info' in self.dict, bool) else 'info', {})
+        """Get the torrent name, if available.
+
+        Returns
+        -------
+        str or None
+            The torrent name from the info dictionary.
+        """
+        info = self._normalized_dict.get('info')
         if isinstance(info, dict):
-            name = info.get(b'name' if isinstance(info, dict) else 'name',
-                           info.get('name'))
+            name = info.get('name')
+            if name is None:
+                name = info.get(b'name')
             if isinstance(name, bytes):
                 return name.decode('utf-8', errors='replace')
             return str(name) if name else None
         return None
 
+    def _get_key(self, data: dict[Any, Any], str_key: str, byte_key: bytes) -> Any:
+        """Get a value from a dict, trying string key first then byte key.
+
+        Parameters
+        ----------
+        data : dict
+            The dictionary to look up.
+        str_key : str
+            The string key to try first.
+        byte_key : bytes
+            The byte key to try if string key is not found.
+
+        Returns
+        -------
+        Any
+            The value associated with the key, or None if not found.
+        """
+        if str_key in data:
+            return data[str_key]
+        if byte_key in data:
+            return data[byte_key]
+        return None
+
     @property
     def info(self) -> Optional[BEncodeValue]:
         """Get the raw info dictionary."""
-        return self.dict.get('info')
+        return self._get_key(self._normalized_dict, 'info', b'info')
 
     @property
     def trackers(self) -> list[str]:
-        """Get the list of tracker URLs."""
+        """Get the list of tracker URLs.
+
+        Returns
+        -------
+        list[str]
+            All tracker URLs from both single 'announce' and 'announce-list' tiers.
+        """
         trackers: list[str] = []
 
-        # Single tracker tier
-        announce = self.dict.get(b'announce' if isinstance(b'announce' in self.dict, bool) else 'announce', '')
-        if isinstance(announce, bytes):
-            trackers.append(announce.decode('utf-8', errors='replace'))
-        elif isinstance(announce, str):
-            trackers.append(announce)
+        # Single tracker
+        announce = self._get_key(self._normalized_dict, 'announce', b'announce')
+        if announce is not None:
+            if isinstance(announce, bytes):
+                trackers.append(announce.decode('utf-8', errors='replace'))
+            elif isinstance(announce, str):
+                trackers.append(announce)
 
-        # Tracker tiers (announcelist)
-        announcelist = self.dict.get(b'announcelist' if isinstance(b'announcelist' in self.dict, bool) else 'announcelist',
-                                     self.dict.get(b'announce-list' if isinstance(b'announce-list' in self.dict, bool) else 'announce-list', []))
-        if isinstance(announcelist, list):
-            for tier in announcelist:
+        # Tracker tiers (BEP 12) — 'announce-list' takes priority
+        announce_list = self._get_key(self._normalized_dict, 'announce-list', b'announce-list')
+        if announce_list is None:
+            # Fallback to legacy key name
+            announce_list = self._get_key(self._normalized_dict, 'announcelist', b'announcelist')
+
+        if isinstance(announce_list, list):
+            for tier in announce_list:
                 if isinstance(tier, list):
                     for tracker in tier:
                         if isinstance(tracker, bytes):
@@ -138,14 +187,21 @@ class Torrent:
 
     @property
     def file_count(self) -> int:
-        """Get the number of files in the torrent."""
+        """Get the number of files in the torrent.
+
+        Returns
+        -------
+        int
+            Number of files, or 1 for single-file torrents.
+        """
         info = self.info
         if info is None:
             return 0
 
         if isinstance(info, dict):
-            if b'files' in info or 'files' in info:
-                return len(info.get(b'files' if isinstance(b'files' in info, bool) else 'files', []))
+            files = self._get_key(info, 'files', b'files')
+            if files is not None and isinstance(files, list):
+                return len(files)
         return 1  # Single-file torrent
 
     @classmethod

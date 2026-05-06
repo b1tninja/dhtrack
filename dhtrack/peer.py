@@ -26,10 +26,32 @@ from dhtrack.torrent import Torrent
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# BEP 10: Extension Protocol constants
+# BEP 3: Peer Wire Protocol constants
 # ---------------------------------------------------------------------------
 
-# Extended message type values
+# Peer wire protocol message types (BEP 3)
+MSG_CHOKE = 0
+MSG_UNCHOKE = 1
+MSG_INTERESTED = 2
+MSG_NOT_INTERESTED = 3
+MSG_HAVE = 4
+MSG_BITFIELD = 5
+MSG_REQUEST = 6
+MSG_PIECE = 7
+MSG_CANCEL = 8
+
+# BEP 6 additional message types
+MSG_PORT = 7  # BEP 6 (overrides BEP 3 default, use BEP 6 constants)
+MSG_HAVE_ALL = 8
+MSG_HAVE_NONE = 9
+MSG_ALLOWED_FAST = 10
+MSG_NOT_ALLOWED_FAST = 11
+MSG_SATISFIED = 12
+
+# BEP 6 alias
+MSG_SATISFIED_ALT = 13
+
+# Extended protocol message type (BEP 10)
 EXTENSION_MSG_TYPE_HANDSHAKE = 0
 EXTENSION_MSG_TYPE_MESSAGE = 1
 
@@ -44,6 +66,242 @@ EXTENSION_HANDSHAKE_TIMEOUT = 30
 
 # Maximum extended message payload size (64 KB)
 MAX_EXTENDED_MESSAGE_SIZE = 65536
+
+# BEP 3 defaults
+# Maximum request size: 16 KB (de-facto standard, per BEP 3)
+MAX_REQUEST_SIZE = 16384
+
+# Default keepalive interval (seconds)
+KEEPALIVE_INTERVAL = 120
+
+# Maximum pending requests per peer
+MAX_PENDING_REQUESTS = 100
+
+# ---------------------------------------------------------------------------
+# BEP 3 Peer Message Dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PeerMessage:
+    """Represents a decoded peer wire protocol message (BEP 3).
+
+    Attributes
+    ----------
+    msg_type : int
+        The message type code (0-15).
+    payload : bytes
+        The raw payload bytes (may contain bencoded data).
+    piece_index : int | None
+        Piece index (for REQUEST, PIECE messages).
+    begin : int
+        Byte offset within the piece (for REQUEST, PIECE messages).
+    length : int
+        Request length (for REQUEST messages) or actual length of piece data.
+    piece_data : bytes | None
+        The actual piece data for MSG_PIECE messages.
+    piece_bitmask : bytes | None
+        The bitfield data for MSG_BITFIELD messages.
+    """
+
+    msg_type: int
+    payload: bytes = b""
+    piece_index: Optional[int] = None
+    begin: int = 0
+    length: int = 0
+    piece_data: Optional[bytes] = None
+    piece_bitmask: Optional[bytes] = None
+
+
+def serialize_peer_message(msg_type: int, payload: bytes = b"") -> bytes:
+    """Serialize a peer wire protocol message to wire format.
+
+    Format: [4-byte length prefix][1-byte msg type][payload]
+    For zero-length messages (keepalives), only the 4-byte prefix is sent.
+
+    Parameters
+    ----------
+    msg_type : int
+        The message type code (0-15).
+    payload : bytes
+        Optional payload data.
+
+    Returns
+    -------
+    bytes
+        The serialized message for TCP transmission.
+    """
+    if msg_type < 0 or msg_type > 255:
+        raise ExtensionError(f"Invalid message type: {msg_type}")
+
+    if len(payload) == 0:
+        # Keepalive: just the length prefix (0)
+        return struct.pack("!I", 0)
+
+    # Length prefix = 1 (msg type) + len(payload)
+    msg_len = 1 + len(payload)
+    result = struct.pack("!I", msg_len)
+    result += struct.pack("!B", msg_type)
+    result += payload
+    return result
+
+
+def parse_peer_message(data: bytes) -> PeerMessage:
+    """Parse an incoming peer wire protocol message (BEP 3).
+
+    Parameters
+    ----------
+    data : bytes
+        The raw bytes received from the peer (must contain a complete
+        length-prefixed message).
+
+    Returns
+    -------
+    PeerMessage
+        The parsed message with type and payload.
+
+    Raises
+    ------
+    ExtensionError
+        If the message is malformed.
+    """
+    if len(data) < 4:
+        raise ExtensionError(f"Message too short: {len(data)} bytes (need at least 4)")
+
+    # Read length prefix
+    msg_len = struct.unpack("!I", data[:4])[0]
+
+    if msg_len == 0:
+        # Keepalive
+        return PeerMessage(msg_type=-1)  # -1 = keepalive
+
+    if msg_len < 1 or msg_len > 0xFFFF:
+        raise ExtensionError(f"Invalid message length: {msg_len}")
+
+    if len(data) < 4 + msg_len:
+        raise ExtensionError(
+            f"Truncated message: expected {4 + msg_len} bytes, got {len(data)}"
+        )
+
+    payload = data[5:4 + msg_len]
+    msg_type = data[4]
+
+    msg = PeerMessage(msg_type=msg_type, payload=payload)
+
+    # Decode type-specific fields
+    if msg_type == MSG_REQUEST or msg_type == MSG_PIECE or msg_type == MSG_CANCEL:
+        if len(payload) >= 12:
+            idx, begin, length = struct.unpack("!III", payload[:12])
+            msg.piece_index = idx
+            msg.begin = begin
+            msg.length = length
+        if msg_type == MSG_PIECE and len(payload) > 12:
+            msg.piece_data = payload[12:]
+
+    elif msg_type == MSG_HAVE:
+        if len(payload) >= 4:
+            msg.piece_index = struct.unpack("!I", payload[:4])[0]
+
+    elif msg_type == MSG_BITFIELD:
+        msg.piece_bitmask = payload
+
+    return msg
+
+
+def create_handshake(
+    info_hash: bytes,
+    peer_id: bytes,
+    reserved_bytes: bytes = b"\x00" * 8,
+) -> bytes:
+    """Create a BEP 3 peer handshake.
+
+    Format: [1 byte length=19][8 byte protocol identifier][8 reserved bytes]
+            [20 byte info hash][20 byte peer ID]
+
+    Parameters
+    ----------
+    info_hash : bytes
+        The 20-byte infohash of the torrent.
+    peer_id : bytes
+        The 20-byte peer ID.
+    reserved_bytes : bytes
+        8 reserved bytes for extension flags (default: all zeros).
+
+    Returns
+    -------
+    bytes
+        The full 68-byte handshake.
+
+    Raises
+    ------
+    ExtensionError
+        If info_hash or peer_id is not exactly 20 bytes.
+    """
+    if len(info_hash) != 20:
+        raise ExtensionError(f"info_hash must be 20 bytes, got {len(info_hash)}")
+    if len(peer_id) != 20:
+        raise ExtensionError(f"peer_id must be 20 bytes, got {len(peer_id)}")
+
+    protocol_str = b"\x10BitTorrent protocol"  # 19 bytes
+    handshake = struct.pack("B", len(protocol_str)) + protocol_str
+    handshake += reserved_bytes
+    handshake += info_hash
+    handshake += peer_id
+    return handshake
+
+
+def parse_handshake(data: bytes) -> tuple[bool, bytes, bytes, bytes]:
+    """Parse an incoming BEP 3 peer handshake.
+
+    Parameters
+    ----------
+    data : bytes
+        The raw handshake bytes received from the peer.
+
+    Returns
+    -------
+    tuple[bool, bytes, bytes, bytes]
+        A tuple of (extensions_enabled, reserved_bytes, info_hash, peer_id).
+        extensions_enabled is True if reserved_bytes[7] & 0x04 is set (BEP 10).
+
+    Raises
+    ------
+    ExtensionError
+        If the handshake is malformed.
+    """
+    expected_len = 1 + 19 + 8 + 20 + 20  # 68 bytes
+    if len(data) < expected_len:
+        raise ExtensionError(
+            f"Handshake too short: expected {expected_len} bytes, got {len(data)}"
+        )
+
+    # Byte 0: length of protocol string (should be 19)
+    pstrlen = data[0]
+    if pstrlen != 19:
+        raise ExtensionError(f"Invalid protocol string length: {pstrlen}")
+
+    # Bytes 1-19: protocol identifier
+    pstr = data[1:20]
+    if pstr != EXTENSION_NAME:
+        raise ExtensionError(f"Invalid protocol identifier: {pstr!r}")
+
+    # Bytes 20-27: reserved bytes
+    reserved_bytes = data[20:28]
+
+    # Byte 7, bit 2 (0x04) indicates BEP 10 support
+    extensions_enabled = bool(reserved_bytes[7] & 0x04)
+
+    # Bytes 28-47: info hash
+    info_hash = data[28:48]
+    if len(info_hash) != 20:
+        raise ExtensionError(f"Invalid info_hash: {len(info_hash)} bytes")
+
+    # Bytes 48-67: peer ID
+    peer_id = data[48:68]
+    if len(peer_id) != 20:
+        raise ExtensionError(f"Invalid peer_id: {len(peer_id)} bytes")
+
+    return extensions_enabled, reserved_bytes, info_hash, peer_id
 
 # ---------------------------------------------------------------------------
 # BEP 9: Metadata Extension constants
@@ -999,6 +1257,8 @@ class PeerConnection:
         The remote peer's 20-byte peer ID.
     endpoint : Endpoint
         The network endpoint of the peer.
+    info_hash : bytes
+        The torrent infohash for this connection.
     negotiator : ExtensionNegotiator
         Extension negotiation state.
     metadata_exchange : MetadataExchange
@@ -1015,12 +1275,25 @@ class PeerConnection:
         Whether the extended protocol has been negotiated.
     handshake_done : bool
         Whether the extension handshake has been completed.
+    choked : bool
+        Whether this side is choked (cannot send data).
+    peer_choked : bool
+        Whether the remote peer is choked.
+    interested : bool
+        Whether this side is interested.
+    peer_interested : bool
+        Whether the remote peer is interested.
+    has_all : bool
+        Whether this side has all pieces.
+    pending_requests : list[dict]
+        Pending piece requests.
     send_buffer : bytearray
         Buffer for outgoing data.
     """
 
     peer_id: bytes
     endpoint: Endpoint
+    info_hash: bytes = field(default_factory=lambda: b"")
     negotiator: ExtensionNegotiator = field(default_factory=ExtensionNegotiator)
     metadata_exchange: Optional[MetadataExchange] = None
     pex_manager: Optional[PEXManager] = None
@@ -1029,6 +1302,12 @@ class PeerConnection:
     connected: bool = False
     extended_enabled: bool = False
     handshake_done: bool = False
+    choked: bool = True
+    peer_choked: bool = True
+    interested: bool = False
+    peer_interested: bool = False
+    has_all: bool = False
+    pending_requests: list[dict] = field(default_factory=list)
     send_buffer: bytearray = field(default_factory=bytearray)
     last_activity: float = field(default_factory=time.time)
 
@@ -1048,15 +1327,45 @@ class PeerConnection:
         -------
         bytes
             The full handshake: pref + length + identifier + info.
-        """
-        pref = b"\x10BitTorrent protocol"
-        reserved_bytes = b"\x00" * 8
-        info_hash = b"\x00" * 20  # Placeholder
-        peer_id_bytes = b"\x00" * 20  # Placeholder
 
-        length = len(pref)  # 19
-        handshake = struct.pack("B", length) + pref + reserved_bytes + info_hash + peer_id_bytes
-        return handshake
+        Raises
+        ------
+        ExtensionError
+            If info_hash is not 20 bytes.
+        """
+        return create_handshake(self.info_hash, self.peer_id)
+
+    def parse_incoming_handshake(self, data: bytes) -> tuple[bytes, bytes]:
+        """Parse an incoming BEP 3 handshake from a peer.
+
+        Parameters
+        ----------
+        data : bytes
+            The raw handshake bytes.
+
+        Returns
+        -------
+        tuple[bytes, bytes]
+            A tuple of (info_hash, peer_id) from the handshake.
+
+        Raises
+        ------
+        ExtensionError
+            If the handshake is invalid or info_hash doesn't match.
+        """
+        extensions_enabled, reserved_bytes, info_hash, peer_id = parse_handshake(data)
+
+        # Verify info_hash matches this torrent
+        if self.info_hash and info_hash != self.info_hash:
+            raise ExtensionError(
+                f"Info hash mismatch: expected {self.info_hash.hex()}, got {info_hash.hex()}"
+            )
+
+        # Store extension support
+        if extensions_enabled:
+            self.extended_enabled = True
+
+        return info_hash, peer_id
 
     def create_extended_handshake(self) -> bytes:
         """Create an extended protocol handshake.
@@ -1162,7 +1471,340 @@ class PeerConnection:
         """
         return time.time() - self.last_activity > timeout
 
+    def create_choke(self) -> bytes:
+        """Create a choke message (BEP 3).
+
+        Returns
+        -------
+        bytes
+            Serialized choke message.
+        """
+        self.choked = True
+        return serialize_peer_message(MSG_CHOKE)
+
+    def create_unchoke(self) -> bytes:
+        """Create an unchoke message (BEP 3).
+
+        Returns
+        -------
+        bytes
+            Serialized unchoke message.
+        """
+        self.choked = False
+        return serialize_peer_message(MSG_UNCHOKE)
+
+    def create_interested(self) -> bytes:
+        """Create an interested message (BEP 3).
+
+        Returns
+        -------
+        bytes
+            Serialized interested message.
+        """
+        self.interested = True
+        return serialize_peer_message(MSG_INTERESTED)
+
+    def create_not_interested(self) -> bytes:
+        """Create a not interested message (BEP 3).
+
+        Returns
+        -------
+        bytes
+            Serialized not interested message.
+        """
+        self.interested = False
+        return serialize_peer_message(MSG_NOT_INTERESTED)
+
+    def create_have(self, piece_index: int) -> bytes:
+        """Create a have message (BEP 3).
+
+        Parameters
+        ----------
+        piece_index : int
+            The index of the newly available piece.
+
+        Returns
+        -------
+        bytes
+            Serialized have message.
+        """
+        payload = struct.pack("!I", piece_index)
+        return serialize_peer_message(MSG_HAVE, payload)
+
+    def create_bitfield(self, bitfield: bytes) -> bytes:
+        """Create a bitfield message (BEP 3).
+
+        Parameters
+        ----------
+        bitfield : bytes
+            The bitfield bytes representing owned pieces.
+
+        Returns
+        -------
+        bytes
+            Serialized bitfield message.
+        """
+        return serialize_peer_message(MSG_BITFIELD, bitfield)
+
+    def create_request(self, piece_index: int, begin: int, length: int = 16384) -> bytes:
+        """Create a request message (BEP 3).
+
+        Parameters
+        ----------
+        piece_index : int
+            The index of the piece to request.
+        begin : int
+            The byte offset within the piece.
+        length : int
+            The number of bytes to request. Default: 16384.
+
+        Returns
+        -------
+        bytes
+            Serialized request message.
+
+        Raises
+        ------
+        ExtensionError
+            If the request exceeds maximum size or pending queue is full.
+        """
+        if length > MAX_REQUEST_SIZE:
+            raise ExtensionError(
+                f"Request size {length} exceeds maximum {MAX_REQUEST_SIZE}"
+            )
+        if len(self.pending_requests) >= MAX_PENDING_REQUESTS:
+            raise ExtensionError(
+                f"Pending requests {len(self.pending_requests)} exceeds maximum {MAX_PENDING_REQUESTS}"
+            )
+
+        payload = struct.pack("!III", piece_index, begin, length)
+        msg = serialize_peer_message(MSG_REQUEST, payload)
+
+        # Track the pending request
+        self.pending_requests.append({
+            "piece_index": piece_index,
+            "begin": begin,
+            "length": length,
+            "timestamp": time.time(),
+        })
+
+        return msg
+
+    def create_cancel(self, piece_index: int, begin: int, length: int = 16384) -> bytes:
+        """Create a cancel message (BEP 3).
+
+        Parameters
+        ----------
+        piece_index : int
+            The index of the piece to cancel.
+        begin : int
+            The byte offset within the piece.
+        length : int
+            The number of bytes to cancel. Default: 16384.
+
+        Returns
+        -------
+        bytes
+            Serialized cancel message.
+        """
+        payload = struct.pack("!III", piece_index, begin, length)
+        msg = serialize_peer_message(MSG_CANCEL, payload)
+
+        # Remove from pending requests
+        self.pending_requests = [
+            r for r in self.pending_requests
+            if not (
+                r["piece_index"] == piece_index
+                and r["begin"] == begin
+                and r["length"] == length
+            )
+        ]
+
+        return msg
+
+    def handle_choke(self) -> None:
+        """Handle an incoming choke message from the peer."""
+        self.peer_choked = True
+        logger.debug("Peer choked")
+
+    def handle_unchoke(self) -> None:
+        """Handle an incoming unchoke message from the peer."""
+        self.peer_choked = False
+        logger.debug("Peer unchoked")
+
+    def handle_interested(self) -> None:
+        """Handle an incoming interested message from the peer."""
+        self.peer_interested = True
+
+    def handle_not_interested(self) -> None:
+        """Handle an incoming not interested message from the peer."""
+        self.peer_interested = False
+
+    def handle_have(self, piece_index: int) -> None:
+        """Handle an incoming have message from the peer.
+
+        Parameters
+        ----------
+        piece_index : int
+            The index of the piece the peer has.
+        """
+        logger.debug("Peer has piece %d", piece_index)
+
+    def handle_bitfield(self, bitfield: bytes, total_pieces: int) -> None:
+        """Handle an incoming bitfield message from the peer.
+
+        Parameters
+        ----------
+        bitfield : bytes
+            The bitfield data.
+        total_pieces : int
+            Total number of pieces in the torrent.
+        """
+        num_bits = len(bitfield) * 8
+        if num_bits > total_pieces:
+            logger.warning("Bitfield has %d bits, but torrent has %d pieces", num_bits, total_pieces)
+
+    def handle_piece(self, piece_index: int, begin: int, piece_data: bytes) -> None:
+        """Handle an incoming piece message from the peer.
+
+        Parameters
+        ----------
+        piece_index : int
+            The index of the piece.
+        begin : int
+            The byte offset within the piece.
+        piece_data : bytes
+            The actual piece data.
+        """
+        logger.debug("Received piece %d offset %d length %d", piece_index, begin, len(piece_data))
+        self.update_activity()
+
+        # Remove completed request from pending
+        self.pending_requests = [
+            r for r in self.pending_requests
+            if not (r["piece_index"] == piece_index and r["begin"] == begin)
+        ]
+
+    def handle_request(self, piece_index: int, begin: int, length: int) -> None:
+        """Handle an incoming request from the peer.
+
+        Parameters
+        ----------
+        piece_index : int
+            The requested piece index.
+        begin : int
+            Byte offset within the piece.
+        length : int
+            Number of bytes requested.
+
+        Returns
+        -------
+        bool
+            True if the request is accepted, False otherwise.
+        """
+        if self.peer_choked:
+            logger.debug("Rejected request from choked peer")
+            return False
+
+        if length > MAX_REQUEST_SIZE:
+            logger.debug("Request size %d exceeds maximum %d", length, MAX_REQUEST_SIZE)
+            return False
+
+        logger.debug("Peer requested piece %d offset %d length %d", piece_index, begin, length)
+        return True
+
+    def handle_cancel(self, piece_index: int, begin: int, length: int) -> None:
+        """Handle an incoming cancel message from the peer.
+
+        Parameters
+        ----------
+        piece_index : int
+            The cancelled piece index.
+        begin : int
+            Byte offset.
+        length : int
+            Request length.
+        """
+        logger.debug("Peer cancelled piece %d offset %d length %d", piece_index, begin, length)
+
+    def handle_peer_message(self, msg: PeerMessage) -> None:
+        """Handle a parsed peer wire message and update connection state.
+
+        Parameters
+        ----------
+        msg : PeerMessage
+            The parsed peer message.
+        """
+        msg_type = msg.msg_type
+
+        if msg_type == MSG_CHOKE:
+            self.handle_choke()
+        elif msg_type == MSG_UNCHOKE:
+            self.handle_unchoke()
+        elif msg_type == MSG_INTERESTED:
+            self.handle_interested()
+        elif msg_type == MSG_NOT_INTERESTED:
+            self.handle_not_interested()
+        elif msg_type == MSG_HAVE:
+            if msg.piece_index is not None:
+                self.handle_have(msg.piece_index)
+        elif msg_type == MSG_BITFIELD:
+            if msg.piece_bitmask is not None:
+                # We need total_pieces from somewhere
+                self.handle_bitfield(msg.piece_bitmask, 0)
+        elif msg_type == MSG_REQUEST:
+            if msg.piece_index is not None:
+                self.handle_request(msg.piece_index, msg.begin, msg.length)
+        elif msg_type == MSG_PIECE:
+            if msg.piece_index is not None and msg.piece_data is not None:
+                self.handle_piece(msg.piece_index, msg.begin, msg.piece_data)
+        elif msg_type == MSG_CANCEL:
+            if msg.piece_index is not None:
+                self.handle_cancel(msg.piece_index, msg.begin, msg.length)
+
+    def build_keepalive(self) -> bytes:
+        """Build a keepalive message (zero-length message).
+
+        Returns
+        -------
+        bytes
+            Zero-length message for keepalive.
+        """
+        return serialize_peer_message(MSG_CHOKE)  # Will be zero-length via empty payload
+
+    def clear_pending_requests(self) -> None:
+        """Clear all pending requests (e.g., on choke or disconnect)."""
+        self.pending_requests.clear()
+
+    def get_pending_count(self) -> int:
+        """Get the number of pending requests.
+
+        Returns
+        -------
+        int
+            Number of pending requests.
+        """
+        return len(self.pending_requests)
+
+    def is_pipelining_allowed(self) -> bool:
+        """Check if request pipelining is allowed.
+
+        Returns
+        -------
+        bool
+            True if we can queue more requests.
+        """
+        return len(self.pending_requests) < MAX_PENDING_REQUESTS and (
+            not self.peer_choked or self.choked
+        )
+
     def __repr__(self) -> str:
         status = "connected" if self.connected else "disconnected"
         ext = "extended" if self.extended_enabled else "plain"
-        return f"PeerConnection({self.endpoint}, {status}, {ext})"
+        choke_state = "choked" if self.choked else "unchoked"
+        interest_state = "interested" if self.interested else "not interested"
+        return (
+            f"PeerConnection({self.endpoint}, {status}, {ext}, "
+            f"{choke_state}, {interest_state}, "
+            f"pending={len(self.pending_requests)})"
+        )
