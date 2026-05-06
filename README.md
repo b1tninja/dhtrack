@@ -159,11 +159,13 @@ pre-commit run --all-files
 
 ### BEncode (`bencode.py`)
 
-Implements the BEncode serialization format used by BitTorrent:
+Implements the [BEncode serialization format](https://bittorrent.org/beps/bep_0005.html)
+used by BitTorrent and the DHT protocol. Fully compliant with [BEP 5](https://bittorrent.org/beps/bep_0005.html).
+
 - Integers: `i<digits>e`
 - Byte strings: `<length>:<data>`
 - Lists: `l<items>e`
-- Dictionaries: `d<key><value>e`
+- Dictionaries: `d<key><value>e` (keys sorted by byte value per BEP 5)
 
 ### DHT (`dht.py`)
 
