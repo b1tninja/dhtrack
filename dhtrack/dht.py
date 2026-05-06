@@ -66,6 +66,8 @@ DEFAULT_BOOTSTRAP_NODES: list[tuple[str, int]] = [
     ("router.bitcomet.com", 6881),
     ("dht.transmissionbt.com", 6881),
 ]
+
+
 def _xor_distance(a: bytes, b: bytes) -> int:
     """Compute XOR distance between two node IDs.
 
@@ -382,7 +384,7 @@ class PeerStore:
         """
         peers = self.get_peers(info_hash)
         # Sort by distance to infohash
-        peers.sort(key=lambda p: _xor_distance(info_hash, p.node_id or b"\\x00" * 20))
+        peers.sort(key=lambda p: _xor_distance(info_hash, p.node_id or b"\x00" * 20))
         return peers[:count]
 
     def remove_peer(self, info_hash: bytes, ip: str, port: int) -> bool:
@@ -428,7 +430,7 @@ class BucketNode:
     """A node entry in a K-bucket."""
 
     node_id: bytes
-    endpoint: Endpoint
+    endpoint: Any
     status: str = NodeStatus.GOOD
     last_contacted: float = field(default_factory=time.time)
     failure_count: int = 0
@@ -630,7 +632,7 @@ class RoutingTable:
 
     def _closest_bucket(self, node_id: bytes) -> KBucket:
         """Find the bucket closest to the given node ID."""
-        return min(self.buckets, key=lambda b: _xor_distance(b.my_node_id if hasattr(b, 'my_node_id') else b.min_id, node_id))
+        return min(self.buckets, key=lambda b: _xor_distance(b.min_id, node_id))
 
     def add_node(self, node: BucketNode) -> bool:
         """Add a node to the routing table.
@@ -812,8 +814,8 @@ class DHTPeer:
         Pending RPC transaction queue.
     """
 
-    dht_node: DHTNode
-    endpoint: Endpoint
+    dht_node: "DHTNode"
+    endpoint: "Endpoint"
     node_id: Optional[bytes] = None
     queue: dict[bytes, dict] = field(default_factory=dict)
     last_seen: float = field(default_factory=lambda: time.time())
@@ -1291,6 +1293,30 @@ class DHTPeer:
 
 
 # ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Endpoint:
+    """Network endpoint for a peer.
+
+    Attributes
+    ----------
+    ip : str
+        The IP address.
+    port : int
+        The port number.
+    is_ipv6 : bool
+        Whether this is an IPv6 address.
+    """
+
+    ip: str
+    port: int
+    is_ipv6: bool = False
+
+
+# ---------------------------------------------------------------------------
 # DHTNode
 # ---------------------------------------------------------------------------
 
@@ -1300,6 +1326,9 @@ class DHTNode:
 
     Manages socket connections, peer discovery, and peer storage.
     Implements the full Kademlia routing table protocol per BEP 5.
+
+    Per BEP-27, a DHT node MUST NOT perform DHT operations (find_node,
+    get_peers, announce_peer) for private torrents.
 
     Parameters
     ----------
@@ -1319,6 +1348,10 @@ class DHTNode:
     ) -> None:
         self.node_id: bytes = node_id or os.urandom(20)
         self.peers_file: str = peers_file
+        # BEP-27: Private torrent enforcement flag
+        # When True, all DHT operations are disabled (private torrents
+        # must not use DHT, PEX, or LSD for peer discovery).
+        self._private_mode: bool = False
 
         # Kademlia routing table
         self.routing_table = RoutingTable(self.node_id)
@@ -1354,6 +1387,78 @@ class DHTNode:
                 self._setup_socket_watch(self.sock6, socket.AF_INET6)
             except (OSError, socket.error):
                 logger.debug("IPv6 socket creation failed, continuing with IPv4 only")
+
+    @property
+    def is_private_mode(self) -> bool:
+        """Check if DHT is disabled for private torrents (BEP-27).
+
+        Returns
+        -------
+        bool
+            True if DHT operations are restricted (private mode).
+
+        Notes
+        -----
+        When True, the DHT node MUST NOT perform find_node, get_peers,
+        or announce_peer queries.  This enforces BEP-27 which requires
+        private torrents to only use the tracker for peer discovery.
+
+        See BEP-27 for details:
+        https://www.bittorrent.org/beps/bep_0027.html
+        """
+        return self._private_mode
+
+    @is_private_mode.setter
+    def is_private_mode(self, value: bool) -> None:
+        """Enable or disable DHT operations for private torrents.
+
+        Parameters
+        ----------
+        value : bool
+            True to restrict DHT (private mode), False to allow all DHT ops.
+        """
+        self._private_mode = bool(value)
+
+    def is_dht_allowed(self, info_hash: Optional[bytes] = None) -> bool:
+        """Check whether DHT operations are allowed.
+
+        Per BEP-27, DHT is NOT allowed for private torrents.
+        This method can be called before any DHT operation to verify
+        that the operation is permitted.
+
+        Parameters
+        ----------
+        info_hash : bytes, optional
+            The 20-byte infohash of the torrent (unused in global mode,
+            but included for API extensibility).
+
+        Returns
+        -------
+        bool
+            True if DHT operations are allowed, False otherwise.
+        """
+        return not self._private_mode
+
+    def enforce_private_mode(self, torrent: Optional["Torrent"] = None) -> None:
+        """Enable or disable private mode based on a torrent.
+
+        Convenience method that checks whether the given torrent is
+        private and sets the DHT enforcement accordingly.
+
+        Per BEP-27, if *any* torrent being downloaded is private, the
+        client MUST NOT use DHT for *any* torrent (since DHT is used
+        to discover peers for all torrents, not just the private one).
+
+        Parameters
+        ----------
+        torrent : Torrent, optional
+            The torrent to check. If True is private, private mode
+            is enabled. If None, private mode is disabled.
+        """
+        if torrent is not None and torrent.is_private:
+            self._private_mode = True
+        else:
+            self._private_mode = False
 
     def _setup_socket_watch(self, sock: socket.socket, family: int) -> None:
         """Set up a GLib IO watch on a socket.

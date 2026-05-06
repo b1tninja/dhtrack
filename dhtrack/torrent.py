@@ -865,6 +865,69 @@ class Torrent:
             return entry.get("length", 0)
         return 0
 
+    # ---- BEP-27: Private Torrents ----
+
+    @property
+    def is_private(self) -> bool:
+        """Check if this is a private torrent (BEP-27).
+
+        A torrent is private when the ``info`` dict contains the key-value
+        pair ``private=1``.  Per BEP-27, private torrents MUST NOT use
+        DHT, PEX, or LSD for peer discovery.
+
+        Returns
+        -------
+        bool
+            True if the torrent is private, False otherwise.
+
+        Notes
+        -----
+        The ``private`` key is stored inside the ``info`` dictionary (not
+        at the top level of the metainfo file).
+
+        See BEP-27 for details:
+        https://www.bittorrent.org/beps/bep_0027.html
+        """
+        if isinstance(self.info, dict):
+            for key in (b"private", "private"):
+                if key in self.info:
+                    value = self.info[key]
+                    if isinstance(value, (bytes, str)):
+                        return value in (b"1", "1", b"true", "true")
+                    elif isinstance(value, int) and not isinstance(value, bool):
+                        return value == 1
+        return False
+
+    @is_private.setter
+    def is_private(self, value: bool) -> None:
+        """Set or remove the private flag in the torrent's info dict.
+
+        When ``value`` is True, adds (or updates) the ``"private"`` key
+        inside the ``info`` dictionary to ``"1"``.  When ``False``, removes
+        the key if present.
+
+        Parameters
+        ----------
+        value : bool
+            True to mark the torrent as private, False to remove the flag.
+        """
+        if not isinstance(self.info, dict):
+            return
+
+        if value:
+            # Check if key exists as bytes or string and update accordingly
+            if b"private" in self.info:
+                self.info[b"private"] = b"1"
+            elif "private" in self.info:
+                self.info["private"] = "1"
+            else:
+                # Default to bytes key for BEncode compatibility
+                self.info[b"private"] = b"1"
+        else:
+            # Remove the private key
+            self.info.pop(b"private", None)
+            self.info.pop("private", None)
+
     def get_piece_length(self) -> int:
         """Get the piece length from the torrent.
 

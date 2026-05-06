@@ -345,21 +345,36 @@ class PEXExtension(Extension):
     This extension enables peers to exchange peer lists,
     allowing discovery of additional peers without using
     a tracker or DHT.
+
+    Per BEP-27, PEX is disabled for private torrents since
+    exchanging peer information with peers in a private torrent
+    would subvert the tracker's access control.
+
+    See BEP-27 for details:
+    https://www.bittorrent.org/beps/bep_0027.html
     """
 
     NAME = ExtensionType.PEX
     SUPPORTED_MSG_TYPES = {0}  # Only standard PEX messages
 
-    def __init__(self, pex_manager: PEXManager) -> None:
+    def __init__(
+        self,
+        pex_manager: PEXManager,
+        is_private: bool = False,
+    ) -> None:
         """Initialize the PEX extension.
 
         Parameters
         ----------
         pex_manager : PEXManager
             The PEX manager instance.
+        is_private : bool
+            Whether this torrent is private (BEP-27).
+            When True, PEX messages are silently dropped.
         """
         super().__init__()
         self._pex = pex_manager
+        self._is_private = is_private
 
     def create_handshake_payload(self) -> dict[str, Any]:
         """Create the handshake payload.
@@ -371,8 +386,36 @@ class PEXExtension(Extension):
         """
         return {}
 
+    @property
+    def is_private(self) -> bool:
+        """Check if this torrent is private (BEP-27).
+
+        Returns
+        -------
+        bool
+            True if PEX is disabled for private torrents.
+        """
+        return self._is_private
+
+    @is_private.setter
+    def is_private(self, value: bool) -> None:
+        """Enable or disable PEX for private torrents.
+
+        Per BEP-27, PEX must be disabled when the torrent is private.
+
+        Parameters
+        ----------
+        value : bool
+            True to disable PEX for private torrents.
+        """
+        self._is_private = value
+
     def on_message(self, msg_type: int, payload: bytes) -> Optional[bytes]:
         """Handle an incoming PEX message.
+
+        Per BEP-27, PEX messages are silently dropped for private torrents.
+        This prevents peer information exchange that could subvert the
+        tracker's access control.
 
         Parameters
         ----------
@@ -384,8 +427,20 @@ class PEXExtension(Extension):
         Returns
         -------
         bytes or None
-            Response if applicable.
+            None always (PEX responses are also disabled for private torrents).
+
+        Notes
+        -----
+        BEP-27: "When PEX only provides peer information to other peers
+        already in the swarm, if an intruder obtained or guessed the IP
+        and port of a peer already in a private torrent then exchanging
+        peer information with the intruder would provide the intruder with
+        a full complement of peers."
         """
+        # BEP-27: Drop all PEX messages for private torrents
+        if self._is_private:
+            return None
+
         if msg_type == 0:
             try:
                 from dhtrack import bencode as bencode_module
