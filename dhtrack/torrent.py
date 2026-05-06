@@ -406,6 +406,174 @@ class Torrent:
 
         return all_shuffled
 
+    # ---- BEP 19: WebSeed - HTTP/FTP Seeding ----
+
+    @property
+    def webseeding_urls(self) -> list[str]:
+        """Get the list of webseed URLs from the torrent metadata.
+
+        Reads the top-level "url-list" key from the torrent (BEP 19).
+        This key is NOT inside the "info" section - it's at the top level.
+
+        Returns
+        -------
+        list[str]
+            List of HTTP/FTP URLs for webseeding.
+
+        Notes
+        -----
+        Per BEP 19, if a URL ends with "/", the client should append
+        the "name" from the torrent and the "path" from multi-file torrents
+        to construct the full URL.
+        """
+        urls: list[str] = []
+
+        # Try both string and bytes keys at top level
+        url_list = self._normalized_dict.get('url-list')
+        if url_list is None:
+            # Try the raw dict with bytes key
+            url_list = self.dict.get(b'url-list')
+        if url_list is None:
+            # Try string key on raw dict
+            url_list = self.dict.get('url-list')
+
+        if url_list is None:
+            return urls
+
+        # Handle both single URL string and list of URLs
+        if isinstance(url_list, bytes):
+            urls.append(url_list.decode('utf-8', errors='replace'))
+        elif isinstance(url_list, str):
+            urls.append(url_list)
+        elif isinstance(url_list, list):
+            for url in url_list:
+                if isinstance(url, bytes):
+                    urls.append(url.decode('utf-8', errors='replace'))
+                elif isinstance(url, str):
+                    urls.append(url)
+
+        return urls
+
+    @webseeding_urls.setter
+    def webseeding_urls(self, urls: list[str]) -> None:
+        """Set the webseed URLs in the torrent metadata.
+
+        Parameters
+        ----------
+        urls : list[str]
+            List of HTTP/FTP URLs for webseeding.
+        """
+        # Convert to bytes for BEncode compatibility
+        encoded_urls: list[bytes] = []
+        for url in urls:
+            if isinstance(url, str):
+                encoded_urls.append(url.encode('utf-8'))
+            elif isinstance(url, bytes):
+                encoded_urls.append(url)
+
+        # Set on both normalized and raw dict
+        self._normalized_dict['url-list'] = encoded_urls
+        self.dict['url-list'] = encoded_urls
+
+    def get_webseeding_url_for_file(self, file_index: int = 0) -> Optional[str]:
+        """Get the full webseed URL for a specific file in multi-file torrents.
+
+        Constructs the full URL by appending the torrent name and file path
+        to the base webseed URL (BEP 19).
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file within the torrent (0 for single-file, index for multi-file).
+
+        Returns
+        -------
+        str or None
+            The complete URL for downloading the file from a webseed server, or None
+            if no webseed URLs are available.
+
+        Notes
+        -----
+        Per BEP 19, if the url-list URL ends with "/", the client appends:
+        - Single-file: the "name" from the torrent info
+        - Multi-file: the "name" + "path" elements from the file entries
+        """
+        urls = self.webseeding_urls
+        if not urls:
+            return None
+
+        # Use the first URL as the base
+        base_url = urls[0]
+
+        # Check if URL ends with "/" - if so, we need to append name/path
+        if base_url.endswith('/'):
+            # Get the torrent name
+            name = self.name
+            if not name:
+                return base_url
+
+            # Check if this is a multi-file torrent
+            if self.file_count > 1 and file_index < self.file_count:
+                # Multi-file torrent - get the file path
+                file_path = self.get_file_path(file_index)
+                if file_path:
+                    return f"{base_url}{name}/{file_path}"
+
+            # Single-file torrent or default
+            return f"{base_url}{name}"
+
+        return base_url if urls else None
+
+    def get_file_path(self, file_index: int) -> Optional[str]:
+        """Get the path of a file in a multi-file torrent.
+
+        Parameters
+        ----------
+        file_index : int
+            The index of the file.
+
+        Returns
+        -------
+        str or None
+            The file path relative to the torrent's root, or None for single-file torrents.
+        """
+        info = self.info
+        if info is None:
+            return None
+
+        if not isinstance(info, dict):
+            return None
+
+        files = self._get_key(info, 'files', b'files')
+        if files is None or not isinstance(files, list):
+            return None  # Single-file torrent
+
+        if file_index < 0 or file_index >= len(files):
+            return None
+
+        file_entry = files[file_index]
+        if not isinstance(file_entry, dict):
+            return None
+
+        # Get the path list
+        path = self._get_key(file_entry, 'path', b'path')
+        if path is None:
+            return None
+
+        if isinstance(path, bytes):
+            return path.decode('utf-8', errors='replace')
+        elif isinstance(path, list):
+            # Path can be a list of path components (BEP 32)
+            parts: list[str] = []
+            for component in path:
+                if isinstance(component, bytes):
+                    parts.append(component.decode('utf-8', errors='replace'))
+                elif isinstance(component, str):
+                    parts.append(component)
+            return '/'.join(parts)
+
+        return None
+
     @property
     def tracker_tiers(self) -> list[list[str]]:
         """Get the tracker URLs organized by tiers.
