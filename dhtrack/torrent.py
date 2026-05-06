@@ -153,28 +153,30 @@ class Torrent:
     def trackers(self) -> list[str]:
         """Get the list of tracker URLs.
 
+        Per BEP-12, when ``announce-list`` is present, the ``announce`` key
+        MUST be ignored.  Only the URLs from ``announce-list`` are returned.
+        If no ``announce-list`` exists, the single ``announce`` URL is returned.
+
         Returns
         -------
         list[str]
-            All tracker URLs from both single 'announce' and 'announce-list' tiers.
+            Tracker URLs from ``announce-list`` (if present) or the single
+            ``announce`` URL.
+
+        Notes
+        -----
+        See BEP-12: https://www.bittorrent.org/beps/bep_0012.html
         """
         trackers: list[str] = []
 
-        # Single tracker
-        announce = self._get_key(self._normalized_dict, 'announce', b'announce')
-        if announce is not None:
-            if isinstance(announce, bytes):
-                trackers.append(announce.decode('utf-8', errors='replace'))
-            elif isinstance(announce, str):
-                trackers.append(announce)
-
-        # Tracker tiers (BEP 12) - 'announce-list' takes priority
+        # Per BEP-12: if announce-list exists, ignore the announce key
         announce_list = self._get_key(self._normalized_dict, 'announce-list', b'announce-list')
         if announce_list is None:
             # Fallback to legacy key name
             announce_list = self._get_key(self._normalized_dict, 'announcelist', b'announcelist')
 
         if isinstance(announce_list, list):
+            # Multi-tracker mode (BEP 12)
             for tier in announce_list:
                 if isinstance(tier, list):
                     for tracker in tier:
@@ -182,6 +184,14 @@ class Torrent:
                             trackers.append(tracker.decode('utf-8', errors='replace'))
                         elif isinstance(tracker, str):
                             trackers.append(tracker)
+        else:
+            # Legacy single-tracker mode: fall back to announce key
+            announce = self._get_key(self._normalized_dict, 'announce', b'announce')
+            if announce is not None:
+                if isinstance(announce, bytes):
+                    trackers.append(announce.decode('utf-8', errors='replace'))
+                elif isinstance(announce, str):
+                    trackers.append(announce)
 
         return trackers
 
@@ -360,6 +370,10 @@ class Torrent:
         ------
         ValueError
             If no announce-list is found in torrent metadata.
+
+        Notes
+        -----
+        See BEP-12: https://www.bittorrent.org/beps/bep_0012.html
         """
         announce_list = self.get_raw_announce_list()
         if not isinstance(announce_list, list):
@@ -384,6 +398,117 @@ class Torrent:
             all_shuffled.append(urls)
 
         return all_shuffled
+
+    # ---- BEP 12: Tier Progression Tracking ----
+
+    # Instance-level state for tracking current tier during announce cycles.
+    # This is intentionally NOT persisted with the torrent data - it is
+    # runtime state only.
+    _current_tier_index: int = 0
+
+    def get_current_tier_index(self) -> int:
+        """Get the current tier index for announce operations.
+
+        Per BEP 12, tiers are processed sequentially. This method tracks
+        which tier is currently active for announce operations. When a
+        tracker in the current tier fails, the client should advance to
+        the next tier.
+
+        Returns
+        -------
+        int
+            The 0-based index of the current tier.
+
+        Notes
+        -----
+        See BEP-12: https://www.bittorrent.org/beps/bep_0012.html
+        """
+        return self._current_tier_index
+
+    def advance_tier_on_failure(self) -> int:
+        """Advance to the next tier when the current tier's trackers fail.
+
+        Per BEP 12, if all trackers in the current tier fail to respond,
+        the client should proceed to the next tier. This method increments
+        the current tier index and returns it, clamping to the last tier
+        if already at the end.
+
+        Returns
+        -------
+        int
+            The new current tier index (0-based).
+
+        Notes
+        -----
+        This method is intended for use by the tracker iteration logic.
+        After calling this method, the tracker layer should attempt to
+        connect to the first URL in the new current tier.
+
+        See BEP-12: https://www.bittorrent.org/beps/bep_0012.html
+        """
+        announce_list = self.get_raw_announce_list()
+        if isinstance(announce_list, list) and len(announce_list) > 0:
+            max_tier = len(announce_list) - 1
+            if self._current_tier_index < max_tier:
+                self._current_tier_index += 1
+            # Clamp to last tier - no further progression needed
+        return self._current_tier_index
+
+    def reset_tier_index(self) -> None:
+        """Reset the current tier index to 0.
+
+        Per BEP 12, the client should start from the first tier on each
+        full announce cycle (e.g., after a successful connection to any
+        tier, the next announce should start from tier 0 again).
+
+        Notes
+        -----
+        See BEP-12: https://www.bittorrent.org/beps/bep_0012.html
+        """
+        self._current_tier_index = 0
+
+    def get_current_tier_urls(self) -> list[str]:
+        """Get the tracker URLs for the current tier.
+
+        Returns the URLs of the currently active tier for announce
+        operations. The URLs should be shuffled before use (BEP 12).
+
+        Returns
+        -------
+        list[str]
+            Tracker URLs for the current tier.
+
+        Raises
+        ------
+        ValueError
+            If no announce-list is found or the tier index is invalid.
+
+        Notes
+        -----
+        See BEP-12: https://www.bittorrent.org/beps/bep_0012.html
+        """
+        announce_list = self.get_raw_announce_list()
+        if not isinstance(announce_list, list):
+            raise ValueError("No announce-list found in torrent metadata")
+
+        tier_index = self.get_current_tier_index()
+        if tier_index < 0 or tier_index >= len(announce_list):
+            raise ValueError(
+                f"Invalid tier index {tier_index} (valid range: 0-{len(announce_list) - 1})"
+            )
+
+        tier = announce_list[tier_index]
+        if not isinstance(tier, list):
+            raise ValueError(f"Tier {tier_index} is not a list")
+
+        urls: list[str] = []
+        for tracker in tier:
+            if isinstance(tracker, bytes):
+                urls.append(tracker.decode('utf-8', errors='replace'))
+            elif isinstance(tracker, str):
+                urls.append(tracker)
+
+        return urls
 
     # ---- BEP 19: WebSeed - HTTP/FTP Seeding ----
 

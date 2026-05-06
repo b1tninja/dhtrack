@@ -179,13 +179,16 @@ class TestMultitracker:
     """Tests for BEP 12 multitracker torrents."""
 
     def test_multitracker_urls_flat(self):
-        """Should return all tracker URLs flat."""
+        """Should return all tracker URLs flat from announce-list only."""
         torrent = create_multitracker_torrent()
         urls = torrent.trackers
-        assert len(urls) == 4
+        # Per BEP-12: announce is ignored when announce-list exists
+        assert len(urls) == 3
         assert 'http://primary1.tracker.com/announce' in urls
         assert 'http://primary2.tracker.com/announce' in urls
         assert 'http://backup1.tracker.com/announce' in urls
+        # announce URL should NOT be present
+        assert 'http://fallback.tracker.com/announce' not in urls
 
     def test_multitracker_has_announce_list(self):
         """Should detect announce-list presence."""
@@ -209,12 +212,14 @@ class TestMultitracker:
         assert len(tiers[1]) == 1
 
     def test_multitracker_announce_priority(self):
-        """announce-list should take priority over announce."""
+        """announce-list should take priority over announce (BEP-12)."""
         torrent = create_multitracker_torrent()
         # trackers property should ignore announce when announce-list exists
         urls = torrent.trackers
-        # Should only include URLs from announce-list, not from announce
-        assert len(urls) == 4
+        # Should only include URLs from announce-list (3 URLs), not announce
+        assert len(urls) == 3
+        # Verify announce URL is excluded
+        assert all('fallback' not in u for u in urls)
 
     def test_get_raw_announce_list_empty(self):
         """Should return None for torrents without announce-list."""
@@ -592,3 +597,217 @@ class TestBencodeRoundtrip:
         encoded = bencode_module.encode(info)
         assert isinstance(encoded, bytes)
         assert encoded[0] == ord(b'i') or encoded[0] == ord(b'd')
+
+
+# ============================================================================
+# Test BEP-12: Trackers property ignores announce when announce-list exists
+# ============================================================================
+
+
+class TestTrackersProperty:
+    """Tests for the trackers property with BEP-12 priority."""
+
+    def test_trackers_ignores_announce_when_announce_list_exists(self):
+        """When announce-list exists, trackers should NOT include announce URL."""
+        data = {
+            'announce': b'http://ignored.tracker.com/announce',
+            'announce-list': [
+                [b'http://tier1.tracker1.com/announce', b'http://tier1.tracker2.com/announce'],
+                [b'http://tier2.backup.com/announce'],
+            ],
+            'info': {
+                'name': b'test',
+                'piece length': 16384,
+                'pieces': b'\x00' * 20,
+            },
+        }
+        torrent = Torrent(data)
+        urls = torrent.trackers
+        # announce-list URLs only
+        assert 'http://tier1.tracker1.com/announce' in urls
+        assert 'http://tier1.tracker2.com/announce' in urls
+        assert 'http://tier2.backup.com/announce' in urls
+        # announce URL should NOT be included
+        assert 'http://ignored.tracker.com/announce' not in urls
+
+    def test_trackers_includes_announce_when_no_announce_list(self):
+        """When no announce-list, trackers should include announce URL."""
+        data = {
+            'announce': b'http://single.tracker.com/announce',
+            'info': {
+                'name': b'test',
+                'piece length': 16384,
+                'pieces': b'\x00' * 20,
+            },
+        }
+        torrent = Torrent(data)
+        urls = torrent.trackers
+        assert urls == ['http://single.tracker.com/announce']
+
+    def test_trackers_empty_with_no_announce(self):
+        """Should return empty list when no announce or announce-list."""
+        data = {
+            'info': {
+                'name': b'test',
+                'piece length': 16384,
+                'pieces': b'\x00' * 20,
+            },
+        }
+        torrent = Torrent(data)
+        assert torrent.trackers == []
+
+
+# ============================================================================
+# Test BEP-12: Tier Progression Tracking
+# ============================================================================
+
+
+class TestTierProgression:
+    """Tests for BEP-12 tier progression tracking methods."""
+
+    def test_get_current_tier_index(self):
+        """Should return initial tier index of 0."""
+        torrent = create_multitracker_torrent()
+        assert torrent.get_current_tier_index() == 0
+
+    def test_advance_tier_on_failure(self):
+        """Should advance tier index when trackers fail."""
+        torrent = create_multitracker_torrent()
+        # 2-tier torrent
+        assert len(torrent.tracker_tiers) == 2
+        # Start at tier 0
+        assert torrent.get_current_tier_index() == 0
+        # Advance once
+        tier_after_advance = torrent.advance_tier_on_failure()
+        assert tier_after_advance == 1
+        assert torrent.get_current_tier_index() == 1
+
+    def test_advance_tier_clamps_at_last_tier(self):
+        """Should not advance beyond last tier."""
+        torrent = create_multitracker_torrent()
+        # Already at last tier, advance again should stay at last tier
+        torrent.advance_tier_on_failure()  # Now at tier 1
+        tier_after = torrent.advance_tier_on_failure()
+        assert tier_after == 1  # Should stay at last tier
+
+    def test_advance_tier_no_announce_list(self):
+        """Should handle advance when no announce-list."""
+        torrent = create_simple_torrent()
+        # No announce-list, should not cause error
+        tier = torrent.advance_tier_on_failure()
+        assert tier == 0
+
+    def test_reset_tier_index(self):
+        """Should reset tier index to 0."""
+        torrent = create_multitracker_torrent()
+        torrent.advance_tier_on_failure()  # Move to tier 1
+        assert torrent.get_current_tier_index() == 1
+        torrent.reset_tier_index()
+        assert torrent.get_current_tier_index() == 0
+
+    def test_get_current_tier_urls(self):
+        """Should return URLs for the current tier."""
+        torrent = create_multitracker_torrent()
+        # Current tier is 0
+        tier0_urls = torrent.get_current_tier_urls()
+        assert len(tier0_urls) == 2
+        assert 'http://primary1.tracker.com/announce' in tier0_urls
+        assert 'http://primary2.tracker.com/announce' in tier0_urls
+
+    def test_get_current_tier_urls_after_advance(self):
+        """Should return URLs for the advanced tier."""
+        torrent = create_multitracker_torrent()
+        torrent.advance_tier_on_failure()  # Move to tier 1
+        tier1_urls = torrent.get_current_tier_urls()
+        assert len(tier1_urls) == 1
+        assert tier1_urls[0] == 'http://backup1.tracker.com/announce'
+
+    def test_get_current_tier_urls_no_announce_list(self):
+        """Should raise error when no announce-list."""
+        torrent = create_simple_torrent()
+        with pytest.raises(ValueError, match="No announce-list"):
+            torrent.get_current_tier_urls()
+
+    def test_get_current_tier_urls_invalid_tier(self):
+        """Should raise error for invalid tier index."""
+        torrent = create_multitracker_torrent()
+        torrent._current_tier_index = 99  # Manually set invalid index
+        with pytest.raises(ValueError, match="Invalid tier index"):
+            torrent.get_current_tier_urls()
+
+    def test_full_bep12_workflow(self):
+        """Test the complete BEP-12 tracker iteration workflow."""
+        torrent = create_multitracker_torrent()
+
+        # 1. Start at tier 0
+        assert torrent.get_current_tier_index() == 0
+        tier0_urls = torrent.get_current_tier_urls()
+        assert len(tier0_urls) == 2
+
+        # 2. Try all URLs in tier 0, none succeed
+        # (In practice, the tracker layer would try each URL)
+        for url in tier0_urls:
+            # Simulate failure...
+            pass
+
+        # 3. Advance to next tier on complete failure
+        torrent.advance_tier_on_failure()
+        assert torrent.get_current_tier_index() == 1
+
+        # 4. Get URLs for new tier
+        tier1_urls = torrent.get_current_tier_urls()
+        assert len(tier1_urls) == 1
+        assert tier1_urls[0] == 'http://backup1.tracker.com/announce'
+
+        # 5. On successful tracker connection, next announce cycle starts from tier 0
+        torrent.record_announce_success(1, 'http://backup1.tracker.com/announce')
+        torrent.reset_tier_index()
+        assert torrent.get_current_tier_index() == 0
+
+        # 6. Shuffle tier 0 for the new cycle
+        shuffled = torrent.shuffle_tier(0)
+        assert set(shuffled) == {
+            'http://primary1.tracker.com/announce',
+            'http://primary2.tracker.com/announce'
+        }
+
+    def test_announce_list_not_modified_by_tier_progression(self):
+        """Tier progression should not modify the announce-list data."""
+        torrent = create_multitracker_torrent()
+        original_raw = torrent.get_raw_announce_list()
+
+        # Perform many tier advances
+        for _ in range(10):
+            torrent.advance_tier_on_failure()
+
+        # Raw data should be unchanged
+        assert torrent.get_raw_announce_list() == original_raw
+
+    def test_tier_progression_with_four_tiers(self):
+        """Test tier progression with 4 tiers."""
+        data = {
+            'announce-list': [
+                [b'http://tier0.tracker.com/announce'],
+                [b'http://tier1.tracker.com/announce'],
+                [b'http://tier2.tracker.com/announce'],
+                [b'http://tier3.tracker.com/announce'],
+            ],
+            'info': {
+                'name': b'test',
+                'piece length': 16384,
+                'pieces': b'\x00' * 20,
+            },
+        }
+        torrent = Torrent(data)
+        assert torrent.get_current_tier_index() == 0
+
+        # Advance through all tiers
+        assert torrent.advance_tier_on_failure() == 1
+        assert torrent.advance_tier_on_failure() == 2
+        assert torrent.advance_tier_on_failure() == 3
+        # Already at last tier
+        assert torrent.advance_tier_on_failure() == 3
+
+        # Reset should go back to 0
+        torrent.reset_tier_index()
+        assert torrent.get_current_tier_index() == 0
