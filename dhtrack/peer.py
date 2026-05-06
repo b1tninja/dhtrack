@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from dhtrack import bencode as bencode_module
 from dhtrack.bencode import BEncodeValue
+from dhtrack import bep4
 from dhtrack.peerid import Endpoint
 from dhtrack.torrent import Torrent
 
@@ -29,31 +30,37 @@ logger = logging.getLogger(__name__)
 # BEP 3: Peer Wire Protocol constants
 # ---------------------------------------------------------------------------
 
-# Peer wire protocol message types (BEP 3)
-MSG_CHOKE = 0
-MSG_UNCHOKE = 1
-MSG_INTERESTED = 2
-MSG_NOT_INTERESTED = 3
-MSG_HAVE = 4
-MSG_BITFIELD = 5
-MSG_REQUEST = 6
-MSG_PIECE = 7
-MSG_CANCEL = 8
+# Import core protocol message types from BEP-4
+MSG_CHOKE = bep4.MSG_CHOKE
+MSG_UNCHOKE = bep4.MSG_UNCHOKE
+MSG_INTERESTED = bep4.MSG_INTERESTED
+MSG_NOT_INTERESTED = bep4.MSG_NOT_INTERESTED
+MSG_HAVE = bep4.MSG_HAVE
+MSG_BITFIELD = bep4.MSG_BITFIELD
+MSG_REQUEST = bep4.MSG_REQUEST
+MSG_PIECE = bep4.MSG_PIECE
+MSG_CANCEL = bep4.MSG_CANCEL
 
-# BEP 6 additional message types
-MSG_PORT = 7  # BEP 6 (overrides BEP 3 default, use BEP 6 constants)
-MSG_HAVE_ALL = 8
-MSG_HAVE_NONE = 9
-MSG_ALLOWED_FAST = 10
-MSG_NOT_ALLOWED_FAST = 11
-MSG_SATISFIED = 12
+# BEP 6 / BEP 16 message types (imported from BEP-4)
+MSG_PORT = bep4.MSG_PORT  # BEP 6: DHT port
+MSG_SUGGEST = bep4.MSG_SUGGEST  # BEP 16: Suggest
+MSG_HAVE_ALL = bep4.MSG_HAVE_ALL  # BEP 16: Have All
+MSG_HAVE_NONE = bep4.MSG_HAVE_NONE  # BEP 16: Have None
+MSG_REJECT_REQUEST = bep4.MSG_REJECT_REQUEST  # BEP 16: Reject Request
+MSG_ALLOWED_FAST = bep4.MSG_ALLOWED_FAST  # BEP 16: Allowed Fast
 
-# BEP 6 alias
-MSG_SATISFIED_ALT = 13
+# Legacy BEP 6 aliases (non-standard values from historical implementations)
+# Note: These differ from BEP-4 values but are used by some deployed clients
+MSG_NOT_ALLOWED_FAST = 11  # Legacy alias (not in BEP-4)
+MSG_SATISFIED = 12  # Legacy alias (not in BEP-4)
+MSG_SATISFIED_ALT = 13  # BEP 6 alias (not in BEP-4)
 
 # Extended protocol message type (BEP 10)
 EXTENSION_MSG_TYPE_HANDSHAKE = 0
 EXTENSION_MSG_TYPE_MESSAGE = 1
+
+# BEP 10 LTEP handshake message type
+MSG_LTEP_HANDSHAKE = bep4.MSG_LTEP_HANDSHAKE
 
 # The protocol name used in extension handshakes
 EXTENSION_NAME = b"BitTorrent protocol"
