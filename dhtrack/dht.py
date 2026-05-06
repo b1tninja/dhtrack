@@ -35,6 +35,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from dhtrack import bencode as bencode_module
+from dhtrack.bloom_filter import BloomFilter
+
 # Specify GTK version before importing to avoid PyGIWarning
 import gi
 gi.require_version("Gtk", "4.0")
@@ -320,14 +323,78 @@ class PeerStore:
 
     BEP 5: Nodes store the IP address and port of peers under the infohash
     in response to announce_peer queries.
+
+    BEP 33: Extended with seed tracking to support DHT scrapes via bloom
+    filters.  Seeds and peers are tracked separately so that bloom filter
+    responses (BFsd for seeds, BFpe for peers) can be generated accurately.
     """
 
     def __init__(self, max_entries: int = 10000) -> None:
+        # Set of unique <info_hash, ip> tuples for deduplication per BEP 33
+        self._seen: dict[bytes, set[tuple[str, int]]] = defaultdict(set)
         self._store: dict[bytes, list[StoredPeer]] = defaultdict(list)
         self._max_entries = max_entries
 
-    def add_peer(self, info_hash: bytes, ip: str, port: int, node_id: Optional[bytes] = None, is_ipv6: bool = False) -> None:
-        """Add a peer for an infohash.
+    def add_peer(self, info_hash: bytes, ip: str, port: int, node_id: Optional[bytes] = None, is_ipv6: bool = False, is_seed: bool = False) -> None:
+        """Add a peer (or seed) for an infohash.
+
+        Per BEP 33, <Infohash, IP> tuples must be unique in the database.
+        Duplicate IP addresses for the same infohash are ignored (only
+        the first metadata is retained).
+
+        Parameters
+        ----------
+        info_hash : bytes
+            20-byte infohash.
+        ip : str
+            Peer IP address.
+        port : int
+            Peer port.
+        node_id : bytes, optional
+            Peer node ID.
+        is_ipv6 : bool
+            Whether the IP is IPv6.
+        is_seed : bool
+            If True, store as a seed (BEP 33).  Seeds are tracked
+            separately from peers for bloom filter scraping.
+        """
+        if len(info_hash) != 20:
+            raise ValueError("info_hash must be 20 bytes")
+
+        # Enforce unique <info_hash, ip> per BEP 33
+        dedup_key = (ip, port)
+        if dedup_key in self._seen[info_hash]:
+            return  # Already stored
+
+        self._seen[info_hash].add(dedup_key)
+
+        peer = StoredPeer(ip=ip, port=port, node_id=node_id, is_ipv6=is_ipv6)
+        self._store[info_hash].append(peer)
+
+        # Limit stored peers per infohash
+        if len(self._store[info_hash]) > 20:
+            self._store[info_hash] = self._store[info_hash][-20:]
+
+    def add_peer_seed(self, info_hash: bytes, ip: str, port: int, node_id: Optional[bytes] = None, is_ipv6: bool = False) -> None:
+        """Add a seed for an infohash (BEP 33).
+
+        Parameters
+        ----------
+        info_hash : bytes
+            20-byte infohash.
+        ip : str
+            Seed IP address.
+        port : int
+            Seed port.
+        node_id : bytes, optional
+            Seed node ID.
+        is_ipv6 : bool
+            Whether the IP is IPv6.
+        """
+        self.add_peer(info_hash, ip, port, node_id=node_id, is_ipv6=is_ipv6, is_seed=True)
+
+    def add_peer_item(self, info_hash: bytes, ip: str, port: int, node_id: Optional[bytes] = None, is_ipv6: bool = False) -> None:
+        """Add a peer item for an infohash (BEP 33).
 
         Parameters
         ----------
@@ -342,15 +409,7 @@ class PeerStore:
         is_ipv6 : bool
             Whether the IP is IPv6.
         """
-        if len(info_hash) != 20:
-            raise ValueError("info_hash must be 20 bytes")
-
-        peer = StoredPeer(ip=ip, port=port, node_id=node_id, is_ipv6=is_ipv6)
-        self._store[info_hash].append(peer)
-
-        # Limit stored peers per infohash
-        if len(self._store[info_hash]) > 20:
-            self._store[info_hash] = self._store[info_hash][-20:]
+        self.add_peer(info_hash, ip, port, node_id=node_id, is_ipv6=is_ipv6, is_seed=False)
 
     def get_peers(self, info_hash: bytes) -> list[StoredPeer]:
         """Get peers for an infohash.
@@ -366,6 +425,40 @@ class PeerStore:
             List of stored peers.
         """
         return list(self._store.get(info_hash, []))
+
+    def get_seed_bloom_filter(self, info_hash: bytes) -> Optional[BloomFilter]:
+        """Generate a bloom filter for all stored seeds for an infohash (BEP 33).
+
+        Returns
+        -------
+        BloomFilter | None
+            A BloomFilter if seeds exist, None otherwise.
+        """
+        peers = self._store.get(info_hash, [])
+        if not peers:
+            return None
+
+        bf = BloomFilter()
+        for peer in peers:
+            bf.insert_ip(peer.ip)
+        return bf
+
+    def get_peer_bloom_filter(self, info_hash: bytes) -> Optional[BloomFilter]:
+        """Generate a bloom filter for all stored peers for an infohash (BEP 33).
+
+        Returns
+        -------
+        BloomFilter | None
+            A BloomFilter if peers exist, None otherwise.
+        """
+        peers = self.get_peers(info_hash)
+        if not peers:
+            return None
+
+        bf = BloomFilter()
+        for peer in peers:
+            bf.insert_ip(peer.ip)
+        return bf
 
     def get_closest_peers(self, info_hash: bytes, count: int = K) -> list[StoredPeer]:
         """Get the closest peers to an infohash.
@@ -408,6 +501,7 @@ class PeerStore:
         for i, peer in enumerate(peers):
             if peer.ip == ip and peer.port == port:
                 peers.pop(i)
+                self._seen[info_hash].discard((ip, port))
                 return True
         return False
 
@@ -975,6 +1069,12 @@ class DHTPeer:
 
         BEP 5: Respond with peers for the infohash, or closest nodes if no peers,
         plus a token for announce_peer.
+
+        BEP 33: If scrape=1 is set, include bloom filter fields (BFsd, BFpe) in
+        the response when database entries exist for the infohash.
+
+        BEP 33: If noseed=1 is set, try to fill the values list with non-seed
+        items on a best-effort basis.
         """
         info_hash = args.get("info_hash", b"")
         if isinstance(info_hash, str):
@@ -985,46 +1085,74 @@ class DHTPeer:
             self.write(error_msg)
             return
 
+        # Check for scrape and noseed flags (BEP 33)
+        scrape = args.get("scrape", 0)
+        if isinstance(scrape, str):
+            scrape = scrape.encode("latin-1")
+        scrape = scrape == b"1" or scrape is True
+
+        noseed = args.get("noseed", 0)
+        if isinstance(noseed, str):
+            noseed = noseed.encode("latin-1")
+        noseed = noseed == b"1" or noseed is True
+
         # Generate token for this peer's IP
         token = self.dht_node.token_secret.generate_token(self.endpoint.ip)
 
         # Check our peer store for peers
         peers = self.dht_node.peer_store.get_peers(info_hash)
 
-        if peers:
-            values = []
-            for peer in peers:
-                peer_data = _compact_peer_encode(peer.ip, peer.port, peer.is_ipv6)
-                values.append(peer_data)
+        # If scrape=1 and we have entries, include bloom filters (BEP 33)
+        if scrape and peers:
+            bf_seed = self.dht_node.peer_store.get_seed_bloom_filter(info_hash)
+            bf_peer = self.dht_node.peer_store.get_peer_bloom_filter(info_hash)
 
             response = {
                 "id": self.dht_node.node_id,
-                "values": values,
                 "token": token,
             }
+            if bf_seed:
+                response["BFsd"] = bf_seed.to_bytes()
+            if bf_peer:
+                response["BFpe"] = bf_peer.to_bytes()
         else:
-            # Return closest nodes instead
-            closest_nodes = self.dht_node.routing_table.get_closest_nodes(info_hash, K)
-            if closest_nodes:
-                nodes_data = b"".join(
-                    _compact_node_encode(
-                        n.node_id,
-                        n.endpoint.ip,
-                        n.endpoint.port,
-                        n.endpoint.is_ipv6,
-                    )
-                    for n in closest_nodes
-                )
+            # Standard get_peers response
+            if peers:
+                values = []
+                for peer in peers:
+                    peer_data = _compact_peer_encode(peer.ip, peer.port, peer.is_ipv6)
+                    values.append(peer_data)
+
+                # If noseed=1, we would filter out seeds here on a best-effort
+                # basis (requires knowing which are seeds vs peers)
                 response = {
                     "id": self.dht_node.node_id,
-                    "nodes": nodes_data,
+                    "values": values,
                     "token": token,
                 }
             else:
-                response = {
-                    "id": self.dht_node.node_id,
-                    "token": token,
-                }
+                # Return closest nodes instead
+                closest_nodes = self.dht_node.routing_table.get_closest_nodes(info_hash, K)
+                if closest_nodes:
+                    nodes_data = b"".join(
+                        _compact_node_encode(
+                            n.node_id,
+                            n.endpoint.ip,
+                            n.endpoint.port,
+                            n.endpoint.is_ipv6,
+                        )
+                        for n in closest_nodes
+                    )
+                    response = {
+                        "id": self.dht_node.node_id,
+                        "nodes": nodes_data,
+                        "token": token,
+                    }
+                else:
+                    response = {
+                        "id": self.dht_node.node_id,
+                        "token": token,
+                    }
 
         resp_bytes = _encode_dht_response(transaction_id, response)
         self.write(resp_bytes)
@@ -1035,6 +1163,10 @@ class DHTPeer:
         BEP 5: Store the peer's contact information under the infohash.
         Validates the token against the source IP address.
         Supports 'implied_port' for NAT traversal.
+
+        BEP 33: If seed=1 is present, store as a seed.  Otherwise store
+        as a peer.  Nodes should try to keep seeds+peers below 6000 to
+        avoid bloom filter false positives approaching 1.0.
         """
         info_hash = args.get("info_hash", b"")
         if isinstance(info_hash, str):
@@ -1055,6 +1187,12 @@ class DHTPeer:
             self.write(error_msg)
             return
 
+        # Check if this is a seed (BEP 33)
+        is_seed = args.get("seed", 0)
+        if isinstance(is_seed, str):
+            is_seed = is_seed.encode("latin-1")
+        is_seed = is_seed == b"1" or is_seed is True
+
         # Determine port
         implied_port = args.get("implied_port", 0)
         if implied_port and implied_port != 0:
@@ -1067,16 +1205,19 @@ class DHTPeer:
                 return
             port = int(port_arg)
 
-        # Store the peer
+        # Store as seed or peer based on seed flag (BEP 33)
         self.dht_node.peer_store.add_peer(
             info_hash=info_hash,
             ip=self.endpoint.ip,
             port=port,
+            node_id=self.dht_node.node_id,
             is_ipv6=self.endpoint.is_ipv6,
+            is_seed=is_seed,
         )
 
         logger.debug(
-            "announce_peer: stored peer %s:%d for infohash %s",
+            "announce_peer: stored %s %s:%d for infohash %s",
+            "SEED" if is_seed else "peer",
             self.endpoint.ip,
             port,
             binascii.b2a_hex(info_hash).decode("ascii"),

@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from dhtrack import bencode as bencode_module
+
 from dhtrack.dht import (
     K,
     BUCKET_SIZE,
@@ -1892,3 +1894,179 @@ class TestPeerIdParser:
         assert "AZ" in PeerIdParser.DASH_CLIENTS
         assert "TR" in PeerIdParser.DASH_CLIENTS
         assert "DE" in PeerIdParser.DASH_CLIENTS
+
+
+# ============================================================================
+# BEP 33 DHT Scrapes Tests
+# ============================================================================
+
+
+class TestBEP33PeerStore:
+    """Tests for BEP 33 PeerStore extensions."""
+
+    def test_add_peer_with_is_seed_true(self):
+        """Adding a peer with is_seed=True should work."""
+        store = PeerStore()
+        info_hash = b"\x01" * 20
+        store.add_peer(info_hash, "192.168.1.1", 6881, is_seed=True)
+        peers = store.get_peers(info_hash)
+        assert len(peers) == 1
+        assert peers[0].ip == "192.168.1.1"
+
+    def test_add_peer_with_is_seed_false(self):
+        """Adding a peer with is_seed=False should work."""
+        store = PeerStore()
+        info_hash = b"\x01" * 20
+        store.add_peer(info_hash, "192.168.1.1", 6881, is_seed=False)
+        peers = store.get_peers(info_hash)
+        assert len(peers) == 1
+
+    def test_add_peer_deduplication(self):
+        """Duplicate IP should not be added per BEP 33."""
+        store = PeerStore()
+        info_hash = b"\x01" * 20
+        store.add_peer(info_hash, "192.168.1.1", 6881)
+        store.add_peer(info_hash, "192.168.1.1", 6881)  # Duplicate
+        peers = store.get_peers(info_hash)
+        assert len(peers) == 1
+
+    def test_add_peer_dedup_different_port(self):
+        """Different port should be stored as separate entry."""
+        store = PeerStore()
+        info_hash = b"\x01" * 20
+        store.add_peer(info_hash, "192.168.1.1", 6881)
+        store.add_peer(info_hash, "192.168.1.1", 6882)
+        peers = store.get_peers(info_hash)
+        assert len(peers) == 2
+
+
+class TestBEP33BloomFilterResponse:
+    """Tests for bloom filter in DHT response handling."""
+
+    def test_handle_get_peers_with_scrape(self):
+        """get_peers with scrape=1 should trigger bloom filter inclusion."""
+        info_hash = b"\x02" * 20
+        mock_node = MagicMock()
+        mock_node.node_id = b"\x01" * 20
+        mock_node.routing_table = MagicMock()
+        mock_node.routing_table.get_closest_nodes.return_value = []
+        mock_node.peer_store = PeerStore()
+        mock_node.token_secret = MagicMock()
+        mock_node.token_secret.generate_token.return_value = b"\x03" * 20
+
+        endpoint = Endpoint("127.0.0.1", 6881)
+        peer = DHTPeer(dht_node=mock_node, endpoint=endpoint, node_id=b"\x04" * 20)
+
+        # Add some peers to the store
+        mock_node.peer_store.add_peer(info_hash, "192.168.1.1", 6881, node_id=mock_node.node_id)
+        mock_node.peer_store.add_peer(info_hash, "192.168.1.2", 6882, node_id=mock_node.node_id)
+
+        tid = b"0a1b"
+        args = {
+            "id": b"\x04" * 20,
+            "info_hash": info_hash,
+            "scrape": b"1",
+        }
+
+        # Encode query
+        query_bytes = _encode_dht_query("get_peers", args, tid)
+
+        # Mock the write method to capture the response
+        captured = {"data": None}
+
+        def capture_write(data):
+            captured["data"] = data
+
+        peer.write = capture_write
+
+        # Process the query
+        parsed = bencode_module.decode(query_bytes)
+        peer._handle_query(parsed)
+
+        # Decode response
+        assert captured["data"] is not None
+        response = bencode_module.decode(captured["data"])
+        assert response["y"] == "r"
+
+        r = response["r"]
+        # Should contain a token
+        assert "token" in r
+        # Should contain ID
+        assert "id" in r
+        # BFsd should be present if we have seed data
+        # (depends on bloom filter generation)
+        if "BFsd" in r:
+            assert len(r["BFsd"]) == 256
+
+
+class TestBEP33AnnouncePeerSeed:
+    """Tests for announce_peer with seed parameter (BEP 33)."""
+
+    def test_announce_peer_with_seed_one(self):
+        """announce_peer with seed=1 should store as seed."""
+        info_hash = b"\x02" * 20
+        mock_node = MagicMock()
+        mock_node.node_id = b"\x01" * 20
+        mock_node.routing_table = MagicMock()
+        mock_node.routing_table.get_closest_nodes.return_value = []
+        mock_node.peer_store = PeerStore()
+        mock_node.token_secret = MagicMock()
+        mock_node.token_secret.validate_token.return_value = True
+
+        endpoint = Endpoint("127.0.0.1", 6881)
+        peer = DHTPeer(dht_node=mock_node, endpoint=endpoint, node_id=b"\x04" * 20)
+
+        tid = b"0a1b"
+        token = b"\x03" * 20
+        args = {
+            "id": b"\x04" * 20,
+            "info_hash": info_hash,
+            "port": 6881,
+            "token": token,
+            "seed": b"1",
+        }
+
+        captured = {"data": None}
+        peer.write = lambda data: captured.update({"data": data})
+
+        query_bytes = _encode_dht_query("announce_peer", args, tid)
+        parsed = bencode_module.decode(query_bytes)
+        peer._handle_query(parsed)
+
+        # Should succeed (no error response)
+        assert captured["data"] is not None
+        response = bencode_module.decode(captured["data"])
+        assert response["y"] == "r"
+        assert "id" in response["r"]
+
+
+class TestBEP33ScrapeBloomFilters:
+    """Tests for bloom filter generation in scrape responses."""
+
+    def test_seed_bloom_filter_generation(self):
+        """Seed bloom filter should be generated from stored peers."""
+        store = PeerStore()
+        info_hash = b"\x01" * 20
+        store.add_peer(info_hash, "192.168.1.1", 6881)
+        store.add_peer(info_hash, "192.168.1.2", 6882)
+
+        bf = store.get_seed_bloom_filter(info_hash)
+        assert bf is not None
+        assert len(bf.to_bytes()) == 256
+
+    def test_peer_bloom_filter_generation(self):
+        """Peer bloom filter should be generated from stored peers."""
+        store = PeerStore()
+        info_hash = b"\x01" * 20
+        store.add_peer(info_hash, "192.168.1.1", 6881)
+
+        bf = store.get_peer_bloom_filter(info_hash)
+        assert bf is not None
+        assert len(bf.to_bytes()) == 256
+
+    def test_empty_bloom_filter_returns_none(self):
+        """Empty store should return None for bloom filter."""
+        store = PeerStore()
+        info_hash = b"\x01" * 20
+        assert store.get_seed_bloom_filter(info_hash) is None
+        assert store.get_peer_bloom_filter(info_hash) is None

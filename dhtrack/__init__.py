@@ -9,6 +9,68 @@ from __future__ import annotations
 
 __version__ = "2.0.0"
 
+# BEP 4: Assigned Numbers
+from dhtrack.bep4 import (
+    # Reserved byte constants
+    RESERVED_AZUREUS_MSG,
+    RESERVED_LOCATION_AWARE,
+    RESERVED_LTEP,
+    RESERVED_DHT,
+    RESERVED_PEER_EXCHANGE,
+    RESERVED_FAST_EXTENSIONS,
+    RESERVED_NAT_TRAVERSAL,
+    RESERVED_HYBRID_TORRENT_LEGACY,
+    RESERVED_BITCOMET_MSG,
+    RESERVED_BITCOMET_EXT,
+    RESERVED_XBT_METADATA_EXCHANGE,
+    RESERVED_BEP10,
+    # Core protocol message types
+    MSG_CHOKE,
+    MSG_UNCHOKE,
+    MSG_INTERESTED,
+    MSG_NOT_INTERESTED,
+    MSG_HAVE,
+    MSG_BITFIELD,
+    MSG_REQUEST,
+    MSG_PIECE,
+    MSG_CANCEL,
+    # BEP 6 / BEP 16 message types
+    MSG_PORT,
+    MSG_SUGGEST,
+    MSG_HAVE_ALL,
+    MSG_HAVE_NONE,
+    MSG_REJECT_REQUEST,
+    MSG_ALLOWED_FAST,
+    # BEP 10
+    MSG_LTEP_HANDSHAKE,
+    # Hash Transfer Protocol
+    MSG_HASH_REQUEST,
+    MSG_HASH_REQUESTS,
+    MSG_HASH_REJECT,
+    # Sets and mappings
+    CORE_MESSAGE_IDS,
+    FAST_EXTENSION_MESSAGE_IDS,
+    DHT_EXTENSION_MESSAGE_IDS,
+    DEPLOYED_EXTENSION_MESSAGE_IDS,
+    ALL_KNOWN_MESSAGE_IDS,
+    MESSAGE_NAMES,
+    # Utility functions
+    is_reserved_bit_set,
+    set_reserved_bit,
+    clear_reserved_bit,
+    message_name,
+    is_valid_message_type,
+    is_core_message,
+    is_fast_extension_message,
+    is_dht_extension_message,
+    decode_reserved_bytes,
+    make_handshake_reserved,
+    # Exceptions
+    BEP4Error,
+    InvalidReservedByteError,
+    InvalidMessageTypeError,
+)
+
 # BEP 10 Extension Protocol support
 from dhtrack.peer import (
     ExtensionNegotiator,
@@ -72,6 +134,32 @@ from dhtrack.udp_tracker import (
     AnnounceResponse,
     ScrapeInfo,
     ScrapeResponse,
+)
+
+# BEP 31: Failure Retry Extension
+from dhtrack.bep31 import (
+    FailureRetryInfo,
+    TrackerRetryScheduler,
+    parse_failure_response,
+    should_retry_tracker,
+)
+
+# BEP 53: Magnet URI File Selection
+from dhtrack.bep53 import (
+    MagnetInfo,
+    parse_magnet_uri,
+    filter_files_by_select_only,
+    create_magnet_from_torrent,
+)
+
+# BEP 54: lt_donthave Extension
+from dhtrack.bep54 import (
+    LT_DONTHAVE_NAME,
+    LT_DONTHAVE_SUBOP,
+    encode_donthave,
+    decode_donthave,
+    create_donthave_message,
+    parse_donthave_from_extended,
 )
 
 # BEP 48: Tracker Scrape Extension
@@ -142,6 +230,57 @@ from dhtrack.utp import (
 )
 
 __all__ = [
+    # BEP 4: Assigned Numbers
+    "RESERVED_AZUREUS_MSG",
+    "RESERVED_LOCATION_AWARE",
+    "RESERVED_LTEP",
+    "RESERVED_DHT",
+    "RESERVED_PEER_EXCHANGE",
+    "RESERVED_FAST_EXTENSIONS",
+    "RESERVED_NAT_TRAVERSAL",
+    "RESERVED_HYBRID_TORRENT_LEGACY",
+    "RESERVED_BITCOMET_MSG",
+    "RESERVED_BITCOMET_EXT",
+    "RESERVED_XBT_METADATA_EXCHANGE",
+    "RESERVED_BEP10",
+    "MSG_CHOKE",
+    "MSG_UNCHOKE",
+    "MSG_INTERESTED",
+    "MSG_NOT_INTERESTED",
+    "MSG_HAVE",
+    "MSG_BITFIELD",
+    "MSG_REQUEST",
+    "MSG_PIECE",
+    "MSG_CANCEL",
+    "MSG_PORT",
+    "MSG_SUGGEST",
+    "MSG_HAVE_ALL",
+    "MSG_HAVE_NONE",
+    "MSG_REJECT_REQUEST",
+    "MSG_ALLOWED_FAST",
+    "MSG_LTEP_HANDSHAKE",
+    "MSG_HASH_REQUEST",
+    "MSG_HASH_REQUESTS",
+    "MSG_HASH_REJECT",
+    "CORE_MESSAGE_IDS",
+    "FAST_EXTENSION_MESSAGE_IDS",
+    "DHT_EXTENSION_MESSAGE_IDS",
+    "DEPLOYED_EXTENSION_MESSAGE_IDS",
+    "ALL_KNOWN_MESSAGE_IDS",
+    "MESSAGE_NAMES",
+    "is_reserved_bit_set",
+    "set_reserved_bit",
+    "clear_reserved_bit",
+    "message_name",
+    "is_valid_message_type",
+    "is_core_message",
+    "is_fast_extension_message",
+    "is_dht_extension_message",
+    "decode_reserved_bytes",
+    "make_handshake_reserved",
+    "BEP4Error",
+    "InvalidReservedByteError",
+    "InvalidMessageTypeError",
     # Peer connection
     "ExtensionNegotiator",
     "MetadataExchange",
@@ -195,6 +334,23 @@ __all__ = [
     "AnnounceResponse",
     "ScrapeInfo",
     "ScrapeResponse",
+    # BEP 31 Failure Retry
+    "FailureRetryInfo",
+    "TrackerRetryScheduler",
+    "parse_failure_response",
+    "should_retry_tracker",
+    # BEP 53 Magnet URI
+    "MagnetInfo",
+    "parse_magnet_uri",
+    "filter_files_by_select_only",
+    "create_magnet_from_torrent",
+    # BEP 54 lt_donthave
+    "LT_DONTHAVE_NAME",
+    "LT_DONTHAVE_SUBOP",
+    "encode_donthave",
+    "decode_donthave",
+    "create_donthave_message",
+    "parse_donthave_from_extended",
     # BEP 48 Tracker Scrape
     "TrackerClient",
     "ScrapeError",

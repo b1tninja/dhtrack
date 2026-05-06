@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from dhtrack import bencode as bencode_module
 from dhtrack.bencode import BEncodeValue
+from dhtrack.bep31 import FailureRetryInfo, parse_failure_response, TrackerRetryScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +417,35 @@ class TrackerClient:
             f"Failed to scrape after {self.max_retries + 1} attempts: {last_exception}"
         ) from last_exception
 
+    def _parse_failure_response(self, data: bytes) -> FailureRetryInfo:
+        """Parse a bencoded failure response from the tracker.
+
+        Parameters
+        ----------
+        data : bytes
+            The raw response from the tracker.
+
+        Returns
+        -------
+        FailureRetryInfo
+            Parsed BEP 31 failure information.
+        """
+        try:
+            decoded = bencode_module.decode(data)
+        except Exception:
+            return FailureRetryInfo(
+                failure_reason="Failed to decode tracker response",
+                permanent=True,
+            )
+
+        if not isinstance(decoded, dict):
+            return FailureRetryInfo(
+                failure_reason="Invalid response format",
+                permanent=True,
+            )
+
+        return parse_failure_response(decoded)
+
     def _do_scrape_request(self, url: str) -> ScrapeResponse:
         """Execute a single scrape request.
 
@@ -441,7 +471,17 @@ class TrackerClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 data = response.read()
-                return _decode_scrape_response(data)
+                result = _decode_scrape_response(data)
+                # Check for BEP 31 retry information in error responses
+                if result.is_error:
+                    failure_info = self._parse_failure_response(data)
+                    logger.warning(
+                        "Scrape failed: %s (retry in %s minutes, permanent=%s)",
+                        result.failure_reason,
+                        failure_info.retry_minutes,
+                        failure_info.permanent,
+                    )
+                return result
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 raise ScrapeError(f"Tracker not found: {exc}") from exc
