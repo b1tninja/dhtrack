@@ -80,6 +80,17 @@ from dhtrack.tracker import (
     ScrapeError,
 )
 
+# BEP 14: Local Service Discovery
+from dhtrack.lsd import (
+    LSDManager,
+    LSDConfig,
+    LSDAnnouncement,
+    build_lsd_announce,
+    LSD_MULTICAST_V4,
+    LSD_MULTICAST_V6,
+    LSD_PORT,
+)
+
 __all__ = [
     # Peer connection
     "ExtensionNegotiator",
@@ -137,4 +148,12 @@ __all__ = [
     # BEP 48 Tracker Scrape
     "TrackerClient",
     "ScrapeError",
+    # BEP 14 LSD
+    "LSDManager",
+    "LSDConfig",
+    "LSDAnnouncement",
+    "build_lsd_announce",
+    "LSD_MULTICAST_V4",
+    "LSD_MULTICAST_V6",
+    "LSD_PORT",
 ]
