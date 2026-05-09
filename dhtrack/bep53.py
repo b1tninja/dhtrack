@@ -18,12 +18,11 @@ b"QFLA47OD3KEQVOVECCGMCTWBYDQ7IE"
 from __future__ import annotations
 
 import base64
-import hashlib
+import ipaddress
 import logging
-import re
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Optional, Set
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,7 @@ MAGNET_SCHEME = "magnet"
 _BASE32_PADDED = b"="  # RFC 4648 padding
 
 
-def _parse_so_parameter(value: str) -> Optional[set[int]]:
+def _parse_so_parameter(value: str) -> set[int] | None:
     """Parse the ``select-only`` (``so``) parameter value.
 
     Format: comma-separated list of file indices with optional inclusive
@@ -118,17 +117,17 @@ class MagnetInfo:
         Urgency hint.
     """
 
-    info_hash: Optional[bytes] = None
-    info_hash_base32: Optional[bytes] = None
-    name: Optional[str] = None
+    info_hash: bytes | None = None
+    info_hash_base32: bytes | None = None
+    name: str | None = None
     trackers: list[str] = field(default_factory=list)
-    select_only: Optional[set[int]] = None
+    select_only: set[int] | None = None
     peers: list[str] = field(default_factory=list)
-    keywords: Optional[str] = None
-    urgh: Optional[str] = None
+    keywords: str | None = None
+    urgh: str | None = None
 
     @property
-    def info_hash_hex(self) -> Optional[str]:
+    def info_hash_hex(self) -> str | None:
         """Hex-encoded info hash.
 
         Returns
@@ -141,7 +140,7 @@ class MagnetInfo:
         return self.info_hash.hex()
 
     @property
-    def info_hash_base16(self) -> Optional[str]:
+    def info_hash_base16(self) -> str | None:
         """Upper-case hex info hash (BTIH format).
 
         Returns
@@ -234,7 +233,82 @@ def parse_magnet_uri(uri: str) -> MagnetInfo:
     return info
 
 
-def _decode_btih(btih: str) -> Optional[bytes]:
+def _split_magnet_pe_host_port(text: str) -> tuple[str, int] | None:
+    """Split a magnet ``pe`` value into ``(host, port)``.
+
+    Supports ``a.b.c.d:port``, hostnames as ``host:port`` when there is a
+    single colon, and bracketed IPv6 ``[addr]:port``.
+    """
+    s = text.strip()
+    if not s:
+        return None
+    if s.startswith("["):
+        idx = s.find("]")
+        if idx < 2:
+            return None
+        host = s[1:idx].strip()
+        rest = s[idx + 1 :]
+        if not rest.startswith(":") or len(rest) < 2:
+            return None
+        port_str = rest[1:].strip()
+    else:
+        if s.count(":") != 1:
+            return None
+        host, port_str = s.split(":", 1)
+        host = host.strip()
+        port_str = port_str.strip()
+    if not host or not port_str:
+        return None
+    try:
+        port = int(port_str)
+    except ValueError:
+        return None
+    if not (1 <= port <= 65535):
+        return None
+    return host, port
+
+
+def magnet_peer_strings_to_triplets(
+    peer_strings: list[str],
+) -> list[tuple[str, int, bool]]:
+    """Convert magnet ``pe`` strings to ``(host, port, is_ipv6)`` triplets.
+
+    Literal IPv4/IPv6 addresses set ``is_ipv6`` from ``ipaddress``; other
+    host strings are passed through with ``is_ipv6=False`` (DNS left to the
+    transport). Invalid entries are skipped.
+    """
+    out: list[tuple[str, int, bool]] = []
+    for raw in peer_strings:
+        hp = _split_magnet_pe_host_port(raw or "")
+        if hp is None:
+            continue
+        host, port = hp
+        try:
+            ip = ipaddress.ip_address(host)
+            out.append((str(ip), port, ip.version == 6))
+        except ValueError:
+            out.append((host, port, False))
+    return out
+
+
+def merge_peer_triplets_preferred(
+    primary: list[tuple[str, int, bool]],
+    secondary: list[tuple[str, int, bool]],
+) -> list[tuple[str, int, bool]]:
+    """Merge triplets with ``primary`` first, deduplicating by ``(host, port)``."""
+    seen: set[tuple[str, int]] = set()
+    merged: list[tuple[str, int, bool]] = []
+    for trip in list(primary) + list(secondary):
+        host, port, is_v6 = trip
+        key = (host, port)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(trip)
+    return merged
+
+
+def _decode_btih(btih: str) -> bytes | None:
     """Decode a BTIH value (base32 or base32-sha1) to raw bytes.
 
     Parameters
@@ -279,7 +353,7 @@ def _decode_btih(btih: str) -> Optional[bytes]:
 
 def filter_files_by_select_only(
     torrent: Any,
-    select_only: Optional[set[int]],
+    select_only: set[int] | None,
 ) -> set[int]:
     """Filter torrent files by the ``select-only`` parameter from a magnet URI.
 
@@ -330,9 +404,9 @@ def filter_files_by_select_only(
 
 def create_magnet_from_torrent(
     torrent: Any,
-    name: Optional[str] = None,
-    trackers: Optional[list[str]] = None,
-    select_only: Optional[set[int]] = None,
+    name: str | None = None,
+    trackers: list[str] | None = None,
+    select_only: set[int] | None = None,
 ) -> str:
     """Create a magnet URI string from a torrent object (BEP 53).
 
@@ -385,19 +459,36 @@ def create_magnet_from_torrent(
         so_value = _format_select_only(indices)
         params.append(("so", so_value))
 
-    query = urllib.parse.urlencode(params, doseq=False)
+    # Build query string manually to avoid URL-encoding the xt parameter
+    # (urllib.parse.urlencode would encode colons as %3A)
+    query_parts: list[str] = []
+    for key, value in params:
+        if key == "xt":
+            # Keep the URN unencoded
+            query_parts.append(f"{key}={value}")
+        elif key == "so":
+            # Keep commas and ranges human-readable (and match test expectations)
+            encoded_value = urllib.parse.quote_plus(value, safe=", -")
+            query_parts.append(f"{key}={encoded_value}")
+        else:
+            # Use application/x-www-form-urlencoded style (spaces -> '+')
+            encoded_value = urllib.parse.quote_plus(value, safe="")
+            query_parts.append(f"{key}={encoded_value}")
+
+    query = "&".join(query_parts)
     return f"magnet:?{query}"
 
 
 def _format_select_only(indices: list[int]) -> str:
     """Format a sorted list of file indices into a BEP 53 ``so`` value.
 
-    Groups consecutive indices into ranges.
+    Groups consecutive indices into ranges.  Input is automatically sorted
+    and deduplicated regardless of the order passed in.
 
     Parameters
     ----------
     indices : list[int]
-        Sorted, unique file indices.
+        File indices (will be sorted and deduplicated internally).
 
     Returns
     -------
@@ -406,6 +497,9 @@ def _format_select_only(indices: list[int]) -> str:
     """
     if not indices:
         return ""
+
+    # Sort and deduplicate
+    indices = sorted(set(indices))
 
     result: list[str] = []
     start = indices[0]

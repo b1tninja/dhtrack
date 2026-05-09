@@ -23,8 +23,6 @@ b'\\x00\\x07\\x14\\x00*\\x00\\x2a'
 from __future__ import annotations
 
 import struct
-from typing import Optional
-
 
 # BEP 54 constants
 LT_DONTHAVE_NAME = b"lt_donthave"  # Extension name for LTEP handshake
@@ -89,9 +87,7 @@ def decode_donthave(data: bytes) -> tuple[int, int]:
         If the data is too short or malformed.
     """
     if len(data) < 5:
-        raise ValueError(
-            f"Donthave payload too short: {len(data)} bytes (minimum 5)"
-        )
+        raise ValueError(f"Donthave payload too short: {len(data)} bytes (minimum 5)")
 
     subop = data[0]
     piece_index = struct.unpack("!I", data[1:5])[0]
@@ -134,7 +130,7 @@ def create_donthave_message(subop: int, piece_index: int) -> bytes:
     return bytes(msg)
 
 
-def parse_donthave_from_extended(data: bytes) -> Optional[tuple[int, int]]:
+def parse_donthave_from_extended(data: bytes) -> tuple[int, int] | None:
     """Extract lt_donthave data from an extended message.
 
     Given the payload bytes from an extended message (after the

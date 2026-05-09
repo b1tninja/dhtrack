@@ -33,7 +33,6 @@ import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -112,23 +111,23 @@ class TorrentFeedItem:
         Publication date from ``<pubDate>`` element.
     """
 
-    title: Optional[str] = None
-    description: Optional[str] = None
-    torrent_url: Optional[str] = None
-    info_hash: Optional[str] = None
-    guid: Optional[str] = None
-    enclosure_length: Optional[int] = None
-    content_size: Optional[int] = None
-    filename: Optional[str] = None
-    content_length: Optional[int] = None
-    magnet_uri: Optional[str] = None
-    trackers: Optional[list[str]] = None
-    link: Optional[str] = None
-    media_hash_algo: Optional[str] = None
-    pub_date: Optional[str] = None
+    title: str | None = None
+    description: str | None = None
+    torrent_url: str | None = None
+    info_hash: str | None = None
+    guid: str | None = None
+    enclosure_length: int | None = None
+    content_size: int | None = None
+    filename: str | None = None
+    content_length: int | None = None
+    magnet_uri: str | None = None
+    trackers: list[str] | None = None
+    link: str | None = None
+    media_hash_algo: str | None = None
+    pub_date: str | None = None
 
     @property
-    def info_hash_hex(self) -> Optional[str]:
+    def info_hash_hex(self) -> str | None:
         """Return lower-case hex-encoded info hash.
 
         Returns
@@ -141,7 +140,7 @@ class TorrentFeedItem:
         return self.info_hash.lower()
 
     @property
-    def info_hash_upper(self) -> Optional[str]:
+    def info_hash_upper(self) -> str | None:
         """Return upper-case hex-encoded info hash (BTIH format).
 
         Returns
@@ -153,7 +152,7 @@ class TorrentFeedItem:
             return None
         return self.info_hash.upper()
 
-    def get_torrent_link(self) -> Optional[str]:
+    def get_torrent_link(self) -> str | None:
         """Get the primary torrent link.
 
         Returns the ``torrent_url`` if available, otherwise falls back to
@@ -196,13 +195,15 @@ class TorrentFeedItem:
             ``True`` if any of ``torrent_url``, ``info_hash``,
             ``magnet_uri``, ``guid``, ``link`` is set.
         """
-        return any([
-            self.torrent_url,
-            self.info_hash,
-            self.magnet_uri,
-            self.guid,
-            self.link,
-        ])
+        return any(
+            [
+                self.torrent_url,
+                self.info_hash,
+                self.magnet_uri,
+                self.guid,
+                self.link,
+            ]
+        )
 
 
 @dataclass
@@ -236,10 +237,10 @@ class RSSFeed:
     link: str = ""
     description: str = ""
     ttl: int = 3600
-    language: Optional[str] = None
-    copyright: Optional[str] = None
-    manager: Optional[str] = None
-    author: Optional[str] = None
+    language: str | None = None
+    copyright: str | None = None
+    manager: str | None = None
+    author: str | None = None
     items: list[TorrentFeedItem] = field(default_factory=list)
 
 
@@ -286,8 +287,8 @@ def _ns(tag: str, prefix: str = "") -> str:
 def _find_text(
     element: ET.Element,
     path: str,
-    namespaces: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    namespaces: dict[str, str] | None = None,
+) -> str | None:
     """Get the text content of a child element.
 
     Parameters
@@ -345,7 +346,7 @@ def _extract_media_content(item_el: ET.Element) -> dict:
     return dict(content.attrib)
 
 
-def _extract_media_hash(item_el: ET.Element) -> Optional[str]:
+def _extract_media_hash(item_el: ET.Element) -> str | None:
     """Extract the media:hash value from an RSS item."""
     hash_el = item_el.find(_ns("hash", "media"))
     if hash_el is None:
@@ -394,17 +395,20 @@ def _extract_torrent_tag(item_el: ET.Element) -> dict:
                 for tracker in group:
                     tracker_url = tracker.text.strip() if tracker.text else ""
                     if tracker_url:
-                        result.setdefault("_trackers_ordered", []).append({
-                            "url": tracker_url,
-                            "order": group_order,
-                            "seeds": tracker.attrib.get("seeds", "0"),
-                            "peers": tracker.attrib.get("peers", "0"),
-                        })
+                        result.setdefault("_trackers_ordered", []).append(
+                            {
+                                "url": tracker_url,
+                                "order": group_order,
+                                "seeds": tracker.attrib.get("seeds", "0"),
+                                "peers": tracker.attrib.get("peers", "0"),
+                            }
+                        )
             if "_trackers_ordered" in result:
                 # Sort by order preference
                 ordered = result.pop("_trackers_ordered")
                 result["trackers"] = [
-                    t["url"] for t in sorted(
+                    t["url"]
+                    for t in sorted(
                         ordered,
                         key=lambda x: (0 if x["order"] == "ordered" else 1, x["url"]),
                     )
@@ -415,7 +419,7 @@ def _extract_torrent_tag(item_el: ET.Element) -> dict:
     return result
 
 
-def _parse_torrent_url(url: Optional[str]) -> Optional[str]:
+def _parse_torrent_url(url: str | None) -> str | None:
     """Validate and clean a torrent URL.
 
     Parameters
@@ -444,7 +448,7 @@ def _parse_torrent_url(url: Optional[str]) -> Optional[str]:
     return None
 
 
-def _parse_info_hash(raw_hash: Optional[str]) -> Optional[str]:
+def _parse_info_hash(raw_hash: str | None) -> str | None:
     """Validate and normalize an info hash string.
 
     Parameters
@@ -464,7 +468,7 @@ def _parse_info_hash(raw_hash: Optional[str]) -> Optional[str]:
         return None
 
     # Remove non-hex characters
-    cleaned = re.sub(r'[^0-9a-fA-F]', '', raw_hash)
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", raw_hash)
 
     if len(cleaned) == 40:
         return cleaned.lower()
@@ -647,9 +651,7 @@ def parse_rss_feed(xml_content: str) -> RSSFeed:
         if root.tag == "feed" and "atom" in str(root.tag):
             logger.warning("Atom feed detected; BEP 0036 focuses on RSS 2.0")
         elif root.tag != "rss":
-            raise RSSParseError(
-                f"Expected <rss> root element, got <{root.tag}>"
-            )
+            raise RSSParseError(f"Expected <rss> root element, got <{root.tag}>")
 
     # Find channel element
     channel = root.find("channel")
@@ -734,7 +736,7 @@ def create_rss_feed(
     description: str,
     items: list[TorrentFeedItem],
     ttl: int = 3600,
-    language: Optional[str] = None,
+    language: str | None = None,
 ) -> str:
     """Create an RSS 2.0 feed XML string from torrent items.
 
@@ -764,29 +766,29 @@ def create_rss_feed(
     lines: list[str] = []
     lines.append('<?xml version="1.0" encoding="utf-8"?>')
     lines.append('<rss version="2.0">')
-    lines.append('  <channel>')
+    lines.append("  <channel>")
 
-    lines.append(f'    <title>{_escape_xml(title)}</title>')
-    lines.append(f'    <link>{_escape_xml(link)}</link>')
-    lines.append(f'    <description>{_escape_xml(description)}</description>')
-    lines.append(f'    <ttl>{ttl}</ttl>')
+    lines.append(f"    <title>{_escape_xml(title)}</title>")
+    lines.append(f"    <link>{_escape_xml(link)}</link>")
+    lines.append(f"    <description>{_escape_xml(description)}</description>")
+    lines.append(f"    <ttl>{ttl}</ttl>")
 
     if language:
-        lines.append(f'    <language>{_escape_xml(language)}</language>')
+        lines.append(f"    <language>{_escape_xml(language)}</language>")
 
-    lines.append('  </channel>')
-    lines.append('</rss>')
+    lines.append("  </channel>")
+    lines.append("</rss>")
 
-    return '\n'.join(lines)
+    return "\n".join(lines)
 
 
 def create_torrent_item_rss(
     title: str,
     torrent_url: str,
-    content_size: Optional[int] = None,
-    info_hash: Optional[str] = None,
-    description: Optional[str] = None,
-    guid: Optional[str] = None,
+    content_size: int | None = None,
+    info_hash: str | None = None,
+    description: str | None = None,
+    guid: str | None = None,
 ) -> str:
     """Create a single RSS ``<item>`` element for a torrent.
 
@@ -814,19 +816,19 @@ def create_torrent_item_rss(
         An RSS ``<item>`` XML element string.
     """
     lines: list[str] = []
-    lines.append('    <item>')
-    lines.append(f'      <title>{_escape_xml(title)}</title>')
+    lines.append("    <item>")
+    lines.append(f"      <title>{_escape_xml(title)}</title>")
 
     if description:
-        lines.append(f'      <description>{_escape_xml(description)}</description>')
+        lines.append(f"      <description>{_escape_xml(description)}</description>")
 
     # GUID - prefer explicit info hash or a URL that acts as GUID
     if guid:
-        lines.append(f'      <guid>{_escape_xml(guid)}</guid>')
+        lines.append(f"      <guid>{_escape_xml(guid)}</guid>")
     elif info_hash:
-        lines.append(f'      <guid>{_escape_xml(info_hash)}</guid>')
+        lines.append(f"      <guid>{_escape_xml(info_hash)}</guid>")
     else:
-        lines.append(f'      <guid>{_escape_xml(torrent_url)}</guid>')
+        lines.append(f"      <guid>{_escape_xml(torrent_url)}</guid>")
 
     # Enclosure (recommended)
     enclosure_attrs: list[str] = [
@@ -836,9 +838,7 @@ def create_torrent_item_rss(
     if content_size is not None:
         enclosure_attrs.append(f'length="{content_size}"')
 
-    lines.append(
-        f'      <enclosure {" ".join(enclosure_attrs)}/>'
-    )
+    lines.append(f"      <enclosure {' '.join(enclosure_attrs)}/>")
 
     # media:content (optional, for compatibility)
     media_attrs: list[str] = [
@@ -847,19 +847,15 @@ def create_torrent_item_rss(
     if content_size is not None:
         media_attrs.append(f'fileSize="{content_size}"')
 
-    lines.append(
-        f'      <media:content {" ".join(media_attrs)}/>'
-    )
+    lines.append(f"      <media:content {' '.join(media_attrs)}/>")
 
     # media:hash (optional)
     if info_hash:
-        lines.append(
-            f'      <media:hash algo="sha1">{_escape_xml(info_hash)}</media:hash>'
-        )
+        lines.append(f'      <media:hash algo="sha1">{_escape_xml(info_hash)}</media:hash>')
 
-    lines.append('    </item>')
+    lines.append("    </item>")
 
-    return '\n'.join(lines)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -867,7 +863,7 @@ def create_torrent_item_rss(
 # ---------------------------------------------------------------------------
 
 
-def detect_torrent_url(text: str) -> Optional[str]:
+def detect_torrent_url(text: str) -> str | None:
     """Detect a torrent URL within arbitrary text.
 
     Parameters
@@ -886,7 +882,7 @@ def detect_torrent_url(text: str) -> Optional[str]:
     return None
 
 
-def detect_magnet_uri(text: str) -> Optional[str]:
+def detect_magnet_uri(text: str) -> str | None:
     """Detect a magnet URI within arbitrary text.
 
     Parameters
@@ -904,7 +900,7 @@ def detect_magnet_uri(text: str) -> Optional[str]:
         start = match.start()
         end = start
         for i in range(start, len(text)):
-            if text[i] in (' ', '\t', '\n', '\r', '"', "'", '>', '<'):
+            if text[i] in (" ", "\t", "\n", "\r", '"', "'", ">", "<"):
                 end = i
                 break
         else:
@@ -913,7 +909,7 @@ def detect_magnet_uri(text: str) -> Optional[str]:
     return None
 
 
-def extract_info_hash_from_magnet(magnet_uri: str) -> Optional[str]:
+def extract_info_hash_from_magnet(magnet_uri: str) -> str | None:
     """Extract the info hash from a magnet URI.
 
     Parameters
@@ -943,7 +939,7 @@ def extract_info_hash_from_magnet(magnet_uri: str) -> Optional[str]:
                 except ValueError:
                     pass
             # Try base32
-            cleaned = re.sub(r'[^A-Za-z0-9]', '', btih).upper()
+            cleaned = re.sub(r"[^A-Za-z0-9]", "", btih).upper()
             padding = (8 - len(cleaned) % 8) % 8
             padded = cleaned + "=" * padding
             try:

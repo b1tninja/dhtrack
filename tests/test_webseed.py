@@ -3,13 +3,13 @@
 import hashlib
 import unittest
 
+from dhtrack.torrent import Torrent
 from dhtrack.webseed import (
     DownloadState,
     HTTPDownloadThread,
     WebSeedError,
     WebSeedManager,
 )
-from dhtrack.torrent import Torrent
 
 
 class TestDownloadState(unittest.TestCase):
@@ -258,6 +258,97 @@ class TestTorrentWebseedUrls(unittest.TestCase):
         torrent = Torrent(data)
         url = torrent.get_webseeding_url_for_file(0)
         self.assertIsNone(url)
+
+
+class TestWebSeedManagerMultiURLFallback(unittest.TestCase):
+    """Multi-URL fallback and discard behaviour (BEP 19)."""
+
+    def _create_torrent(self, urls: list[str]) -> Torrent:
+        piece_hash = hashlib.sha1(b"testdata" * 1024).digest()
+        info = {
+            "name": b"test.dat",
+            "piece length": 16384,
+            "piece": piece_hash,
+            "length": 16384,
+        }
+        data = {
+            "info": info,
+            "url-list": [u.encode() for u in urls],
+        }
+        return Torrent(data)
+
+    def test_falls_back_to_second_url_when_first_fails(self):
+        """WebSeedManager.download_piece tries all URLs and succeeds on second."""
+        from unittest.mock import patch
+
+        from dhtrack.webseed import DownloadState, HTTPDownloadThread
+
+        torrent = self._create_torrent(
+            [
+                "http://bad.example.com/file",
+                "http://good.example.com/file",
+            ]
+        )
+        manager = WebSeedManager(torrent)
+
+        def fake_download(thread_self):
+            if "bad" in thread_self.url:
+                thread_self.data = None
+                thread_self.error = "connection refused"
+            else:
+                thread_self.data = b"x" * 16384
+                thread_self.error = None
+
+        def fake_join(thread_self, timeout=None):
+            pass
+
+        # Bypass SHA-1 check so we can test the URL fallback logic in isolation
+        with (
+            patch.object(HTTPDownloadThread, "start", fake_download),
+            patch.object(HTTPDownloadThread, "join", fake_join),
+            patch.object(DownloadState, "compute_sha1", return_value=torrent.infohash),
+        ):
+            state = manager.download_piece(0, 0, 16384)
+
+        self.assertIsNotNone(state)
+        self.assertIsNotNone(state.data)
+        self.assertEqual(len(state.data), 16384)
+
+    def test_bad_url_added_to_invalid_set_on_all_failures(self):
+        """All tried URLs are discarded when every download attempt fails."""
+        from unittest.mock import patch
+
+        from dhtrack.webseed import HTTPDownloadThread
+
+        torrent = self._create_torrent(["http://down1.example.com/file"])
+        manager = WebSeedManager(torrent)
+
+        def fake_download(thread_self):
+            thread_self.data = None
+            thread_self.error = "timeout"
+
+        def fake_join(thread_self, timeout=None):
+            pass
+
+        with (
+            patch.object(HTTPDownloadThread, "start", fake_download),
+            patch.object(HTTPDownloadThread, "join", fake_join),
+        ):
+            result = manager.download_piece(0, 0, 16384)
+
+        # Should return a failed DownloadState (not None) and mark URL invalid
+        self.assertIsNotNone(result)
+        self.assertTrue(result.is_failed)
+        self.assertTrue(len(manager.invalid_urls) > 0)
+
+    def test_invalid_url_skipped_on_subsequent_call(self):
+        """A discarded URL is not retried in subsequent download_piece calls."""
+        torrent = self._create_torrent(["http://bad.example.com/file"])
+        manager = WebSeedManager(torrent)
+        manager.invalid_urls.add("http://bad.example.com/file")
+
+        state = manager.download_piece(0, 0, 16384)
+        self.assertIsNone(state)
 
 
 if __name__ == "__main__":

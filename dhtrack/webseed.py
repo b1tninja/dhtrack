@@ -16,13 +16,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
-import socket
-import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from http.client import HTTPResponse
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -65,8 +62,11 @@ class WebSeedError(Exception):
     """Base exception for webseed errors."""
 
 
-class WebSeedTimeout(WebSeedError):
+class WebSeedTimeoutError(WebSeedError):
     """Raised when a webseed request times out."""
+
+
+WebSeedTimeout = WebSeedTimeoutError  # backward-compatible alias
 
 
 class WebSeedConnectionError(WebSeedError):
@@ -141,10 +141,10 @@ class DownloadState:
         self.piece_index = piece_index
         self.start_offset = start_offset
         self.length = length
-        self.data: Optional[bytes] = None
-        self.sha1_hash: Optional[bytes] = None
+        self.data: bytes | None = None
+        self.sha1_hash: bytes | None = None
         self.status = "pending"
-        self.error: Optional[str] = None
+        self.error: str | None = None
         self.start_time = 0.0
         self.end_time = 0.0
         self.bytes_downloaded = 0
@@ -237,9 +237,9 @@ class HTTPDownloadThread(threading.Thread):
         self.end_offset = end_offset
         self.timeout = timeout
         self.follow_redirects = follow_redirects
-        self.data: Optional[bytes] = None
-        self.error: Optional[str] = None
-        self.status_code: Optional[int] = None
+        self.data: bytes | None = None
+        self.error: str | None = None
+        self.status_code: int | None = None
 
     def run(self) -> None:
         """Execute the HTTP download."""
@@ -252,8 +252,6 @@ class HTTPDownloadThread(threading.Thread):
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
             path = parsed.path + ("?" + parsed.query if parsed.query else "")
 
-            is_https = parsed.scheme == "https"
-
             # Check if we can connect via FTP first
             if parsed.scheme.lower() in ("ftp",):
                 raise WebSeedError(f"HTTP download requested for FTP URL: {self.url}")
@@ -261,6 +259,7 @@ class HTTPDownloadThread(threading.Thread):
             conn = http.client.HTTPConnection(host, port, timeout=self.timeout)
             if parsed.scheme == "https":
                 import ssl
+
                 conn = http.client.HTTPSConnection(
                     host,
                     port,
@@ -269,9 +268,7 @@ class HTTPDownloadThread(threading.Thread):
                 )
 
             # Set Range header
-            range_header = (
-                f"bytes={self.start_offset}-{self.end_offset}"
-            )
+            range_header = f"bytes={self.start_offset}-{self.end_offset}"
 
             headers = {
                 "User-Agent": USER_AGENT,
@@ -307,9 +304,7 @@ class HTTPDownloadThread(threading.Thread):
                 self.data = response.read()
                 # Trim to requested range
                 if self.data and len(self.data) > (self.end_offset - self.start_offset + 1):
-                    self.data = self.data[
-                        self.start_offset:self.end_offset + 1
-                    ]
+                    self.data = self.data[self.start_offset : self.end_offset + 1]
             else:
                 self.error = f"HTTP {response.status}: {response.reason}"
 
@@ -358,14 +353,14 @@ class FTPDownloadThread(threading.Thread):
         self.start_offset = start_offset
         self.end_offset = end_offset
         self.timeout = timeout
-        self.data: Optional[bytes] = None
-        self.error: Optional[str] = None
+        self.data: bytes | None = None
+        self.error: str | None = None
 
     def run(self) -> None:
         """Execute the FTP download."""
         try:
-            from ftplib import FTP, FTP_TLS
             import ssl
+            from ftplib import FTP, FTP_TLS
 
             parsed = urlparse(self.url)
             host = parsed.hostname or "localhost"
@@ -395,7 +390,7 @@ class FTPDownloadThread(threading.Thread):
             full_data = b"".join(data)
 
             # Slice to the requested range
-            self.data = full_data[self.start_offset:self.end_offset + 1]
+            self.data = full_data[self.start_offset : self.end_offset + 1]
             self.error = None
 
         except Exception as exc:
@@ -461,8 +456,8 @@ class WebSeedManager:
         piece_index: int,
         start_offset: int,
         length: int,
-        urls: Optional[list[str]] = None,
-    ) -> Optional[DownloadState]:
+        urls: list[str] | None = None,
+    ) -> DownloadState | None:
         """Download a single piece from webseed URLs.
 
         Attempts to download the piece data from the provided URLs,
@@ -497,10 +492,7 @@ class WebSeedManager:
             return None
 
         # Filter to valid URLs only
-        available_urls = [
-            url for url in urls
-            if url not in self.invalid_urls
-        ]
+        available_urls = [url for url in urls if url not in self.invalid_urls]
 
         if not available_urls:
             logger.debug("No valid webseed URLs available for piece %d", piece_index)
@@ -523,7 +515,7 @@ class WebSeedManager:
             parsed = urlparse(url)
             scheme = parsed.scheme.lower()
 
-            downloaded_data: Optional[bytes] = None
+            downloaded_data: bytes | None = None
 
             try:
                 if scheme in ("http", "https"):
@@ -541,7 +533,9 @@ class WebSeedManager:
                     if thread.error:
                         logger.debug(
                             "HTTP download failed for piece %d from %s: %s",
-                            piece_index, url, thread.error,
+                            piece_index,
+                            url,
+                            thread.error,
                         )
 
                 elif scheme in ("ftp", "ftps"):
@@ -558,7 +552,9 @@ class WebSeedManager:
                     if thread.error:
                         logger.debug(
                             "FTP download failed for piece %d from %s: %s",
-                            piece_index, url, thread.error,
+                            piece_index,
+                            url,
+                            thread.error,
                         )
                 else:
                     logger.debug("Unsupported scheme: %s for URL %s", scheme, url)
@@ -567,7 +563,9 @@ class WebSeedManager:
             except Exception as exc:
                 logger.debug(
                     "Download exception for piece %d from %s: %s",
-                    piece_index, url, exc,
+                    piece_index,
+                    url,
+                    exc,
                 )
                 continue
 
@@ -594,15 +592,13 @@ class WebSeedManager:
             computed_hash = state.compute_sha1()
             if computed_hash != self.torrent.infohash:
                 state.status = "failed"
-                state.error = (
-                    f"SHA-1 mismatch: expected {self.torrent.infohash.hex()}, "
-                    f"got {computed_hash.hex()}"
-                )
+                state.error = f"SHA-1 mismatch: expected {self.torrent.infohash.hex()}, got {computed_hash.hex()}"
                 # Per BEP 19: discard this URL
                 self.invalid_urls.add(available_urls[0])
                 logger.debug(
                     "Piece %d: SHA-1 mismatch, discarding URL %s",
-                    piece_index, available_urls[0],
+                    piece_index,
+                    available_urls[0],
                 )
                 return None
             else:
@@ -623,7 +619,7 @@ class WebSeedManager:
         url: str,
         start_offset: int,
         length: int,
-    ) -> Optional[DownloadState]:
+    ) -> DownloadState | None:
         """Download a single piece from a specific URL.
 
         Parameters
@@ -653,7 +649,7 @@ class WebSeedManager:
         state.status = "downloading"
         state.start_time = time.time()
 
-        downloaded_data: Optional[bytes] = None
+        downloaded_data: bytes | None = None
 
         try:
             if scheme in ("http", "https"):
@@ -699,10 +695,7 @@ class WebSeedManager:
                 computed_hash = state.compute_sha1()
                 if computed_hash != self.torrent.infohash:
                     state.status = "failed"
-                    state.error = (
-                        f"SHA-1 mismatch: expected {self.torrent.infohash.hex()}, "
-                        f"got {computed_hash.hex()}"
-                    )
+                    state.error = f"SHA-1 mismatch: expected {self.torrent.infohash.hex()}, got {computed_hash.hex()}"
                     self.invalid_urls.add(url)
                     return None
                 else:
@@ -722,8 +715,8 @@ class WebSeedManager:
         self,
         start_piece: int,
         end_piece: int,
-        urls: Optional[list[str]] = None,
-    ) -> dict[int, Optional[DownloadState]]:
+        urls: list[str] | None = None,
+    ) -> dict[int, DownloadState | None]:
         """Download a range of pieces from webseed URLs.
 
         Downloads all pieces from start_piece to end_piece (inclusive).
@@ -742,7 +735,7 @@ class WebSeedManager:
         dict
             Mapping of piece_index to DownloadState.
         """
-        results: dict[int, Optional[DownloadState]] = {}
+        results: dict[int, DownloadState | None] = {}
 
         for piece_idx in range(start_piece, end_piece + 1):
             start_offset = piece_idx * self.piece_length

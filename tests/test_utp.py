@@ -2,53 +2,40 @@
 
 from __future__ import annotations
 
-import struct
 import time
 import unittest
 
-from dhtrack.utp import (
-    # Constants
-    ST_DATA,
-    ST_FIN,
-    ST_STATE,
-    ST_RESET,
-    ST_SYN,
-    PACKET_TYPE_NAMES,
-    ConnectionState,
-    SELECTIVE_ACK_EXTENSION,
-    EXT_TYPE_NONE,
-    EXT_TYPE_SELECTIVE_ACK,
-    DEFAULT_PACKET_SIZE,
-    MIN_PACKET_SIZE,
-    MAX_PACKET_SIZE,
-    INITIAL_CONGESTION_WINDOW,
+from dhtrack.utp import (  # Core classes; Error classes
+    BASE_DELAY_WINDOW,
     CCONTROL_TARGET,
-    MAX_CWND_INCREASE_PACKETS_PER_RTT,
-    WINDOW_FACTOR_MIN,
+    DEFAULT_PACKET_SIZE,
+    INITIAL_CONGESTION_WINDOW,
     INITIAL_PACKET_SIZE,
     INITIAL_TIMEOUT_MS,
-    TIMEOUT_MULTIPLIER,
+    MAX_PACKET_SIZE,
+    MAX_RTT,
+    MIN_PACKET_SIZE,
+    MIN_RTT,
+    PACKET_TYPE_NAMES,
     RTT_ALPHA,
     RTT_BETA,
-    MAX_RTT,
-    MIN_RTT,
     RTT_VAR_MIN,
-    BASE_DELAY_WINDOW,
-    SELECTIVE_ACK_MIN_BITS,
-    SELECTIVE_ACK_MAX_BITS,
-    SELECTIVE_ACK_MAX_BYTES,
-    # Error classes
+    SELECTIVE_ACK_EXTENSION,
+    ST_DATA,
+    ST_FIN,
+    ST_RESET,
+    ST_STATE,
+    ST_SYN,
+    CongestionControl,
+    ConnectionState,
+    PacketHeader,
+    PendingPacket,
+    SelectiveAck,
+    UTPCongestionError,
+    UTPConnection,
+    UTPConnectionError,
     UTPError,
     UTPPacketError,
-    UTPConnectionError,
-    UTPCongestionError,
-    UTPTimestampError,
-    # Core classes
-    PacketHeader,
-    SelectiveAck,
-    CongestionControl,
-    PendingPacket,
-    UTPConnection,
     UTPSocket,
 )
 
@@ -172,7 +159,7 @@ class TestPacketHeader(unittest.TestCase):
 
     def test_all_packet_types(self):
         """Test all packet types serialize correctly."""
-        for pt_val, pt_name in PACKET_TYPE_NAMES.items():
+        for pt_val, _pt_name in PACKET_TYPE_NAMES.items():
             header = PacketHeader(packet_type=pt_val, version=1)
             serialized = header.serialize()
             parsed = PacketHeader.parse(serialized)
@@ -190,7 +177,7 @@ class TestSelectiveAck(unittest.TestCase):
 
     def test_selective_ack_serialization(self):
         """Test selective ACK serialization."""
-        sack = SelectiveAck(bits=32, bitmask=b"\xFF\x00\x00\x00")
+        sack = SelectiveAck(bits=32, bitmask=b"\xff\x00\x00\x00")
         serialized = sack.to_bytes()
         # extension_type(1) + length(1) + bitmask(4)
         self.assertEqual(len(serialized), 6)
@@ -203,7 +190,7 @@ class TestSelectiveAck(unittest.TestCase):
         sack = SelectiveAck.parse(data)
         self.assertEqual(sack.bits, 32)
         self.assertEqual(len(sack.bitmask), 4)
-        self.assertEqual(bytes(sack.bitmask), b"\xFF\x00\x00\x00")
+        self.assertEqual(bytes(sack.bitmask), b"\xff\x00\x00\x00")
 
     def test_selective_ack_set_get_bit(self):
         """Test setting and getting bits in the bitmask."""
@@ -223,7 +210,7 @@ class TestSelectiveAck(unittest.TestCase):
 
     def test_selective_ack_clear_bit(self):
         """Test clearing bits in the bitmask."""
-        sack = SelectiveAck(bits=32, bitmask=bytearray(b"\xFF" * 4))
+        sack = SelectiveAck(bits=32, bitmask=bytearray(b"\xff" * 4))
         self.assertTrue(sack.get_bit(0))
 
         sack.clear_bit(0)
@@ -276,10 +263,10 @@ class TestSelectiveAck(unittest.TestCase):
 
     def test_selective_ack_len_method(self):
         """Test __len__ returns the bitmask length."""
-        sack = SelectiveAck(bits=32, bitmask=bytearray(b"\xFF" * 4))
+        sack = SelectiveAck(bits=32, bitmask=bytearray(b"\xff" * 4))
         self.assertEqual(len(sack), 4)
 
-        sack64 = SelectiveAck(bits=64, bitmask=bytearray(b"\xFF" * 8))
+        sack64 = SelectiveAck(bits=64, bitmask=bytearray(b"\xff" * 8))
         self.assertEqual(len(sack64), 8)
 
     def test_selective_ack_multiple_bits(self):
@@ -784,7 +771,8 @@ class TestHeaderEdgeCases(unittest.TestCase):
     def test_header_size_consistency(self):
         """Test that header serialization always produces 20 bytes."""
         import random
-        for i in range(100):
+
+        for _i in range(100):
             header = PacketHeader(
                 packet_type=random.randint(0, 4),
                 version=1,

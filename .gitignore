@@ -55,3 +55,4 @@ Thumbs.db
 
 # Local development
 *.local
+dht_node.state

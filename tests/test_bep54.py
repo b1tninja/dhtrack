@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import struct
+
 import pytest
 
 from dhtrack.bep54 import (
+    EXTENDED_MSG_OP,
+    EXTENDED_MSG_TYPE,
     LT_DONTHAVE_NAME,
     LT_DONTHAVE_SUBOP,
-    encode_donthave,
-    decode_donthave,
-    create_donthave_message,
-    parse_donthave_from_extended,
-    create_donthave_extended,
-    EXTENDED_MSG_TYPE,
-    EXTENDED_MSG_OP,
     PAYLOAD_LENGTH,
+    create_donthave_extended,
+    create_donthave_message,
+    decode_donthave,
+    encode_donthave,
+    parse_donthave_from_extended,
 )
 
 

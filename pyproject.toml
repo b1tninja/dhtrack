@@ -25,39 +25,59 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
-dependencies = [
-    "PyGObject>=3.40",
-]
+dependencies = []
 
 [project.optional-dependencies]
+gui = ["PyQt6>=6.6"]
 mongo = ["pymongo>=4.0"]
-gui = ["python-gtksingleapplication"]
 test = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
 dev = [
-    "ruff>=0.4.0",
     "black>=24.0",
     "isort>=5.13",
+    "pillow>=10.0",
     "pre-commit>=3.5",
+    "resvg-py>=0.3.1",
+    "ruff>=0.4.0",
 ]
 
 [project.scripts]
 dhtrack = "dhtrack.cli:main"
+dhtrack-gui = "dhtrack.gui.__main__:main"
+
+[project.gui-scripts]
+dhtrack-inspector = "dhtrack.gui.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 
 [tool.setuptools.package-data]
-dhtrack = ["dhtrack.glade"]
+"dhtrack" = [
+    "gui/styles/*.qss",
+    "gui/resources/*.png",
+    "gui/resources/*.svg",
+    "gui/resources/*.ico",
+]
+
 
 [tool.ruff]
 target-version = "py310"
 line-length = 120
 
+# Black and Ruff disagree on wrapping for this integration test; CI runs both formatters.
+[tool.ruff.format]
+exclude = ["tests/test_internet_archlinux_metadata.py"]
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4"]
+
+# PyQt QAbstractItemModel and signals use camelCase method / attribute names required by Qt.
+[tool.ruff.lint.per-file-ignores]
+"dhtrack/gui/**/*.py" = ["N802"]
+# isort (CI) and Ruff I001 disagree on ``from … import (…, X as Y, …)`` merges here.
+"tests/test_dht.py" = ["I001"]
 
 [tool.black]
 line-length = 120
@@ -72,9 +92,40 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "-ra -v --cov=dhtrack --cov-report=term-missing"
+addopts = "-ra -v"
+markers = [
+    "slow: long-running tests (often network/integration)",
+]
 
 [tool.mypy]
 python_version = "3.10"
-warn_return_any = true
+warn_return_any = false
 warn_unused_configs = true
+explicit_package_bases = true
+# Optional runtime deps (Mongo, Qt) are not installed in CI during the lint job.
+ignore_missing_imports = true
+# Qt GUI is exercised at runtime with PyQt6; typing it cleanly needs stubs + sizable refactors.
+exclude = "(?x)(^|/)dhtrack/gui/.*"
+
+# Gradual typing: these modules remain partially typed against bytes-keyed bencode/TCP wire data.
+[[tool.mypy.overrides]]
+module = [
+    "dhtrack.bep32",
+    "dhtrack.bloom_filter",
+    "dhtrack.cli",
+    "dhtrack.dht",
+    "dhtrack.dht_manager",
+    "dhtrack.extension",
+    "dhtrack.lsd",
+    "dhtrack.metadata_retriever",
+    "dhtrack.peer",
+    "dhtrack.piece_selector",
+    "dhtrack.quic",
+    "dhtrack.storage",
+    "dhtrack.torrent",
+    "dhtrack.tracker",
+    "dhtrack.udp_tracker",
+    "dhtrack.utp",
+    "dhtrack.webseed",
+]
+ignore_errors = true

@@ -21,8 +21,6 @@ from __future__ import annotations
 import hashlib
 import math
 import socket
-from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -59,15 +57,12 @@ class BloomFilter:
 
     __slots__ = ("_bloom",)
 
-    def __init__(self, data: Optional[bytes] = None) -> None:
+    def __init__(self, data: bytes | None = None) -> None:
         # 2048 bits = 256 bytes
         self._bloom: bytearray = bytearray(BLOOM_BYTE_LENGTH)
         if data is not None:
             if len(data) != BLOOM_BYTE_LENGTH:
-                raise ValueError(
-                    f"Bloom filter data must be {BLOOM_BYTE_LENGTH} bytes, "
-                    f"got {len(data)}"
-                )
+                raise ValueError(f"Bloom filter data must be {BLOOM_BYTE_LENGTH} bytes, got {len(data)}")
             self._bloom = bytearray(data)
 
     # ------------------------------------------------------------------
@@ -160,6 +155,7 @@ class BloomFilter:
         float
             The estimated cardinality. Returns 0.0 if the filter is full
             (all bits set) or if the estimation would be undefined.
+            Also returns 0.0 if the filter is empty (all bits zero).
         """
         m = BLOOM_BIT_LENGTH
         k = BLOOM_K
@@ -169,12 +165,16 @@ class BloomFilter:
         for byte in self._bloom:
             zero_bits += bin(~byte & 0xFF).count("1")
 
+        # If no zero bits (filter full), estimation breaks down
+        if zero_bits == 0:
+            return 0.0
+
+        # If all bits are zero (filter empty), return 0.0
+        if zero_bits == m:
+            return 0.0
+
         # Cap at m - 1
         c = min(m - 1, zero_bits)
-
-        # If all bits are set (c == 0) or no zero bits, estimation breaks down
-        if c <= 0:
-            return 0.0
 
         numerator = math.log(c / m)
         denominator = k * math.log(1.0 - 1.0 / m)
@@ -188,7 +188,7 @@ class BloomFilter:
     # Union operation
     # ------------------------------------------------------------------
 
-    def union(self, other: "BloomFilter") -> "BloomFilter":
+    def union(self, other: BloomFilter) -> BloomFilter:
         """Perform a bitwise OR union with another bloom filter.
 
         Per BEP 33, performing unions on bloom filters is trivial - simply
@@ -210,13 +210,11 @@ class BloomFilter:
             If the filters have different sizes.
         """
         if len(self._bloom) != len(other._bloom):
-            raise ValueError(
-                "Cannot union bloom filters of different sizes"
-            )
+            raise ValueError("Cannot union bloom filters of different sizes")
 
         result = BloomFilter()
-        for self_byte, other_byte in zip(self._bloom, other._bloom):
-            result._bloom.append(self_byte | other_byte)
+        for i in range(len(self._bloom)):
+            result._bloom[i] = self._bloom[i] | other._bloom[i]
 
         return result
 
@@ -235,7 +233,7 @@ class BloomFilter:
         return bytes(self._bloom)
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "BloomFilter":
+    def from_bytes(cls, data: bytes) -> BloomFilter:
         """Create a BloomFilter from 256 bytes.
 
         Parameters
@@ -280,11 +278,7 @@ class BloomFilter:
     def __repr__(self) -> str:
         zero_bits = self.count_zero_bits()
         set_bits = self.count_set_bits()
-        return (
-            f"BloomFilter(zero_bits={zero_bits}, "
-            f"set_bits={set_bits}, "
-            f"estimate={self.estimate_count():.2f})"
-        )
+        return f"BloomFilter(zero_bits={zero_bits}, set_bits={set_bits}, estimate={self.estimate_count():.2f})"
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, BloomFilter):
@@ -298,6 +292,7 @@ class BloomFilter:
 # ---------------------------------------------------------------------------
 # Test vector validation
 # ---------------------------------------------------------------------------
+
 
 def generate_test_vector_bloom() -> BloomFilter:
     """Generate a bloom filter from the BEP 33 test vector.
@@ -339,6 +334,7 @@ def generate_test_vector_bloom() -> BloomFilter:
 # Module-level convenience
 # ---------------------------------------------------------------------------
 
+
 def create_bloom_filter(ips: list[str]) -> BloomFilter:
     """Create a BloomFilter from a list of IP address strings.
 
@@ -358,7 +354,7 @@ def create_bloom_filter(ips: list[str]) -> BloomFilter:
     return bf
 
 
-def union_bloom_filters(filters: list["BloomFilter"]) -> "BloomFilter":
+def union_bloom_filters(filters: list[BloomFilter]) -> BloomFilter:
     """Compute the union of multiple bloom filters.
 
     Parameters

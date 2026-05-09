@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-import pytest
 
 from dhtrack.bep31 import (
     FailureRetryInfo,
@@ -18,7 +17,7 @@ class TestParseFailureResponse:
 
     def test_retry_in_minutes(self):
         """Parse integer retry_in value."""
-        response = {"failure reason": "Overloaded", "retry in": 5}
+        response = {b"failure reason": b"Overloaded", b"retry in": 5}
         result = parse_failure_response(response)
 
         assert result.failure_reason == "Overloaded"
@@ -28,7 +27,7 @@ class TestParseFailureResponse:
 
     def test_retry_in_never(self):
         """Parse 'never' retry_in value."""
-        response = {"failure reason": "Not a tracker", "retry in": "never"}
+        response = {b"failure reason": b"Not a tracker", b"retry in": b"never"}
         result = parse_failure_response(response)
 
         assert result.failure_reason == "Not a tracker"
@@ -38,7 +37,7 @@ class TestParseFailureResponse:
 
     def test_no_retry_in(self):
         """Missing retry_in treated as permanent."""
-        response = {"failure reason": "Generic error"}
+        response = {b"failure reason": b"Generic error"}
         result = parse_failure_response(response)
 
         assert result.failure_reason == "Generic error"
@@ -46,7 +45,7 @@ class TestParseFailureResponse:
 
     def test_retry_in_bytes(self):
         """Parse retry_in as bytes."""
-        response = {"failure reason": b"Error", "retry in": b"10"}
+        response = {b"failure reason": b"Error", b"retry in": b"10"}
         result = parse_failure_response(response)
 
         assert result.failure_reason == "Error"
@@ -55,7 +54,7 @@ class TestParseFailureResponse:
 
     def test_retry_in_string(self):
         """Parse retry_in as string number."""
-        response = {"failure reason": "Slow down", "retry in": "3"}
+        response = {b"failure reason": b"Slow down", b"retry in": b"3"}
         result = parse_failure_response(response)
 
         assert result.retry_minutes == 3
@@ -63,14 +62,14 @@ class TestParseFailureResponse:
 
     def test_invalid_retry_in(self):
         """Invalid retry_in treated as permanent."""
-        response = {"failure reason": "Error", "retry in": "abc"}
+        response = {b"failure reason": b"Error", b"retry in": b"abc"}
         result = parse_failure_response(response)
 
         assert result.permanent is True
 
     def test_negative_retry_in(self):
         """Negative retry_in treated as permanent."""
-        response = {"failure reason": "Error", "retry in": -1}
+        response = {b"failure reason": b"Error", b"retry in": -1}
         result = parse_failure_response(response)
 
         assert result.permanent is True
@@ -176,7 +175,7 @@ class TestTrackerRetryScheduler:
     def test_record_failure(self):
         """Record a failure response."""
         scheduler = TrackerRetryScheduler()
-        response = {"failure reason": "Overloaded", "retry in": 5}
+        response = {b"failure reason": b"Overloaded", b"retry in": 5}
         result = scheduler.record_failure(response)
 
         assert result.failure_reason == "Overloaded"
@@ -186,7 +185,7 @@ class TestTrackerRetryScheduler:
     def test_record_success(self):
         """Record success resets state."""
         scheduler = TrackerRetryScheduler()
-        scheduler.record_failure({"failure reason": "Error"})
+        scheduler.record_failure({b"failure reason": b"Error"})
         scheduler.record_success()
 
         assert scheduler.attempt_count == 0
@@ -195,21 +194,21 @@ class TestTrackerRetryScheduler:
     def test_should_retry_after_failure(self):
         """Check retry after recording failure."""
         scheduler = TrackerRetryScheduler(max_retries=5)
-        scheduler.record_failure({"failure reason": "Overloaded", "retry in": 1})
+        scheduler.record_failure({b"failure reason": b"Overloaded", b"retry in": 1})
 
         assert scheduler.should_retry() is True
 
     def test_no_retry_permanent(self):
         """No retry for permanent failures."""
         scheduler = TrackerRetryScheduler()
-        scheduler.record_failure({"failure reason": "Not a tracker", "retry in": "never"})
+        scheduler.record_failure({b"failure reason": b"Not a tracker", b"retry in": b"never"})
 
         assert scheduler.should_retry() is False
 
     def test_delay_minimum_retry_in(self):
         """Delay is at least the BEP 31 retry_in value."""
         scheduler = TrackerRetryScheduler()
-        scheduler.record_failure({"failure reason": "Overloaded", "retry in": 2})
+        scheduler.record_failure({b"failure reason": b"Overloaded", b"retry in": 2})
 
         delay = scheduler.delay_until_ready()
         assert delay >= 120  # 2 minutes = 120 seconds
@@ -217,9 +216,9 @@ class TestTrackerRetryScheduler:
     def test_delay_minimum_backoff(self):
         """Delay uses exponential backoff when no retry_in."""
         scheduler = TrackerRetryScheduler()
-        scheduler.record_failure({"failure reason": "Generic error"})
+        scheduler.record_failure({b"failure reason": b"Generic error"})
         # After 1 failure, backoff is 2^1 = 2 seconds
-        scheduler.record_failure({"failure reason": "Another error"})
+        scheduler.record_failure({b"failure reason": b"Another error"})
         # After 2 failures, backoff is 2^2 = 4 seconds
 
         delay = scheduler.delay_until_ready()
@@ -229,7 +228,7 @@ class TestTrackerRetryScheduler:
         """Delay is capped at max_delay."""
         scheduler = TrackerRetryScheduler(max_delay=60)
         for _ in range(10):
-            scheduler.record_failure({"failure reason": "Error"})
+            scheduler.record_failure({b"failure reason": b"Error"})
 
         delay = scheduler.delay_until_ready()
         assert delay <= 60
@@ -237,7 +236,7 @@ class TestTrackerRetryScheduler:
     def test_reset(self):
         """Reset clears all state."""
         scheduler = TrackerRetryScheduler()
-        scheduler.record_failure({"failure reason": "Error"})
+        scheduler.record_failure({b"failure reason": b"Error"})
         scheduler.reset()
 
         assert scheduler.attempt_count == 0
@@ -246,9 +245,9 @@ class TestTrackerRetryScheduler:
     def test_attempt_clamping(self):
         """Retry denied when max_retries exceeded."""
         scheduler = TrackerRetryScheduler(max_retries=2)
-        scheduler.record_failure({"failure reason": "Temp error", "retry in": 1})
-        scheduler.record_failure({"failure reason": "Temp error", "retry in": 1})
-        scheduler.record_failure({"failure reason": "Temp error", "retry in": 1})
+        scheduler.record_failure({b"failure reason": b"Temp error", b"retry in": 1})
+        scheduler.record_failure({b"failure reason": b"Temp error", b"retry in": 1})
+        scheduler.record_failure({b"failure reason": b"Temp error", b"retry in": 1})
 
         # After 3 attempts with max_retries=2, should not retry
         assert scheduler.should_retry() is False

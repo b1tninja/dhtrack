@@ -22,7 +22,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ PACKET_TYPE_NAMES: dict[int, str] = {
 # ---------------------------------------------------------------------------
 # Connection states (BEP 29 connection lifecycle)
 # ---------------------------------------------------------------------------
+
 
 class ConnectionState(IntEnum):
     """States for a uTP connection."""
@@ -361,9 +362,7 @@ class SelectiveAck:
 
         expected_len = self.bits // 8
         if len(self.bitmask) != expected_len:
-            raise UTPPacketError(
-                f"Bitmask length mismatch: expected {expected_len} bytes, got {len(self.bitmask)}"
-            )
+            raise UTPPacketError(f"Bitmask length mismatch: expected {expected_len} bytes, got {len(self.bitmask)}")
 
         # extension type (1 byte) + length in bytes (1 byte) + bitmask
         return bytes([SELECTIVE_ACK_EXTENSION, expected_len]) + self.bitmask
@@ -401,7 +400,7 @@ class SelectiveAck:
         if length % 4 != 0:
             raise UTPPacketError(f"Selective ACK length must be multiple of 4: {length} bytes")
 
-        bitmask = data[2:2 + length]
+        bitmask = data[2 : 2 + length]
         if len(bitmask) != length:
             raise UTPPacketError(f"Truncated selective ACK bitmask: expected {length} bytes, got {len(bitmask)}")
 
@@ -450,7 +449,7 @@ class SelectiveAck:
 
         byte_index = offset // 8
         bit_index = 7 - (offset % 8)
-        self.bitmask[byte_index] |= (1 << bit_index)
+        self.bitmask[byte_index] |= 1 << bit_index
 
     def clear_bit(self, offset: int) -> None:
         """Clear a bit in the bitmask.
@@ -545,6 +544,9 @@ class CongestionControl:
         # For packet loss detection
         self._lost_packet_count: int = 0
 
+        # Most recent delay sample (ms); used by get_off_target
+        self._current_delay: int = 0
+
     def update_rtt(self, packet_rtt: int) -> None:
         """Update RTT estimates based on a new RTT sample.
 
@@ -597,22 +599,25 @@ class CongestionControl:
         else:
             self.base_delay = delay_ms
 
+        self._current_delay = delay_ms
+
     def get_off_target(self) -> int:
         """Calculate the off-target delay.
 
-        off_target = our_delay - CCONTROL_TARGET
-        where our_delay = (current_delay - base_delay) in milliseconds.
+        Per BEP 29:
+            our_delay = current_delay - base_delay
+            off_target = our_delay - CCONTROL_TARGET
 
         Returns
         -------
         int
             Off-target delay in milliseconds. Negative means below target
-            (good), positive means above target (bad).
+            (good — window can grow), positive means above target (bad — window
+            should shrink).
         """
         if self.base_delay < 0:
             self.base_delay = 0
-        current_delay = max(0, self.base_delay)  # Simplified - no live delay measurement
-        our_delay = current_delay - self.base_delay
+        our_delay = max(0, self._current_delay - self.base_delay)
         return int(our_delay - self.target_delay)
 
     def calculate_scaled_gain(self) -> float:
@@ -709,6 +714,7 @@ class CongestionControl:
         self._delay_history.clear()
         self._acked_bytes_since_last_rtt = 0
         self._lost_packet_count = 0
+        self._current_delay = 0
 
     def should_timeout(self) -> bool:
         """Check if a timeout should occur based on elapsed time.
@@ -853,9 +859,9 @@ class UTPConnection:
         self.sack_window: int = 32  # Number of packets in the SACK bitmask
 
         # Callbacks
-        self.on_connected: Optional[callable] = None
-        self.on_disconnected: Optional[callable] = None
-        self.on_data_received: Optional[callable] = None
+        self.on_connected: callable | None = None
+        self.on_disconnected: callable | None = None
+        self.on_data_received: callable | None = None
 
         # Statistics
         self.packets_sent: int = 0
@@ -904,7 +910,7 @@ class UTPConnection:
         self.state = ConnectionState.SYN_SENT
         logger.debug("Sent ST_SYN: conn_id=%d, seq=%d", self.connection_id, header.seq_nr)
 
-    def handle_packet(self, data: bytes, header: PacketHeader, sender: tuple[str, int]) -> Optional[bytes]:
+    def handle_packet(self, data: bytes, header: PacketHeader, sender: tuple[str, int]) -> bytes | None:
         """Handle an incoming uTP packet.
 
         Parameters
@@ -952,9 +958,10 @@ class UTPConnection:
         elif self.state == ConnectionState.CLOSING:
             return self._handle_close(header, data)
         else:
-            raise UTPConnectionError(f"Unexpected packet in state {self.state}: {PACKET_TYPE_NAMES.get(header.packet_type, 'UNKNOWN')}")
+            ptype = PACKET_TYPE_NAMES.get(header.packet_type, "UNKNOWN")
+            raise UTPConnectionError(f"Unexpected packet in state {self.state}: {ptype}")
 
-    def _handle_syn_response(self, header: PacketHeader, data: bytes, sender: tuple[str, int]) -> Optional[bytes]:
+    def _handle_syn_response(self, header: PacketHeader, data: bytes, sender: tuple[str, int]) -> bytes | None:
         """Handle response to our ST_SYN (should be ST_STATE or ST_DATA).
 
         Parameters
@@ -972,9 +979,8 @@ class UTPConnection:
             Confirmation packet or None.
         """
         if header.packet_type not in (ST_STATE, ST_DATA, ST_SYN):
-            raise UTPConnectionError(
-                f"Expected ST_STATE/ST_DATA/SYN in SYN_SENT state, got {PACKET_TYPE_NAMES.get(header.packet_type, 'UNKNOWN')}"
-            )
+            ptype = PACKET_TYPE_NAMES.get(header.packet_type, "UNKNOWN")
+            raise UTPConnectionError(f"Expected ST_STATE/ST_DATA/SYN in SYN_SENT state, got {ptype}")
 
         # Update ack_nr from SYN response
         self.ack_nr = header.seq_nr
@@ -993,7 +999,7 @@ class UTPConnection:
 
         return response
 
-    def _handle_conn_confirm(self, header: PacketHeader, data: bytes, sender: tuple[str, int]) -> Optional[bytes]:
+    def _handle_conn_confirm(self, header: PacketHeader, data: bytes, sender: tuple[str, int]) -> bytes | None:
         """Handle connection confirmation (after ST_STATE exchange).
 
         Parameters
@@ -1024,9 +1030,10 @@ class UTPConnection:
                 self.on_connected()
             return self._handle_data(header, data)
         else:
-            raise UTPConnectionError(f"Expected ST_STATE/ST_DATA in SYN_RECV state, got {PACKET_TYPE_NAMES.get(header.packet_type, 'UNKNOWN')}")
+            ptype = PACKET_TYPE_NAMES.get(header.packet_type, "UNKNOWN")
+            raise UTPConnectionError(f"Expected ST_STATE/ST_DATA in SYN_RECV state, got {ptype}")
 
-    def _handle_data(self, header: PacketHeader, data: bytes) -> Optional[bytes]:
+    def _handle_data(self, header: PacketHeader, data: bytes) -> bytes | None:
         """Handle data packets in CONNECTED state.
 
         Parameters
@@ -1051,14 +1058,12 @@ class UTPConnection:
 
         # Extract payload
         payload = data[20:]  # Skip 20-byte header
-        packet_size = len(data)
+        len(data)
 
         if header.packet_type == ST_DATA:
             # Store packet in receive buffer
             self.receive_buffer[header.seq_nr] = (payload, time.time())
-            self.congestion_control.outstanding_bytes = max(
-                0, self.congestion_control.outstanding_bytes
-            )
+            self.congestion_control.outstanding_bytes = max(0, self.congestion_control.outstanding_bytes)
 
             # Check for selective ACK
             sack = None
@@ -1119,7 +1124,7 @@ class UTPConnection:
 
         return None
 
-    def _process_ack(self, header: PacketHeader, sack: Optional[SelectiveAck] = None) -> None:
+    def _process_ack(self, header: PacketHeader, sack: SelectiveAck | None = None) -> None:
         """Process an incoming ACK and update congestion control.
 
         Parameters
@@ -1201,7 +1206,7 @@ class UTPConnection:
             return missing
 
         min_seq = min(pkt.seq_nr for pkt in self.send_buffer)
-        max_seq = max(pkt.seq_nr for pkt in self.send_buffer)
+        max(pkt.seq_nr for pkt in self.send_buffer)
 
         for seq in range(min_seq, self.ack_nr + 1):
             if seq <= self.ack_nr:
@@ -1257,7 +1262,7 @@ class UTPConnection:
 
         logger.debug("Queued data for sending: seq=%d, size=%d", self.seq_nr, len(data))
 
-    def send_packet(self, sock: Any, address: tuple[str, int], data: bytes = b"") -> Optional[bytes]:
+    def send_packet(self, sock: Any, address: tuple[str, int], data: bytes = b"") -> bytes | None:
         """Build and send a data packet.
 
         Parameters
@@ -1322,7 +1327,7 @@ class UTPConnection:
         wnd_size: int = 0,
         timestamp_diff_us: int = 0,
         payload: bytes = b"",
-        selective_ack: Optional[SelectiveAck] = None,
+        selective_ack: SelectiveAck | None = None,
     ) -> bytes:
         """Build a uTP packet.
 
@@ -1475,7 +1480,7 @@ class UTPSocket:
         Whether this socket was created as a server (listening).
     """
 
-    def __init__(self, sock: Optional[Any] = None, is_server: bool = False) -> None:
+    def __init__(self, sock: Any | None = None, is_server: bool = False) -> None:
         """Create a uTP socket.
 
         Parameters
@@ -1491,8 +1496,8 @@ class UTPSocket:
 
         self.sock = sock
         self.is_server = is_server
-        self.connection: Optional[UTPConnection] = None
-        self._address: Optional[tuple[str, int]] = None
+        self.connection: UTPConnection | None = None
+        self._address: tuple[str, int] | None = None
         self._closed: bool = False
         self._pending_data: list[bytes] = []
 
@@ -1510,7 +1515,7 @@ class UTPSocket:
         self.sock.bind(address)
         logger.debug("uTP socket bound to %s", address)
 
-    def connect(self, address: tuple[str, int], node_id: Optional[bytes] = None) -> None:
+    def connect(self, address: tuple[str, int], node_id: bytes | None = None) -> None:
         """Initiate a uTP connection to a remote address.
 
         Parameters
@@ -1535,7 +1540,7 @@ class UTPSocket:
 
         self.connection.start_connection(self.sock, address)
 
-    def listen(self, node_id: Optional[bytes] = None) -> None:
+    def listen(self, node_id: bytes | None = None) -> None:
         """Start listening for incoming uTP connections.
 
         Parameters
@@ -1552,7 +1557,7 @@ class UTPSocket:
         if node_id is not None:
             self.connection.node_id = node_id
 
-    def accept(self) -> tuple["UTPSocket", tuple[str, int]]:
+    def accept(self) -> tuple[UTPSocket, tuple[str, int]]:
         """Accept an incoming connection.
 
         Returns
@@ -1570,7 +1575,7 @@ class UTPSocket:
 
         data, address = self._pending_data.pop(0)
         # Create new socket for the accepted connection
-        new_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         new_conn = UTPConnection(
             connection_id=self.connection.connection_id + 1 if self.connection else 0,
             is_initiator=False,
@@ -1682,7 +1687,15 @@ class UTPSocket:
         tuple[str, int]
             Local address (ip, port).
         """
-        return self.sock.getsockname()
+        try:
+            return self.sock.getsockname()
+        except OSError:
+            # On Windows, getsockname() may fail until bound.
+            try:
+                self.sock.bind(("0.0.0.0", 0))
+            except OSError:
+                pass
+            return self.sock.getsockname()
 
     def getpeername(self) -> tuple[str, int]:
         """Get the remote socket address.
@@ -1724,7 +1737,7 @@ class UTPSocket:
             self.sock.settimeout(0)
             while True:
                 try:
-                    data, addr = self.sock.recvfrom(MTU)
+                    data, addr = self.sock.recvfrom(DEFAULT_PACKET_SIZE)
                     if len(data) < 20:
                         continue
 
@@ -1745,7 +1758,7 @@ class UTPSocket:
 
         return count
 
-    def __enter__(self) -> "UTPSocket":
+    def __enter__(self) -> UTPSocket:
         """Support context manager protocol."""
         return self
 

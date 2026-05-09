@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +46,9 @@ class FailureRetryInfo:
     """
 
     failure_reason: str
-    retry_minutes: Optional[int] = None
+    retry_minutes: int | None = None
     permanent: bool = False
-    retry_after: Optional[float] = None
+    retry_after: float | None = None
 
     def can_retry(self) -> bool:
         """Whether the client should retry this tracker.
@@ -56,14 +56,9 @@ class FailureRetryInfo:
         Returns
         -------
         bool
-            ``True`` if a retry is allowed (not permanent and not yet
-            timed out).
+            ``True`` if a retry is allowed (not permanent).
         """
-        if self.permanent:
-            return False
-        if self.retry_after is None:
-            return self.retry_minutes is not None
-        return time.time() >= self.retry_after
+        return not self.permanent
 
     def seconds_until_retry(self) -> int:
         """Seconds remaining until the next retry is allowed.
@@ -79,7 +74,7 @@ class FailureRetryInfo:
         return max(0, remaining)
 
 
-def parse_failure_response(response: dict) -> FailureRetryInfo:
+def parse_failure_response(response: dict[bytes, Any]) -> FailureRetryInfo:
     """Parse a bencoded failure response per BEP 31.
 
     Parameters
@@ -100,13 +95,13 @@ def parse_failure_response(response: dict) -> FailureRetryInfo:
       ``"never"``.
     - The ``"failure reason"`` field is always present on error responses.
     """
-    reason = response.get("failure reason", "Unknown error")
+    reason = response.get(b"failure reason", b"Unknown error")
     if isinstance(reason, bytes):
         reason = reason.decode("utf-8", errors="replace")
 
-    retry_in = response.get("retry in")
+    retry_in = response.get(b"retry in")
 
-    if retry_in is None or retry_in == "never":
+    if retry_in is None or retry_in == b"never" or retry_in == "never":
         return FailureRetryInfo(
             failure_reason=reason,
             retry_minutes=None,
@@ -205,7 +200,7 @@ class TrackerRetryScheduler:
         self.max_retries = max_retries
         self.max_delay = max_delay
         self.attempt_count = 0
-        self.last_failure: Optional[FailureRetryInfo] = None
+        self.last_failure: FailureRetryInfo | None = None
 
     def record_failure(self, response: dict) -> FailureRetryInfo:
         """Record a tracker failure and return retry information.
@@ -258,7 +253,7 @@ class TrackerRetryScheduler:
             bep_delay = self.last_failure.retry_minutes * 60
 
         # Exponential backoff
-        backoff_delay = min(2 ** self.attempt_count, self.max_delay)
+        backoff_delay = min(2**self.attempt_count, self.max_delay)
 
         return float(max(bep_delay, backoff_delay))
 

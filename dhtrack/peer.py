@@ -16,10 +16,9 @@ import socket
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from dhtrack import bencode as bencode_module
-from dhtrack.bencode import BEncodeValue
 from dhtrack import bep4
 from dhtrack.peerid import Endpoint
 from dhtrack.torrent import Torrent
@@ -113,11 +112,11 @@ class PeerMessage:
 
     msg_type: int
     payload: bytes = b""
-    piece_index: Optional[int] = None
+    piece_index: int | None = None
     begin: int = 0
     length: int = 0
-    piece_data: Optional[bytes] = None
-    piece_bitmask: Optional[bytes] = None
+    piece_data: bytes | None = None
+    piece_bitmask: bytes | None = None
 
 
 def serialize_peer_message(msg_type: int, payload: bytes = b"") -> bytes:
@@ -186,11 +185,9 @@ def parse_peer_message(data: bytes) -> PeerMessage:
         raise ExtensionError(f"Invalid message length: {msg_len}")
 
     if len(data) < 4 + msg_len:
-        raise ExtensionError(
-            f"Truncated message: expected {4 + msg_len} bytes, got {len(data)}"
-        )
+        raise ExtensionError(f"Truncated message: expected {4 + msg_len} bytes, got {len(data)}")
 
-    payload = data[5:4 + msg_len]
+    payload = data[5 : 4 + msg_len]
     msg_type = data[4]
 
     msg = PeerMessage(msg_type=msg_type, payload=payload)
@@ -249,7 +246,9 @@ def create_handshake(
     if len(peer_id) != 20:
         raise ExtensionError(f"peer_id must be 20 bytes, got {len(peer_id)}")
 
-    protocol_str = b"\x10BitTorrent protocol"  # 19 bytes
+    # BEP 3: Protocol string is exactly 19 bytes ("BitTorrent protocol")
+    # The length prefix should be 19 (0x13), not the length of the protocol bytes
+    protocol_str = b"BitTorrent protocol"  # 19 bytes per BEP 3 spec
     handshake = struct.pack("B", len(protocol_str)) + protocol_str
     handshake += reserved_bytes
     handshake += info_hash
@@ -269,7 +268,7 @@ def parse_handshake(data: bytes) -> tuple[bool, bytes, bytes, bytes]:
     -------
     tuple[bool, bytes, bytes, bytes]
         A tuple of (extensions_enabled, reserved_bytes, info_hash, peer_id).
-        extensions_enabled is True if reserved_bytes[7] & 0x04 is set (BEP 10).
+        extensions_enabled is True if reserved_bytes[5] & 0x10 is set (BEP 10).
 
     Raises
     ------
@@ -278,9 +277,7 @@ def parse_handshake(data: bytes) -> tuple[bool, bytes, bytes, bytes]:
     """
     expected_len = 1 + 19 + 8 + 20 + 20  # 68 bytes
     if len(data) < expected_len:
-        raise ExtensionError(
-            f"Handshake too short: expected {expected_len} bytes, got {len(data)}"
-        )
+        raise ExtensionError(f"Handshake too short: expected {expected_len} bytes, got {len(data)}")
 
     # Byte 0: length of protocol string (should be 19)
     pstrlen = data[0]
@@ -295,8 +292,9 @@ def parse_handshake(data: bytes) -> tuple[bool, bytes, bytes, bytes]:
     # Bytes 20-27: reserved bytes
     reserved_bytes = data[20:28]
 
-    # Byte 7, bit 2 (0x04) indicates BEP 10 support
-    extensions_enabled = bool(reserved_bytes[7] & 0x04)
+    # Byte 5, bit 4 (0x10) indicates BEP 10 extension protocol support
+    # See: https://www.bittorrent.org/beps/bep_0010.html
+    extensions_enabled = bool(reserved_bytes[5] & 0x10)
 
     # Bytes 28-47: info hash
     info_hash = data[28:48]
@@ -309,6 +307,7 @@ def parse_handshake(data: bytes) -> tuple[bool, bytes, bytes, bytes]:
         raise ExtensionError(f"Invalid peer_id: {len(peer_id)} bytes")
 
     return extensions_enabled, reserved_bytes, info_hash, peer_id
+
 
 # ---------------------------------------------------------------------------
 # BEP 9: Metadata Exchange Extension constants
@@ -340,6 +339,10 @@ UT_PEX = b"ut_pex"
 PEX_EVENT_NEW = 0x01
 PEX_EVENT_REMOVE = 0x02
 
+# Return value of parse_pex_message (3rd element) for BEP 11 compact payloads.
+# Legacy messages still use separate event bits only.
+PEX_SEMANTICS_BEP11 = PEX_EVENT_NEW | PEX_EVENT_REMOVE
+
 # Maximum peers in a single PEX message
 MAX_PEX_PEERS = 50
 
@@ -365,7 +368,7 @@ HOLEPUNCH_ADDR_IPV4 = 0x00
 HOLEPUNCH_ADDR_IPV6 = 0x01
 
 # Minimum and maximum message sizes
-HOLEPUNCH_MSG_MIN_SIZE = 9   # 1 + 1 + 4 + 2 + 1 (min for ipv4, no err_code)
+HOLEPUNCH_MSG_MIN_SIZE = 9  # 1 + 1 + 4 + 2 + 1 (min for ipv4, no err_code)
 HOLEPUNCH_MSG_MIN_SIZE_V6 = 13  # 1 + 1 + 16 + 2 (ipv6, no err_code)
 HOLEPUNCH_MSG_WITH_ERROR = 13  # 9 + 4 bytes err_code for ipv4
 HOLEPUNCH_MSG_WITH_ERROR_V6 = 17  # 13 + 4 bytes err_code for ipv6
@@ -429,7 +432,7 @@ def encode_holepunch_message(
             addr_bytes = socket.inet_pton(socket.AF_INET6, target_ip)
             addr_type = HOLEPUNCH_ADDR_IPV6
         except OSError:
-            raise ExtensionError(f"Invalid IP address: {target_ip}")
+            raise ExtensionError(f"Invalid IP address: {target_ip}") from None
 
     payload = bytearray()
     payload.append(msg_type)
@@ -475,9 +478,7 @@ def decode_holepunch_message(data: bytes) -> dict[str, Any]:
     if addr_type == HOLEPUNCH_ADDR_IPV4:
         # IPv4: msg_type(1) + addr_type(1) + ip(4) + port(2) = 8 bytes
         if len(data) < 8:
-            raise ExtensionError(
-                f"IPv4 holepunch message too short: {len(data)} bytes (minimum 8)"
-            )
+            raise ExtensionError(f"IPv4 holepunch message too short: {len(data)} bytes (minimum 8)")
         ip = socket.inet_ntop(socket.AF_INET, data[2:6])
         port = struct.unpack("!H", data[6:8])[0]
         err_code = 0
@@ -486,9 +487,7 @@ def decode_holepunch_message(data: bytes) -> dict[str, Any]:
     else:  # IPv6
         # IPv6: msg_type(1) + addr_type(1) + ip(16) + port(2) = 20 bytes
         if len(data) < 20:
-            raise ExtensionError(
-                f"IPv6 holepunch message too short: {len(data)} bytes (minimum 20)"
-            )
+            raise ExtensionError(f"IPv6 holepunch message too short: {len(data)} bytes (minimum 20)")
         ip = socket.inet_ntop(socket.AF_INET6, data[2:18])
         port = struct.unpack("!H", data[18:20])[0]
         err_code = 0
@@ -560,9 +559,7 @@ class ExtensionNegotiator:
     handshake_complete: bool = False
 
     # Supported extensions (ordered by preference)
-    SUPPORTED_EXTENSIONS: list[bytes] = field(
-        default_factory=lambda: [UT_METADATA, UT_PEX, UT_HOLEPUNCH]
-    )
+    SUPPORTED_EXTENSIONS: list[bytes] = field(default_factory=lambda: [UT_METADATA, UT_PEX, UT_HOLEPUNCH])
 
     def create_handshake(self) -> bytes:
         """Create the extension handshake message payload.
@@ -580,10 +577,13 @@ class ExtensionNegotiator:
         >>> bencode_module.decode(handshake)
         {'m': [b'ut_metadata', b'ut_pex', b'ut_holepunch'], 'v': b'dh01'}
         """
-        return bencode_module.encode({
-            "m": [ext.decode("utf-8", errors="replace") for ext in self.SUPPORTED_EXTENSIONS],
-            "v": self.client_version,
-        })
+        # Bytes-only bencode invariant: keys and byte-strings are bytes.
+        return bencode_module.encode(
+            {
+                b"m": list(self.SUPPORTED_EXTENSIONS),
+                b"v": self.client_version.encode("utf-8"),
+            }
+        )
 
     def parse_handshake(self, data: bytes) -> bool:
         """Parse an extension handshake response from a peer.
@@ -614,20 +614,17 @@ class ExtensionNegotiator:
         if not isinstance(parsed, dict):
             raise ExtensionHandshakeError("Handshake is not a dictionary")
 
-        # Extract peer version
-        v = parsed.get(b"v" if isinstance(parsed.get(b"v"), bytes) else "v", b"")
+        # Bytes-only bencode invariant
+        v = parsed.get(b"v", b"")
         if isinstance(v, bytes):
             self.peer_version = v.decode("utf-8", errors="replace")
         else:
             self.peer_version = str(v) if v else ""
 
         # Extract peer extensions
-        m = parsed.get(b"m" if isinstance(parsed.get(b"m"), bytes) else "m", [])
+        m = parsed.get(b"m", [])
         if isinstance(m, list):
-            self.peer_extensions = {
-                ext.encode("utf-8") if isinstance(ext, str) else ext
-                for ext in m
-            }
+            self.peer_extensions = {ext for ext in m if isinstance(ext, bytes)}
 
         # Determine common extensions
         for ext in self.SUPPORTED_EXTENSIONS:
@@ -667,20 +664,17 @@ class ExtensionNegotiator:
         if msg_type not in (EXTENSION_MSG_TYPE_HANDSHAKE, EXTENSION_MSG_TYPE_MESSAGE):
             raise ExtensionError(f"Invalid message type: {msg_type}")
 
-        # Encode the payload
-        m_val = payload.get("m", b"")
-        if isinstance(m_val, bytes):
-            m_val = m_val.decode("utf-8", errors="replace")
-        encoded_payload = bencode_module.encode({
-            "m": m_val,
-            **{k: v for k, v in payload.items() if k != "m"},
-        })
+        # Encode the payload (bytes-only bencode invariant for dict keys).
+        encoded_payload = bencode_module.encode(
+            {
+                b"m": payload.get("m", b""),
+                **{(k.encode("utf-8") if isinstance(k, str) else k): v for k, v in payload.items() if k != "m"},
+            }
+        )
 
         # Check payload size
         if len(encoded_payload) > MAX_EXTENDED_MESSAGE_SIZE:
-            raise ExtensionError(
-                f"Payload exceeds maximum size: {len(encoded_payload)} > {MAX_EXTENDED_MESSAGE_SIZE}"
-            )
+            raise ExtensionError(f"Payload exceeds maximum size: {len(encoded_payload)} > {MAX_EXTENDED_MESSAGE_SIZE}")
 
         # Build the extended message
         message = bytearray()
@@ -721,20 +715,16 @@ class ExtensionNegotiator:
         payload_length = struct.unpack("!H", data[1:3])[0]
 
         if payload_length > MAX_EXTENDED_MESSAGE_SIZE:
-            raise ExtensionError(
-                f"Payload too large: {payload_length} > {MAX_EXTENDED_MESSAGE_SIZE}"
-            )
+            raise ExtensionError(f"Payload too large: {payload_length} > {MAX_EXTENDED_MESSAGE_SIZE}")
 
         if len(data) < 4 + payload_length:
-            raise ExtensionError(
-                f"Message truncated: expected {4 + payload_length} bytes, got {len(data)}"
-            )
+            raise ExtensionError(f"Message truncated: expected {4 + payload_length} bytes, got {len(data)}")
 
         # Byte 3: msg_type
         msg_type = data[3]
 
         # Payload
-        payload_bytes = data[4:4 + payload_length]
+        payload_bytes = data[4 : 4 + payload_length]
         try:
             payload = bencode_module.decode(payload_bytes)
         except Exception as exc:
@@ -817,8 +807,8 @@ class MetadataExchange:
         Message counter for generating unique request IDs.
     """
 
-    torrent: Optional[Torrent] = None
-    metadata: Optional[bytes] = None
+    torrent: Torrent | None = None
+    metadata: bytes | None = None
     metadata_size: int = 0
     block_size: int = METADATA_BLOCK_SIZE
     num_pieces: int = 0
@@ -868,7 +858,7 @@ class MetadataExchange:
             return 0
         return (self.metadata_size + self.block_size - 1) // self.block_size
 
-    def _extract_metadata(self) -> Optional[bytes]:
+    def _extract_metadata(self) -> bytes | None:
         """Extract the raw metadata bytes from the torrent.
 
         Returns
@@ -902,12 +892,14 @@ class MetadataExchange:
         bytes
             Bencoded handshake: ``{msg_type: 0, total_size: <int>}``.
         """
-        return bencode_module.encode({
-            "msg_type": UT_METADATA_DATA,  # 1, used for handshake in BEP 9
-            "total_size": self.metadata_size,
-        })
+        return bencode_module.encode(
+            {
+                b"msg_type": UT_METADATA_DATA,  # 1, used for handshake in BEP 9
+                b"total_size": self.metadata_size,
+            }
+        )
 
-    def parse_handshake(self, data: bytes) -> Optional[dict]:
+    def parse_handshake(self, data: bytes) -> dict | None:
         """Parse an incoming metadata handshake message.
 
         Parameters
@@ -928,7 +920,7 @@ class MetadataExchange:
         if not isinstance(parsed, dict):
             return None
 
-        msg_type = parsed.get("msg_type")
+        msg_type = parsed.get(b"msg_type")
         # msg_type 1 is used for handshake in the BEP 9 extension
         if msg_type == UT_METADATA_DATA:
             return parsed
@@ -958,22 +950,28 @@ class MetadataExchange:
         MetadataExchangeError
             If piece_index is out of range.
         """
-        if piece_index < 0 or piece_index >= self.num_pieces:
-            raise MetadataExchangeError(
-                f"Invalid piece index: {piece_index} (max: {self.num_pieces - 1})"
-            )
+        # Receivers may not yet know num_pieces (until handshake/total_size).
+        # In that state (num_pieces==0), allow creating requests and rely on
+        # the remote peer to reject invalid indices. When num_pieces is known,
+        # keep strict bounds.
+        if piece_index < 0:
+            raise MetadataExchangeError(f"Invalid piece index: {piece_index}")
+        if self.num_pieces > 0 and piece_index >= self.num_pieces:
+            raise MetadataExchangeError(f"Invalid piece index: {piece_index} (max: {self.num_pieces - 1})")
 
         self.msg_counter += 1
         req_id = hashlib.md5(peer_id + str(self.msg_counter).encode()).digest()[:4]
         self.pending_requests[req_id] = [piece_index, 0, 0]  # [piece_index, offset, transferred]
 
-        return bencode_module.encode({
-            "msg_type": UT_METADATA_REQUEST,  # 0
-            "piece": piece_index,
-            "reqid": req_id,
-        })
+        return bencode_module.encode(
+            {
+                b"msg_type": UT_METADATA_REQUEST,  # 0
+                b"piece": piece_index,
+                b"reqid": req_id,
+            }
+        )
 
-    def handle_request(self, data: bytes, peer_id: bytes = b"") -> Optional[bytes]:
+    def handle_request(self, data: bytes, peer_id: bytes = b"") -> bytes | None:
         """Handle an incoming metadata request and respond with data or reject.
 
         Parameters
@@ -996,20 +994,20 @@ class MetadataExchange:
         if not isinstance(parsed, dict):
             return None
 
-        msg_type = parsed.get("msg_type")
+        msg_type = parsed.get(b"msg_type")
         if msg_type != UT_METADATA_REQUEST:
             return None
 
-        piece = parsed.get("piece", -1)
+        piece = parsed.get(b"piece", -1)
         if not isinstance(piece, int) or piece < 0 or piece >= self.num_pieces:
-            return self._create_reject_message(parsed.get("reqid", b""))
+            return self._create_reject_message(parsed.get(b"reqid", b""))
 
         # Check if we have the metadata
         if self.metadata is None:
-            return self._create_reject_message(parsed.get("reqid", b""))
+            return self._create_reject_message(parsed.get(b"reqid", b""))
 
         # Send the data
-        return self._create_data_message(piece, parsed.get("reqid", b""))
+        return self._create_data_message(piece, parsed.get(b"reqid", b""))
 
     # ------------------------------------------------------------------
     # Data (msg_type=1)
@@ -1042,27 +1040,27 @@ class MetadataExchange:
         if self.metadata is None:
             raise MetadataExchangeError("No metadata available")
         if piece_index < 0 or piece_index >= self.num_pieces:
-            raise MetadataExchangeError(
-                f"Invalid piece index: {piece_index} (max: {self.num_pieces - 1})"
-            )
+            raise MetadataExchangeError(f"Invalid piece index: {piece_index} (max: {self.num_pieces - 1})")
 
         # Calculate piece data
         start_offset = piece_index * self.block_size
         end_offset = min(start_offset + self.block_size, len(self.metadata))
         piece_data = self.metadata[start_offset:end_offset]
 
-        return bencode_module.encode({
-            "msg_type": UT_METADATA_DATA,  # 1
-            "piece": piece_index,
-            "total_size": self.metadata_size,
-            "buffer": piece_data,
-        })
+        return bencode_module.encode(
+            {
+                b"msg_type": UT_METADATA_DATA,  # 1
+                b"piece": piece_index,
+                b"total_size": self.metadata_size,
+                b"buffer": piece_data,
+            }
+        )
 
     def handle_data(
         self,
         data: bytes,
         peer_id: bytes = b"",
-    ) -> Optional[bool]:
+    ) -> bool | None:
         """Handle an incoming metadata data message.
 
         Accumulates piece data and returns True when complete metadata
@@ -1090,13 +1088,13 @@ class MetadataExchange:
         if not isinstance(parsed, dict):
             return None
 
-        msg_type = parsed.get("msg_type")
+        msg_type = parsed.get(b"msg_type")
         if msg_type != UT_METADATA_DATA:
             return None
 
-        piece = parsed.get("piece", -1)
-        total_size = parsed.get("total_size", 0)
-        buffer = parsed.get("buffer", b"")
+        piece = parsed.get(b"piece", -1)
+        total_size = parsed.get(b"total_size", 0)
+        buffer = parsed.get(b"buffer", b"")
 
         if not isinstance(piece, int) or piece < 0:
             return None
@@ -1161,11 +1159,13 @@ class MetadataExchange:
             Bencoded reject message.
         """
         req_id = b"\x00\x00\x00\x00"
-        return bencode_module.encode({
-            "msg_type": UT_METADATA_REJECT,  # 2
-            "piece": piece_index,
-            "reqid": req_id,
-        })
+        return bencode_module.encode(
+            {
+                b"msg_type": UT_METADATA_REJECT,  # 2
+                b"piece": piece_index,
+                b"reqid": req_id,
+            }
+        )
 
     def _create_reject_message(self, req_id: bytes = b"") -> bytes:
         """Internal: create a reject message with a specific request ID.
@@ -1180,11 +1180,13 @@ class MetadataExchange:
         bytes
             Bencoded reject message.
         """
-        return bencode_module.encode({
-            "msg_type": UT_METADATA_REJECT,
-            "piece": -1,
-            "reqid": req_id,
-        })
+        return bencode_module.encode(
+            {
+                b"msg_type": UT_METADATA_REJECT,
+                b"piece": -1,
+                b"reqid": req_id,
+            }
+        )
 
     def handle_reject(self, data: bytes) -> None:
         """Handle an incoming metadata reject message.
@@ -1200,7 +1202,7 @@ class MetadataExchange:
             logger.debug("Failed to decode metadata reject message")
             return
 
-        piece = parsed.get("piece", -1)
+        piece = parsed.get(b"piece", -1)
         logger.debug("Metadata piece %d rejected", piece)
 
     def _create_data_message(self, piece_index: int, req_id: bytes = b"") -> bytes:
@@ -1225,12 +1227,14 @@ class MetadataExchange:
         end_offset = min(start_offset + self.block_size, len(self.metadata))
         piece_data = self.metadata[start_offset:end_offset]
 
-        return bencode_module.encode({
-            "msg_type": UT_METADATA_DATA,
-            "piece": piece_index,
-            "total_size": self.metadata_size,
-            "buffer": piece_data,
-        })
+        return bencode_module.encode(
+            {
+                b"msg_type": UT_METADATA_DATA,
+                b"piece": piece_index,
+                b"total_size": self.metadata_size,
+                b"buffer": piece_data,
+            }
+        )
 
     # ------------------------------------------------------------------
     # Verification
@@ -1285,7 +1289,7 @@ class MetadataExchange:
             logger.debug("Failed to verify metadata: %s", exc)
             return False
 
-    def _get_expected_infohash(self) -> Optional[bytes]:
+    def _get_expected_infohash(self) -> bytes | None:
         """Get the expected info hash for verification.
 
         Returns
@@ -1330,7 +1334,7 @@ class MetadataExchange:
         """
         return self.num_pieces
 
-    def get_metadata(self) -> Optional[bytes]:
+    def get_metadata(self) -> bytes | None:
         """Get the complete metadata if fully received.
 
         Returns
@@ -1382,52 +1386,75 @@ class PEXManager:
 
     def create_pex_message(
         self,
-        new_peers: Optional[list[Endpoint]] = None,
-        removed_peers: Optional[list[Endpoint]] = None,
+        new_peers: list[Endpoint] | None = None,
+        removed_peers: list[Endpoint] | None = None,
         direction: int = PEX_EVENT_NEW,
     ) -> bytes:
-        """Create a PEX message (BEP 11).
+        """Create PEX payload bytes for LTEP ``ut_pex`` (BEP 11).
+
+        The returned value is **only** the bencoded dictionary that follows the
+        LTEP extension header (not LTEP handshake fields such as ``m``).
+
+        Uses compact IPv4/v6 blobs: ``added``, ``added6``, ``dropped``, ``dropped6``.
 
         Parameters
         ----------
         new_peers : list of Endpoint, optional
-            New peers to include in the message.
+            Peers to encode in ``added`` / ``added6``.
         removed_peers : list of Endpoint, optional
-            Peers to remove from the message.
+            Peers to encode in ``dropped`` / ``dropped6``.
         direction : int
-            PEX_EVENT_NEW (0x01) for new peers, PEX_EVENT_REMOVE (0x02) for removals.
+            Ignored. Kept for backward compatibility with older call sites.
 
         Returns
         -------
         bytes
-            Bencoded PEX message with "m" extension name and peer lists.
+            Bencoded payload per BEP 11.
         """
+        del direction  # BEP 11 encodes deltas via compact lists only.
         new_peers = new_peers or []
         removed_peers = removed_peers or []
 
-        # Format peer data
-        formatted_new = self._format_peers(new_peers)
-        formatted_removed = self._format_peers(removed_peers)
+        nv4 = [p for p in new_peers if not p.is_ipv6]
+        nv6 = [p for p in new_peers if p.is_ipv6]
+        rv4 = [p for p in removed_peers if not p.is_ipv6]
+        rv6 = [p for p in removed_peers if p.is_ipv6]
 
-        return bencode_module.encode({
-            "m": [UT_PEX.decode("utf-8")],
-            "peers": formatted_new,
-            "peers.s": formatted_removed,
-            "events": direction,
-        })
+        nv4, nv6 = self._budget_ipv4_ipv6(nv4, nv6, MAX_PEX_PEERS)
+        rv4, rv6 = self._budget_ipv4_ipv6(rv4, rv6, MAX_PEX_PEERS)
+
+        payload: dict[Any, Any] = {}
+        ab = self._encode_compact_ipv4(nv4)
+        a6b = self._encode_compact_ipv6(nv6)
+        db = self._encode_compact_ipv4(rv4)
+        d6b = self._encode_compact_ipv6(rv6)
+        if ab:
+            payload[b"added"] = ab
+        if a6b:
+            payload[b"added6"] = a6b
+        if db:
+            payload[b"dropped"] = db
+        if d6b:
+            payload[b"dropped6"] = d6b
+        if not payload:
+            payload[b"added"] = b""
+        return bencode_module.encode(payload)
 
     def parse_pex_message(self, data: bytes) -> tuple[list[Endpoint], list[Endpoint], int]:
-        """Parse an incoming PEX message (BEP 11).
+        """Parse incoming PEX payload (BEP 11 compact or legacy dictionary layout).
 
         Parameters
         ----------
         data : bytes
-            Bencoded PEX message.
+            Bencoded PEX message payload for ``ut_pex``.
 
         Returns
         -------
         tuple[list[Endpoint], list[Endpoint], int]
-            A tuple of (new_peers, removed_peers, events_bitfield).
+            ``(added_peers, dropped_peers, semantics)``.
+            For BEP 11 compact payloads, semantics is ``PEX_SEMANTICS_BEP11``
+            ; for legacy payloads, semantics is an ``events`` bitfield if
+            present, otherwise ``PEX_EVENT_NEW``.
 
         Raises
         ------
@@ -1435,37 +1462,146 @@ class PEXManager:
             If the message is malformed.
         """
         try:
-            parsed = bencode_module.decode(data)
+            parsed_raw = bencode_module.decode(data)
         except Exception as exc:
             raise PEXError(f"Failed to decode PEX message: {exc}") from exc
 
-        if not isinstance(parsed, dict):
+        if not isinstance(parsed_raw, dict):
             raise PEXError("PEX message is not a dictionary")
 
-        # Extract events bitfield
-        events = parsed.get("events", 0)
-        if isinstance(events, bytes):
-            events = struct.unpack("!B", events)[0]
+        parsed = self._normalize_pex_dict_keys(parsed_raw)
 
-        # Extract new peers
+        if self._pex_payload_uses_bep11_compact(parsed):
+            new_peers: list[Endpoint] = []
+            removed_peers: list[Endpoint] = []
+            new_peers.extend(self._decode_compact_ipv4(self._expect_compact_blob(parsed, b"added")))
+            new_peers.extend(self._decode_compact_ipv6(self._expect_compact_blob(parsed, b"added6")))
+            removed_peers.extend(self._decode_compact_ipv4(self._expect_compact_blob(parsed, b"dropped")))
+            removed_peers.extend(self._decode_compact_ipv6(self._expect_compact_blob(parsed, b"dropped6")))
+            return new_peers, removed_peers, PEX_SEMANTICS_BEP11
+
+        events_raw = parsed.get(b"events", 0)
+        if isinstance(events_raw, bytes):
+            events = events_raw[-1] if events_raw else 0
+        elif isinstance(events_raw, int):
+            events = events_raw & 0xFF
+        else:
+            events = PEX_EVENT_NEW
+
         new_peers = []
-        peers_data = parsed.get("peers", parsed.get(b"peers", []))
+        peers_data = parsed.get(b"peers", [])
         if isinstance(peers_data, list):
             for peer_data in peers_data:
                 peer = self._parse_peer(peer_data)
                 if peer:
                     new_peers.append(peer)
 
-        # Extract removed peers
         removed_peers = []
-        removed_data = parsed.get("peers.s", parsed.get(b"peers.s", []))
+        removed_data = parsed.get(b"peers.s", [])
         if isinstance(removed_data, list):
             for peer_data in removed_data:
                 peer = self._parse_peer(peer_data)
                 if peer:
                     removed_peers.append(peer)
 
+        if new_peers and events == 0:
+            events = PEX_EVENT_NEW
+
         return new_peers, removed_peers, events
+
+    @staticmethod
+    def _normalize_pex_dict_keys(
+        parsed: dict[Any, Any],
+    ) -> dict[bytes, Any]:
+        out: dict[bytes, Any] = {}
+        for k, v in parsed.items():
+            if isinstance(k, str):
+                bk = k.encode("utf-8", errors="replace")
+            elif isinstance(k, bytes):
+                bk = k
+            else:
+                continue
+            out[bk] = v
+        return out
+
+    @staticmethod
+    def _pex_payload_uses_bep11_compact(parsed: dict[bytes, Any]) -> bool:
+        return any(key in parsed for key in (b"added", b"added6", b"dropped", b"dropped6", b"added.f", b"added6.f"))
+
+    @staticmethod
+    def _expect_compact_blob(parsed: dict[bytes, Any], key: bytes) -> bytes:
+        val = parsed.get(key, b"")
+        if val in (None, b""):
+            return b""
+        if isinstance(val, bytes):
+            return val
+        raise PEXError(f"PEX field {key!r} must be a byte string, got {type(val).__name__}")
+
+    @staticmethod
+    def _budget_ipv4_ipv6(v4: list[Endpoint], v6: list[Endpoint], budget: int) -> tuple[list[Endpoint], list[Endpoint]]:
+        out_v4: list[Endpoint] = []
+        out_v6: list[Endpoint] = []
+        n = 0
+        for p in v4:
+            if n >= budget:
+                break
+            out_v4.append(p)
+            n += 1
+        for p in v6:
+            if n >= budget:
+                break
+            out_v6.append(p)
+            n += 1
+        return out_v4, out_v6
+
+    @staticmethod
+    def _encode_compact_ipv4(peers: list[Endpoint]) -> bytes:
+        parts: list[bytes] = []
+        for peer in peers:
+            parts.append(socket.inet_aton(peer.ip) + peer.port.to_bytes(2, "big"))
+        return b"".join(parts)
+
+    @staticmethod
+    def _encode_compact_ipv6(peers: list[Endpoint]) -> bytes:
+        parts: list[bytes] = []
+        for peer in peers:
+            parts.append(socket.inet_pton(socket.AF_INET6, peer.ip) + peer.port.to_bytes(2, "big"))
+        return b"".join(parts)
+
+    @staticmethod
+    def _decode_compact_ipv4(blob: bytes) -> list[Endpoint]:
+        if not blob:
+            return []
+        out: list[Endpoint] = []
+        for i in range(0, len(blob), 6):
+            chunk = blob[i : i + 6]
+            if len(chunk) < 6:
+                logger.debug("PEX IPv4 compact blob truncated at offset %s", i)
+                break
+            ip = socket.inet_ntop(socket.AF_INET, chunk[:4])
+            port = int.from_bytes(chunk[4:6], "big")
+            out.append(Endpoint(ip=ip, port=port, node_id=None))
+        return out
+
+    @staticmethod
+    def _decode_compact_ipv6(blob: bytes) -> list[Endpoint]:
+        if not blob:
+            return []
+        out: list[Endpoint] = []
+        for i in range(0, len(blob), 18):
+            chunk = blob[i : i + 18]
+            if len(chunk) < 18:
+                logger.debug("PEX IPv6 compact blob truncated at offset %s", i)
+                break
+            ip = socket.inet_ntop(socket.AF_INET6, chunk[:16])
+            port = int.from_bytes(chunk[16:18], "big")
+            out.append(Endpoint(ip=ip, port=port, node_id=None))
+        return out
+
+    def remove_peer(self, peer: Endpoint) -> None:
+        """Remove peer from tracked sets."""
+        self.known_peers.discard(peer)
+        self.recent_peers.discard(peer)
 
     def add_peer(self, peer: Endpoint) -> None:
         """Add a peer to the known peers set.
@@ -1482,34 +1618,7 @@ class PEXManager:
         """Clear the recent peers set after PEX has been sent."""
         self.recent_peers.clear()
 
-    def _format_peers(self, peers: list[Endpoint]) -> list[dict[str, Any]]:
-        """Format peers for PEX message.
-
-        Parameters
-        ----------
-        peers : list of Endpoint
-            The peers to format.
-
-        Returns
-        -------
-        list of dict
-            Formatted peer data for bencoding.
-        """
-        formatted = []
-        for peer in peers:
-            if peer.is_ipv6:
-                ip_bytes = socket.inet_pton(socket.AF_INET6, peer.ip)
-            else:
-                ip_bytes = socket.inet_aton(peer.ip)
-
-            formatted.append({
-                "ip": ip_bytes,
-                "port": peer.port.to_bytes(2, "big"),
-                "id": peer.node_id or b"",
-            })
-        return formatted
-
-    def _parse_peer(self, peer_data: Any) -> Optional[Endpoint]:
+    def _parse_peer(self, peer_data: Any) -> Endpoint | None:
         """Parse a peer from PEX data.
 
         Parameters
@@ -1525,13 +1634,10 @@ class PEXManager:
         if not isinstance(peer_data, dict):
             return None
 
+        pmap = self._normalize_pex_dict_keys(peer_data)
+
         try:
-            ip_data = None
-            for key in [b"ip", "ip"]:
-                val = peer_data.get(key)
-                if val is not None:
-                    ip_data = val
-                    break
+            ip_data = pmap.get(b"ip")
 
             if ip_data is None or not isinstance(ip_data, bytes):
                 return None
@@ -1539,19 +1645,12 @@ class PEXManager:
             # Try IPv4 first
             if len(ip_data) == 4:
                 ip = socket.inet_ntop(socket.AF_INET, ip_data)
-                is_ipv6 = False
             elif len(ip_data) == 16:
                 ip = socket.inet_ntop(socket.AF_INET6, ip_data)
-                is_ipv6 = True
             else:
                 return None
 
-            port_data = None
-            for key in [b"port", "port"]:
-                val = peer_data.get(key)
-                if val is not None:
-                    port_data = val
-                    break
+            port_data = pmap.get(b"port")
 
             if isinstance(port_data, bytes):
                 port = struct.unpack("!H", port_data)[0]
@@ -1560,19 +1659,13 @@ class PEXManager:
             else:
                 return None
 
-            node_id_data = None
-            for key in [b"id", "id"]:
-                val = peer_data.get(key)
-                if val is not None:
-                    node_id_data = val
-                    break
+            node_id_data = pmap.get(b"id")
+            node_id = node_id_data if isinstance(node_id_data, bytes) else None
+            if node_id == b"":
+                node_id = None
 
-            if isinstance(node_id_data, str):
-                node_id_data = node_id_data.encode("latin-1")
-            node_id = node_id_data if isinstance(node_id_data, bytes) else b""
-
-            return Endpoint(ip=ip, port=port, is_ipv6=is_ipv6, node_id=node_id)
-        except (socket.error, struct.error, ValueError) as exc:
+            return Endpoint(ip=ip, port=port, node_id=node_id)
+        except (OSError, struct.error, ValueError) as exc:
             logger.debug("Failed to parse PEX peer: %s", exc)
             return None
 
@@ -1607,9 +1700,9 @@ class HolePunchHandler:
     """
 
     peer_id: bytes = field(default_factory=lambda: b"")
-    endpoint: Optional[Endpoint] = None
+    endpoint: Endpoint | None = None
     pending_requests: dict[bytes, dict] = field(default_factory=dict)
-    on_holepunch_connect: Optional[Any] = None
+    on_holepunch_connect: Any | None = None
 
     def create_rendezvous_message(
         self,
@@ -1638,9 +1731,7 @@ class HolePunchHandler:
         ExtensionError
             If parameters are invalid.
         """
-        return encode_holepunch_message(
-            HOLEPUNCH_RENDEZVOUS, target_ip, target_port
-        )
+        return encode_holepunch_message(HOLEPUNCH_RENDEZVOUS, target_ip, target_port)
 
     def create_connect_message(
         self,
@@ -1668,9 +1759,7 @@ class HolePunchHandler:
         ExtensionError
             If parameters are invalid.
         """
-        return encode_holepunch_message(
-            HOLEPUNCH_CONNECT, peer_ip, peer_port
-        )
+        return encode_holepunch_message(HOLEPUNCH_CONNECT, peer_ip, peer_port)
 
     def create_error_message(
         self,
@@ -1702,11 +1791,9 @@ class HolePunchHandler:
         ExtensionError
             If parameters are invalid.
         """
-        return encode_holepunch_message(
-            HOLEPUNCH_ERROR, target_ip, target_port, err_code
-        )
+        return encode_holepunch_message(HOLEPUNCH_ERROR, target_ip, target_port, err_code)
 
-    def handle_rendezvous(self, data: bytes) -> tuple[dict[str, Any], Optional[bytes]]:
+    def handle_rendezvous(self, data: bytes) -> tuple[dict[str, Any], bytes | None]:
         """Handle an incoming rendezvous message.
 
         Parses the rendezvous message and returns the decoded data.
@@ -1733,9 +1820,7 @@ class HolePunchHandler:
         decoded = decode_holepunch_message(data)
 
         if decoded["msg_type"] != HOLEPUNCH_RENDEZVOUS:
-            raise ExtensionError(
-                f"Expected rendezvous message, got type {decoded['msg_type']}"
-            )
+            raise ExtensionError(f"Expected rendezvous message, got type {decoded['msg_type']}")
 
         return decoded, None
 
@@ -1763,9 +1848,7 @@ class HolePunchHandler:
         decoded = decode_holepunch_message(data)
 
         if decoded["msg_type"] != HOLEPUNCH_CONNECT:
-            raise ExtensionError(
-                f"Expected connect message, got type {decoded['msg_type']}"
-            )
+            raise ExtensionError(f"Expected connect message, got type {decoded['msg_type']}")
 
         # Invoke callback if set
         if self.on_holepunch_connect:
@@ -1800,9 +1883,7 @@ class HolePunchHandler:
         decoded = decode_holepunch_message(data)
 
         if decoded["msg_type"] != HOLEPUNCH_ERROR:
-            raise ExtensionError(
-                f"Expected error message, got type {decoded['msg_type']}"
-            )
+            raise ExtensionError(f"Expected error message, got type {decoded['msg_type']}")
 
         return decoded
 
@@ -1879,9 +1960,10 @@ class PeerConnection:
     endpoint: Endpoint
     info_hash: bytes = field(default_factory=lambda: b"")
     negotiator: ExtensionNegotiator = field(default_factory=ExtensionNegotiator)
-    metadata_exchange: Optional[MetadataExchange] = None
-    pex_manager: Optional[PEXManager] = None
-    holepunch_handler: Optional[HolePunchHandler] = None
+    metadata_exchange: MetadataExchange | None = None
+    pex_manager: PEXManager | None = None
+    holepunch_handler: HolePunchHandler | None = None
+    is_private: bool = False  # BEP 27: suppresses ut_pex when True
     is_initiator: bool = True
     connected: bool = False
     extended_enabled: bool = False
@@ -1897,11 +1979,18 @@ class PeerConnection:
 
     def __post_init__(self) -> None:
         """Initialize optional components."""
-        if self.metadata_exchange is not None:
-            self.pex_manager = PEXManager(
-                info_hash=self.metadata_exchange._info_hash,
-                my_node_id=self.peer_id,
+        if self.is_private:
+            # BEP 27: private torrents must not use peer exchange; remove ut_pex from
+            # the advertised extension list so it is never negotiated with the peer.
+            self.negotiator = ExtensionNegotiator(
+                SUPPORTED_EXTENSIONS=[ext for ext in self.negotiator.SUPPORTED_EXTENSIONS if ext != UT_PEX]
             )
+        if self.metadata_exchange is not None:
+            if not self.is_private:
+                self.pex_manager = PEXManager(
+                    info_hash=self.metadata_exchange._info_hash,
+                    my_node_id=self.peer_id,
+                )
             self.holepunch_handler = HolePunchHandler()
 
     def create_handshake(self) -> bytes:
@@ -1941,9 +2030,7 @@ class PeerConnection:
 
         # Verify info_hash matches this torrent
         if self.info_hash and info_hash != self.info_hash:
-            raise ExtensionError(
-                f"Info hash mismatch: expected {self.info_hash.hex()}, got {info_hash.hex()}"
-            )
+            raise ExtensionError(f"Info hash mismatch: expected {self.info_hash.hex()}, got {info_hash.hex()}")
 
         # Store extension support
         if extensions_enabled:
@@ -2153,9 +2240,7 @@ class PeerConnection:
             If the request exceeds maximum size or pending queue is full.
         """
         if length > MAX_REQUEST_SIZE:
-            raise ExtensionError(
-                f"Request size {length} exceeds maximum {MAX_REQUEST_SIZE}"
-            )
+            raise ExtensionError(f"Request size {length} exceeds maximum {MAX_REQUEST_SIZE}")
         if len(self.pending_requests) >= MAX_PENDING_REQUESTS:
             raise ExtensionError(
                 f"Pending requests {len(self.pending_requests)} exceeds maximum {MAX_PENDING_REQUESTS}"
@@ -2165,12 +2250,14 @@ class PeerConnection:
         msg = serialize_peer_message(MSG_REQUEST, payload)
 
         # Track the pending request
-        self.pending_requests.append({
-            "piece_index": piece_index,
-            "begin": begin,
-            "length": length,
-            "timestamp": time.time(),
-        })
+        self.pending_requests.append(
+            {
+                "piece_index": piece_index,
+                "begin": begin,
+                "length": length,
+                "timestamp": time.time(),
+            }
+        )
 
         return msg
 
@@ -2196,12 +2283,9 @@ class PeerConnection:
 
         # Remove from pending requests
         self.pending_requests = [
-            r for r in self.pending_requests
-            if not (
-                r["piece_index"] == piece_index
-                and r["begin"] == begin
-                and r["length"] == length
-            )
+            r
+            for r in self.pending_requests
+            if not (r["piece_index"] == piece_index and r["begin"] == begin and r["length"] == length)
         ]
 
         return msg
@@ -2265,8 +2349,7 @@ class PeerConnection:
 
         # Remove completed request from pending
         self.pending_requests = [
-            r for r in self.pending_requests
-            if not (r["piece_index"] == piece_index and r["begin"] == begin)
+            r for r in self.pending_requests if not (r["piece_index"] == piece_index and r["begin"] == begin)
         ]
 
     def handle_request(self, piece_index: int, begin: int, length: int) -> None:
@@ -2378,9 +2461,7 @@ class PeerConnection:
         bool
             True if we can queue more requests.
         """
-        return len(self.pending_requests) < MAX_PENDING_REQUESTS and (
-            not self.peer_choked or self.choked
-        )
+        return len(self.pending_requests) < MAX_PENDING_REQUESTS and (not self.peer_choked or self.choked)
 
     def __repr__(self) -> str:
         status = "connected" if self.connected else "disconnected"

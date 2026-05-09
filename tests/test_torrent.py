@@ -4,22 +4,23 @@ from __future__ import annotations
 
 import pytest
 
-from dhtrack.torrent import Torrent, TorrentParseError
 from dhtrack import bencode as bencode_module
-
+from dhtrack.bencode import DecodeError
+from dhtrack.torrent import Torrent
 
 # ============================================================================
 # Test Data Helpers
 # ============================================================================
 
+
 def create_simple_torrent() -> Torrent:
     """Create a simple torrent with a single announce URL."""
     data = {
-        'announce': b'http://tracker.example.com/announce',
-        'info': {
-            'name': b'test_file.txt',
-            'piece length': 16384,
-            'pieces': b'\x00' * 20,
+        "announce": b"http://tracker.example.com/announce",
+        "info": {
+            "name": b"test_file.txt",
+            "piece length": 16384,
+            "pieces": b"\x00" * 20,
         },
     }
     return Torrent(data)
@@ -28,15 +29,15 @@ def create_simple_torrent() -> Torrent:
 def create_multitracker_torrent() -> Torrent:
     """Create a torrent with multiple tracker tiers."""
     data = {
-        'announce': b'http://fallback.tracker.com/announce',
-        'announce-list': [
-            [b'http://primary1.tracker.com/announce', b'http://primary2.tracker.com/announce'],
-            [b'http://backup1.tracker.com/announce'],
+        "announce": b"http://fallback.tracker.com/announce",
+        "announce-list": [
+            [b"http://primary1.tracker.com/announce", b"http://primary2.tracker.com/announce"],
+            [b"http://backup1.tracker.com/announce"],
         ],
-        'info': {
-            'name': b'test_file.txt',
-            'piece length': 16384,
-            'pieces': b'\x00' * 20,
+        "info": {
+            "name": b"test_file.txt",
+            "piece length": 16384,
+            "pieces": b"\x00" * 20,
         },
     }
     return Torrent(data)
@@ -45,11 +46,11 @@ def create_multitracker_torrent() -> Torrent:
 def create_single_file_torrent() -> Torrent:
     """Create a single-file torrent."""
     data = {
-        'announce': b'http://tracker.example.com/announce',
-        'info': {
-            'name': b'myfile.txt',
-            'piece length': 16384,
-            'pieces': b'\x00' * 20,
+        "announce": b"http://tracker.example.com/announce",
+        "info": {
+            "name": b"myfile.txt",
+            "piece length": 16384,
+            "pieces": b"\x00" * 20,
         },
     }
     return Torrent(data)
@@ -71,22 +72,18 @@ class TestTorrentParse:
 
     def test_parse_empty_buffer(self):
         """Should raise an exception for empty buffer."""
-        # Raises DecodeError from bencode, not TorrentParseError
-        with pytest.raises(Exception):
-            Torrent.parse(b'')
+        with pytest.raises(DecodeError):
+            Torrent.parse(b"")
 
     def test_parse_invalid_data(self):
         """Should raise an exception for invalid BEncode data."""
-        # Raises ValueError from bencode decoding
-        with pytest.raises(Exception):
-            Torrent.parse(b'invalid data')
+        with pytest.raises(DecodeError):
+            Torrent.parse(b"invalid data")
 
     def test_parse_missing_info(self):
-        """Should raise TorrentParseError if info field is missing."""
-        # Empty dict passes through Torrent.__init__ but returns empty info
-        # The test data {} creates an empty dict which raises DecodeError
-        with pytest.raises(Exception):
-            Torrent.parse(b'e')  # Invalid BEncode
+        """Malformed metainfo decoding raises DecodeError before validation."""
+        with pytest.raises(DecodeError):
+            Torrent.parse(b"e")  # Invalid BEncode
 
 
 # ============================================================================
@@ -100,12 +97,12 @@ class TestTorrentProperties:
     def test_torrent_name(self):
         """Should return the torrent name."""
         torrent = create_simple_torrent()
-        assert torrent.name == 'test_file.txt'
+        assert torrent.name == "test_file.txt"
 
     def test_torrent_name_single_file(self):
         """Should return the torrent name from single-file torrent."""
         torrent = create_single_file_torrent()
-        assert torrent.name == 'myfile.txt'
+        assert torrent.name == "myfile.txt"
 
     def test_torrent_infohash(self):
         """Should return 20-byte SHA-1 hash."""
@@ -118,7 +115,7 @@ class TestTorrentProperties:
         info = torrent.info
         assert info is not None
         assert isinstance(info, dict)
-        assert 'name' in info or b'name' in info
+        assert "name" in info or b"name" in info
 
     def test_torrent_file_count_single(self):
         """Should return 1 for single-file torrent."""
@@ -129,14 +126,14 @@ class TestTorrentProperties:
         """Should return a useful repr."""
         torrent = create_simple_torrent()
         repr_str = repr(torrent)
-        assert 'test_file.txt' in repr_str
+        assert "test_file.txt" in repr_str
         assert torrent.infohash.hex() in repr_str
 
     def test_torrent_str(self):
         """Should return a useful string representation."""
         torrent = create_simple_torrent()
         str_str = str(torrent)
-        assert 'test_file.txt' in str_str
+        assert "test_file.txt" in str_str
 
 
 # ============================================================================
@@ -150,7 +147,7 @@ class TestSingleTracker:
     def test_single_tracker_urls(self):
         """Should return single tracker URL."""
         torrent = create_simple_torrent()
-        assert torrent.trackers == [b'http://tracker.example.com/announce'.decode('utf-8')]
+        assert torrent.trackers == [b"http://tracker.example.com/announce".decode("utf-8")]
 
     def test_no_announce_list(self):
         """Should not have announce-list in single tracker torrent."""
@@ -167,7 +164,7 @@ class TestSingleTracker:
         # tiers[0] is a list of tracker URLs for that tier
         assert isinstance(tiers[0], list)
         assert len(tiers[0]) == 1
-        assert tiers[0][0] == 'http://tracker.example.com/announce'
+        assert tiers[0][0] == "http://tracker.example.com/announce"
 
 
 # ============================================================================
@@ -184,11 +181,11 @@ class TestMultitracker:
         urls = torrent.trackers
         # Per BEP-12: announce is ignored when announce-list exists
         assert len(urls) == 3
-        assert 'http://primary1.tracker.com/announce' in urls
-        assert 'http://primary2.tracker.com/announce' in urls
-        assert 'http://backup1.tracker.com/announce' in urls
+        assert "http://primary1.tracker.com/announce" in urls
+        assert "http://primary2.tracker.com/announce" in urls
+        assert "http://backup1.tracker.com/announce" in urls
         # announce URL should NOT be present
-        assert 'http://fallback.tracker.com/announce' not in urls
+        assert "http://fallback.tracker.com/announce" not in urls
 
     def test_multitracker_has_announce_list(self):
         """Should detect announce-list presence."""
@@ -219,7 +216,7 @@ class TestMultitracker:
         # Should only include URLs from announce-list (3 URLs), not announce
         assert len(urls) == 3
         # Verify announce URL is excluded
-        assert all('fallback' not in u for u in urls)
+        assert all("fallback" not in u for u in urls)
 
     def test_get_raw_announce_list_empty(self):
         """Should return None for torrents without announce-list."""
@@ -239,9 +236,7 @@ class TestSetAnnounceList:
     def test_set_single_tier(self):
         """Should create single tier."""
         torrent = create_simple_torrent()
-        torrent.set_announce_list([
-            ['http://tracker1.com/announce', 'http://tracker2.com/announce']
-        ])
+        torrent.set_announce_list([["http://tracker1.com/announce", "http://tracker2.com/announce"]])
         assert torrent.has_announce_list() is True
         tiers = torrent.tracker_tiers
         assert len(tiers) == 1
@@ -250,10 +245,12 @@ class TestSetAnnounceList:
     def test_set_multiple_tiers(self):
         """Should create multiple tiers."""
         torrent = create_simple_torrent()
-        torrent.set_announce_list([
-            ['http://primary1.com/announce', 'http://primary2.com/announce'],
-            ['http://backup1.com/announce'],
-        ])
+        torrent.set_announce_list(
+            [
+                ["http://primary1.com/announce", "http://primary2.com/announce"],
+                ["http://backup1.com/announce"],
+            ]
+        )
         assert torrent.has_announce_list() is True
         tiers = torrent.tracker_tiers
         assert len(tiers) == 2
@@ -263,9 +260,7 @@ class TestSetAnnounceList:
     def test_set_bytes_urls(self):
         """Should handle both string and bytes URLs."""
         torrent = create_simple_torrent()
-        torrent.set_announce_list([
-            [b'http://tracker1.com/announce', 'http://tracker2.com/announce']
-        ])
+        torrent.set_announce_list([[b"http://tracker1.com/announce", "http://tracker2.com/announce"]])
         tiers = torrent.tracker_tiers
         assert len(tiers[0]) == 2
 
@@ -279,11 +274,13 @@ class TestSetAnnounceList:
     def test_set_empty_tier(self):
         """Should handle empty tiers in list."""
         torrent = create_simple_torrent()
-        torrent.set_announce_list([
-            ['http://tracker1.com/announce'],
-            [],
-            ['http://backup.com/announce'],
-        ])
+        torrent.set_announce_list(
+            [
+                ["http://tracker1.com/announce"],
+                [],
+                ["http://backup.com/announce"],
+            ]
+        )
         # Empty tiers should still be in the raw data
         tiers = torrent.tracker_tiers
         assert len(tiers) == 2  # Empty tiers are filtered in tracker_tiers
@@ -302,8 +299,8 @@ class TestShuffleTier:
         torrent = create_multitracker_torrent()
         result = torrent.shuffle_tier(0)
         assert len(result) == 2
-        assert 'http://primary1.tracker.com/announce' in result
-        assert 'http://primary2.tracker.com/announce' in result
+        assert "http://primary1.tracker.com/announce" in result
+        assert "http://primary2.tracker.com/announce" in result
 
     def test_shuffle_out_of_range(self):
         """Should raise ValueError for out of range tier."""
@@ -333,7 +330,6 @@ class TestShuffleTier:
 
     def test_shuffle_changes_order(self):
         """Shuffle may change the order."""
-        import random
         torrent = create_multitracker_torrent()
         original_order = torrent.tracker_tiers[0][:]
         torrent.shuffle_tier(0)
@@ -354,44 +350,44 @@ class TestRecordAnnounceSuccess:
     def test_move_tracker_to_front(self):
         """Should move successful tracker to front of tier."""
         torrent = create_multitracker_torrent()
-        torrent.record_announce_success(0, 'http://primary2.tracker.com/announce')
+        torrent.record_announce_success(0, "http://primary2.tracker.com/announce")
         tiers = torrent.tracker_tiers
         # primary2 should now be first
-        assert tiers[0][0] == 'http://primary2.tracker.com/announce'
+        assert tiers[0][0] == "http://primary2.tracker.com/announce"
 
     def test_move_already_at_front(self):
         """Should do nothing if tracker is already at front."""
         torrent = create_multitracker_torrent()
-        original = torrent.tracker_tiers[0][:]
-        torrent.record_announce_success(0, 'http://primary1.tracker.com/announce')
+        torrent.tracker_tiers[0][:]
+        torrent.record_announce_success(0, "http://primary1.tracker.com/announce")
         # Should still be at front
-        assert torrent.tracker_tiers[0][0] == 'http://primary1.tracker.com/announce'
+        assert torrent.tracker_tiers[0][0] == "http://primary1.tracker.com/announce"
 
     def test_success_across_tiers(self):
         """Should record success in specific tier."""
         torrent = create_multitracker_torrent()
-        torrent.record_announce_success(1, 'http://backup1.tracker.com/announce')
+        torrent.record_announce_success(1, "http://backup1.tracker.com/announce")
         # Should not affect tier 0
         tiers = torrent.tracker_tiers
-        assert tiers[0][0] == 'http://primary1.tracker.com/announce'
+        assert tiers[0][0] == "http://primary1.tracker.com/announce"
 
     def test_invalid_tier_index(self):
         """Should raise for invalid tier index."""
         torrent = create_multitracker_torrent()
         with pytest.raises(ValueError, match="out of range"):
-            torrent.record_announce_success(5, 'http://backup1.tracker.com/announce')
+            torrent.record_announce_success(5, "http://backup1.tracker.com/announce")
 
     def test_missing_tracker(self):
         """Should raise for tracker not in tier."""
         torrent = create_multitracker_torrent()
         with pytest.raises(ValueError, match="not found"):
-            torrent.record_announce_success(0, 'http://missing.tracker.com/announce')
+            torrent.record_announce_success(0, "http://missing.tracker.com/announce")
 
     def test_no_announce_list(self):
         """Should raise when no announce-list exists."""
         torrent = create_simple_torrent()
         with pytest.raises(ValueError, match="No announce-list"):
-            torrent.record_announce_success(0, 'http://tracker.com/announce')
+            torrent.record_announce_success(0, "http://tracker.com/announce")
 
 
 # ============================================================================
@@ -412,10 +408,7 @@ class TestShuffleAndRecordWorkflow:
 
         # 2. Shuffle tier 0
         shuffled = torrent.shuffle_tier(0)
-        assert set(shuffled) == {
-            'http://primary1.tracker.com/announce',
-            'http://primary2.tracker.com/announce'
-        }
+        assert set(shuffled) == {"http://primary1.tracker.com/announce", "http://primary2.tracker.com/announce"}
 
         # 3. Record success with the last tracker (simulating it responded last)
         last_tracker = shuffled[-1]
@@ -453,32 +446,32 @@ class TestEdgeCases:
     def test_empty_tracker_in_tier(self):
         """Should handle tiers with empty entries gracefully."""
         data = {
-            'announce-list': [
-                [b'http://tracker1.com/announce'],
-                [b''],  # Empty URL
+            "announce-list": [
+                [b"http://tracker1.com/announce"],
+                [b""],  # Empty URL
             ],
-            'info': {
-                'name': b'test',
-                'piece length': 16384,
-                'pieces': b'\x00' * 20,
+            "info": {
+                "name": b"test",
+                "piece length": 16384,
+                "pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
         tiers = torrent.tracker_tiers
         # Empty URLs should still appear in flat list but not as empty
         # Empty tier URLs are included as empty strings
-        assert 'http://tracker1.com/announce' in tiers[0]
+        assert "http://tracker1.com/announce" in tiers[0]
 
     def test_mixed_byte_and_string_urls(self):
         """Should handle mixed bytes and string URLs."""
         data = {
-            'announce-list': [
-                [b'http://bytes.tracker.com/announce', 'http://string.tracker.com/announce'],
+            "announce-list": [
+                [b"http://bytes.tracker.com/announce", "http://string.tracker.com/announce"],
             ],
-            'info': {
-                'name': b'test',
-                'piece length': 16384,
-                'pieces': b'\x00' * 20,
+            "info": {
+                "name": b"test",
+                "piece length": 16384,
+                "pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
@@ -489,13 +482,13 @@ class TestEdgeCases:
     def test_unicode_tracker_url(self):
         """Should handle Unicode in tracker URLs."""
         data = {
-            'announce-list': [
-                [b'http://tracker.example.com/announce\xc3\xa9'],
+            "announce-list": [
+                [b"http://tracker.example.com/announce\xc3\xa9"],
             ],
-            'info': {
-                'name': b'test',
-                'piece length': 16384,
-                'pieces': b'\x00' * 20,
+            "info": {
+                "name": b"test",
+                "piece length": 16384,
+                "pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
@@ -504,13 +497,13 @@ class TestEdgeCases:
 
     def test_many_tiers(self):
         """Should handle many tiers."""
-        tiers_data = [[f'http://tracker{i}.com/announce'.encode()] for i in range(20)]
+        tiers_data = [[f"http://tracker{i}.com/announce".encode()] for i in range(20)]
         data = {
-            'announce-list': tiers_data,
-            'info': {
-                'name': b'test',
-                'piece length': 16384,
-                'pieces': b'\x00' * 20,
+            "announce-list": tiers_data,
+            "info": {
+                "name": b"test",
+                "piece length": 16384,
+                "pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
@@ -520,13 +513,13 @@ class TestEdgeCases:
     def test_legacy_announcelist_key(self):
         """Should handle legacy 'announcelist' key (non-standard)."""
         data = {
-            'announcelist': [
-                [b'http://tracker1.com/announce'],
+            "announcelist": [
+                [b"http://tracker1.com/announce"],
             ],
-            'info': {
-                'name': b'test',
-                'piece length': 16384,
-                'pieces': b'\x00' * 20,
+            "info": {
+                "name": b"test",
+                "piece length": 16384,
+                "pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
@@ -544,16 +537,18 @@ class TestEdgeCases:
         assert not torrent.has_announce_list()
 
         # Add announce-list
-        torrent.set_announce_list([
-            ['http://new1.com/announce'],
-            ['http://new2.com/announce', 'http://new3.com/announce'],
-        ])
+        torrent.set_announce_list(
+            [
+                ["http://new1.com/announce"],
+                ["http://new2.com/announce", "http://new3.com/announce"],
+            ]
+        )
         assert torrent.has_announce_list()
         assert len(torrent.tracker_tiers) == 2
 
         # Shuffle and verify
         shuffled = torrent.shuffle_tier(1)
-        assert set(shuffled) == {'http://new2.com/announce', 'http://new3.com/announce'}
+        assert set(shuffled) == {"http://new2.com/announce", "http://new3.com/announce"}
 
 
 # ============================================================================
@@ -583,20 +578,22 @@ class TestBencodeRoundtrip:
     def test_custom_announce_list_roundtrip(self):
         """Custom announce-list should BEncode correctly."""
         torrent = create_simple_torrent()
-        torrent.set_announce_list([
-            ['http://a.com/announce', 'http://b.com/announce'],
-            ['http://c.com/announce'],
-        ])
+        torrent.set_announce_list(
+            [
+                ["http://a.com/announce", "http://b.com/announce"],
+                ["http://c.com/announce"],
+            ]
+        )
 
         # Verify the data is in the dict
-        assert 'announce-list' in torrent.dict or b'announce-list' in torrent.dict
+        assert "announce-list" in torrent.dict or b"announce-list" in torrent.dict
 
         # Verify the encoded info is valid
         info = torrent.info
         assert info is not None
         encoded = bencode_module.encode(info)
         assert isinstance(encoded, bytes)
-        assert encoded[0] == ord(b'i') or encoded[0] == ord(b'd')
+        assert encoded[0] == ord(b"i") or encoded[0] == ord(b"d")
 
 
 # ============================================================================
@@ -610,47 +607,47 @@ class TestTrackersProperty:
     def test_trackers_ignores_announce_when_announce_list_exists(self):
         """When announce-list exists, trackers should NOT include announce URL."""
         data = {
-            'announce': b'http://ignored.tracker.com/announce',
-            'announce-list': [
-                [b'http://tier1.tracker1.com/announce', b'http://tier1.tracker2.com/announce'],
-                [b'http://tier2.backup.com/announce'],
+            "announce": b"http://ignored.tracker.com/announce",
+            "announce-list": [
+                [b"http://tier1.tracker1.com/announce", b"http://tier1.tracker2.com/announce"],
+                [b"http://tier2.backup.com/announce"],
             ],
-            'info': {
-                'name': b'test',
-                'piece length': 16384,
-                'pieces': b'\x00' * 20,
+            "info": {
+                "name": b"test",
+                "piece length": 16384,
+                "pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
         urls = torrent.trackers
         # announce-list URLs only
-        assert 'http://tier1.tracker1.com/announce' in urls
-        assert 'http://tier1.tracker2.com/announce' in urls
-        assert 'http://tier2.backup.com/announce' in urls
+        assert "http://tier1.tracker1.com/announce" in urls
+        assert "http://tier1.tracker2.com/announce" in urls
+        assert "http://tier2.backup.com/announce" in urls
         # announce URL should NOT be included
-        assert 'http://ignored.tracker.com/announce' not in urls
+        assert "http://ignored.tracker.com/announce" not in urls
 
     def test_trackers_includes_announce_when_no_announce_list(self):
         """When no announce-list, trackers should include announce URL."""
         data = {
-            'announce': b'http://single.tracker.com/announce',
-            'info': {
-                'name': b'test',
-                'piece length': 16384,
-                'pieces': b'\x00' * 20,
+            "announce": b"http://single.tracker.com/announce",
+            "info": {
+                "name": b"test",
+                "piece length": 16384,
+                "pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
         urls = torrent.trackers
-        assert urls == ['http://single.tracker.com/announce']
+        assert urls == ["http://single.tracker.com/announce"]
 
     def test_trackers_empty_with_no_announce(self):
         """Should return empty list when no announce or announce-list."""
         data = {
-            'info': {
-                'name': b'test',
-                'piece length': 16384,
-                'pieces': b'\x00' * 20,
+            "info": {
+                "name": b"test",
+                "piece length": 16384,
+                "pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
@@ -711,8 +708,8 @@ class TestTierProgression:
         # Current tier is 0
         tier0_urls = torrent.get_current_tier_urls()
         assert len(tier0_urls) == 2
-        assert 'http://primary1.tracker.com/announce' in tier0_urls
-        assert 'http://primary2.tracker.com/announce' in tier0_urls
+        assert "http://primary1.tracker.com/announce" in tier0_urls
+        assert "http://primary2.tracker.com/announce" in tier0_urls
 
     def test_get_current_tier_urls_after_advance(self):
         """Should return URLs for the advanced tier."""
@@ -720,7 +717,7 @@ class TestTierProgression:
         torrent.advance_tier_on_failure()  # Move to tier 1
         tier1_urls = torrent.get_current_tier_urls()
         assert len(tier1_urls) == 1
-        assert tier1_urls[0] == 'http://backup1.tracker.com/announce'
+        assert tier1_urls[0] == "http://backup1.tracker.com/announce"
 
     def test_get_current_tier_urls_no_announce_list(self):
         """Should raise error when no announce-list."""
@@ -746,7 +743,7 @@ class TestTierProgression:
 
         # 2. Try all URLs in tier 0, none succeed
         # (In practice, the tracker layer would try each URL)
-        for url in tier0_urls:
+        for _url in tier0_urls:
             # Simulate failure...
             pass
 
@@ -757,19 +754,16 @@ class TestTierProgression:
         # 4. Get URLs for new tier
         tier1_urls = torrent.get_current_tier_urls()
         assert len(tier1_urls) == 1
-        assert tier1_urls[0] == 'http://backup1.tracker.com/announce'
+        assert tier1_urls[0] == "http://backup1.tracker.com/announce"
 
         # 5. On successful tracker connection, next announce cycle starts from tier 0
-        torrent.record_announce_success(1, 'http://backup1.tracker.com/announce')
+        torrent.record_announce_success(1, "http://backup1.tracker.com/announce")
         torrent.reset_tier_index()
         assert torrent.get_current_tier_index() == 0
 
         # 6. Shuffle tier 0 for the new cycle
         shuffled = torrent.shuffle_tier(0)
-        assert set(shuffled) == {
-            'http://primary1.tracker.com/announce',
-            'http://primary2.tracker.com/announce'
-        }
+        assert set(shuffled) == {"http://primary1.tracker.com/announce", "http://primary2.tracker.com/announce"}
 
     def test_announce_list_not_modified_by_tier_progression(self):
         """Tier progression should not modify the announce-list data."""
@@ -786,16 +780,16 @@ class TestTierProgression:
     def test_tier_progression_with_four_tiers(self):
         """Test tier progression with 4 tiers."""
         data = {
-            'announce-list': [
-                [b'http://tier0.tracker.com/announce'],
-                [b'http://tier1.tracker.com/announce'],
-                [b'http://tier2.tracker.com/announce'],
-                [b'http://tier3.tracker.com/announce'],
+            "announce-list": [
+                [b"http://tier0.tracker.com/announce"],
+                [b"http://tier1.tracker.com/announce"],
+                [b"http://tier2.tracker.com/announce"],
+                [b"http://tier3.tracker.com/announce"],
             ],
-            'info': {
-                'name': b'test',
-                'piece length': 16384,
-                'pieces': b'\x00' * 20,
+            "info": {
+                "name": b"test",
+                "piece length": 16384,
+                "pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)

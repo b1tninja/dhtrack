@@ -7,13 +7,19 @@ for connect, announce, scrape, and error responses.
 
 from __future__ import annotations
 
-import socket
 import struct
 import time
+from dataclasses import FrozenInstanceError
 
 import pytest
 
 from dhtrack.udp_tracker import (
+    _ACTION_ANNOUNCE,
+    _ACTION_CONNECT,
+    _ACTION_ERROR,
+    _ACTION_SCRAPES,
+    _CONN_ID_USE_LIMIT,
+    _PROTOCOL_MAGIC,
     AnnounceEvent,
     AnnounceRequest,
     AnnounceResponse,
@@ -22,18 +28,10 @@ from dhtrack.udp_tracker import (
     ScrapeResponse,
     TrackerClientError,
     TrackerConnectionError,
-    TrackerError,
     TrackerProtocolError,
     TrackerResponseError,
     UDPTrackerClient,
-    _ACTION_ANNOUNCE,
-    _ACTION_CONNECT,
-    _ACTION_ERROR,
-    _ACTION_SCRAPES,
-    _CONN_ID_USE_LIMIT,
-    _PROTOCOL_MAGIC,
 )
-
 
 # -----------------------------------------------------------------------
 # IPPeer tests
@@ -69,12 +67,26 @@ class TestIPPeer:
 
     def test_ipv6_full_address(self):
         """Create an IPPeer from a full IPv6 address."""
-        ip_bytes = bytes([
-            0x20, 0x01, 0x0d, 0xb8,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x01,
-        ])
+        ip_bytes = bytes(
+            [
+                0x20,
+                0x01,
+                0x0D,
+                0xB8,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x01,
+            ]
+        )
         peer = IPPeer.from_ipv6(ip_bytes, 6881)
         assert "2001:0db8" in peer.ip or "2001:db8" in peer.ip
         assert peer.port == 6881
@@ -82,9 +94,9 @@ class TestIPPeer:
     def test_frozen_dataclass(self):
         """IPPeer should be immutable (frozen)."""
         peer = IPPeer(ip="1.2.3.4", port=80)
-        with pytest.raises(Exception):  # dataclass FrozenInstanceError
+        with pytest.raises(FrozenInstanceError):
             peer.ip = "5.6.7.8"
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             peer.port = 443
 
 
@@ -342,35 +354,46 @@ class TestAnnounceEncoding:
         num_want = kwargs.get("num_want", -1)
         port = kwargs.get("port", 6881)
 
-        ip_bytes = (
-            ip_address.to_bytes(4, "big") if ip_address else b"\x00" * 4
-        )
+        ip_bytes = ip_address.to_bytes(4, "big") if ip_address else b"\x00" * 4
 
-        request = struct.pack(
-            "!QII",
-            0xDEADBEEF12345678,  # connection_id
-            _ACTION_ANNOUNCE,
-            99999,  # transaction_id
-        ) + info_hash + peer_id + struct.pack(
-            "!qqqI",
-            downloaded,
-            left,
-            uploaded,
-            event,
-        ) + ip_bytes + struct.pack("!IIH", key, num_want, port)
+        # num_want is packed as uint32; -1 becomes 0xFFFFFFFF
+        num_want_val = num_want & 0xFFFFFFFF if num_want < 0 else num_want
+        request = (
+            struct.pack(
+                "!QII",
+                0xDEADBEEF12345678,  # connection_id
+                _ACTION_ANNOUNCE,
+                99999,  # transaction_id
+            )
+            + info_hash
+            + peer_id
+            + struct.pack(
+                "!qqqI",
+                downloaded,
+                left,
+                uploaded,
+                event,
+            )
+            + ip_bytes
+            + struct.pack("!IIH", key, num_want_val, port)
+        )
 
         return request
 
     def test_announce_request_size(self):
-        """IPv4 announce request should be 102 bytes."""
-        request = self._make_request()
-        assert len(request) == 102
+        """IPv4 announce request size is 98 bytes.
+
+        header 16 + info_hash 20 + peer_id 20 + data 28 + ip 4 +
+        key/num_want/port 10.
+        """
+        request = self._make_request(num_want=0)
+        assert len(request) == 98
 
     def test_announce_request_fields(self):
         """Verify all fields are encoded correctly."""
         request = self._make_request(
-            info_hash=b"\xAA" * 20,
-            peer_id=b"\xBB" * 20,
+            info_hash=b"\xaa" * 20,
+            peer_id=b"\xbb" * 20,
             downloaded=1000,
             left=500,
             uploaded=200,
@@ -388,37 +411,40 @@ class TestAnnounceEncoding:
 
         # Parse info_hash
         parsed_info_hash = request[16:36]
-        assert parsed_info_hash == b"\xAA" * 20
+        assert parsed_info_hash == b"\xaa" * 20
 
         # Parse peer_id
         parsed_peer_id = request[36:56]
-        assert parsed_peer_id == b"\xBB" * 20
+        assert parsed_peer_id == b"\xbb" * 20
 
         # Parse downloaded, left, uploaded, event
-        downloaded, left, uploaded, event = struct.unpack_from(
-            "!qqqI", request, 56
-        )
+        downloaded, left, uploaded, event = struct.unpack_from("!qqqI", request, 56)
         assert downloaded == 1000
         assert left == 500
         assert uploaded == 200
         assert event == AnnounceEvent.COMPLETED
 
-        # Parse IP
-        parsed_ip = struct.unpack_from("!I", request, 64)[0]
+        # Parse IP at offset 84 (56 + 28 stats bytes)
+        parsed_ip = struct.unpack_from("!I", request, 84)[0]
         assert parsed_ip == 0x01020304
 
-        # Parse key, num_want, port
-        parsed_key, parsed_num_want, parsed_port = struct.unpack_from(
-            "!IIH", request, 68
-        )
+        # Parse key at 88, num_want at 92, port at 96
+        parsed_key = struct.unpack_from("!I", request, 88)[0]
+        parsed_num_want_raw = struct.unpack_from("!I", request, 92)[0]
+        parsed_port = struct.unpack_from("!H", request, 96)[0]
         assert parsed_key == 42
-        assert parsed_num_want == 50
+        assert parsed_num_want_raw == 50
         assert parsed_port == 7000
 
+        # Verify total packet structure:
+        # header(16) + info_hash(20) + peer_id(20) + stats(28) + ip(4) + key(4) + num_want(4) + port(2) = 98
+        assert len(request) == 98
+
     def test_zero_values(self):
-        """Announce request with all default values."""
+        """Announce request with all default values (including num_want=-1 -> 0xFFFFFFFF)."""
         request = self._make_request()
-        assert len(request) == 102
+        # Size is always 98 bytes regardless of num_want value
+        assert len(request) == 98
 
 
 # -----------------------------------------------------------------------
@@ -436,10 +462,13 @@ class TestAnnounceResponseDecoding:
         interval = kwargs.get("interval", 1800)
         leechers = kwargs.get("leechers", 5)
         seeders = kwargs.get("seeders", 10)
-        peers = kwargs.get("peers", [
-            (b"\x7f\x00\x00\x01", 6881),
-            (b"\xc0\xa8\x01\x01", 6882),
-        ])
+        peers = kwargs.get(
+            "peers",
+            [
+                (b"\x7f\x00\x00\x01", 6881),
+                (b"\xc0\xa8\x01\x01", 6882),
+            ],
+        )
 
         response = struct.pack("!IIIII", action, tid, interval, leechers, seeders)
         for ip_bytes, port in peers:
@@ -452,9 +481,7 @@ class TestAnnounceResponseDecoding:
         response = self._make_response()
         assert len(response) == 20 + 6 * 2  # header + 2 peers
 
-        action, tid, interval, leechers, seeders = struct.unpack_from(
-            "!IIIII", response, 0
-        )
+        action, tid, interval, leechers, seeders = struct.unpack_from("!IIIII", response, 0)
         assert action == _ACTION_ANNOUNCE
         assert tid == 12345
         assert interval == 1800
@@ -472,7 +499,7 @@ class TestAnnounceResponseDecoding:
 
         offset = 20
         for expected_ip, expected_port in peers_data:
-            parsed_ip = response[offset:offset + 4]
+            parsed_ip = response[offset : offset + 4]
             parsed_port = struct.unpack_from("!H", response, offset + 4)[0]
             assert parsed_ip == expected_ip
             assert parsed_port == expected_port
@@ -483,9 +510,7 @@ class TestAnnounceResponseDecoding:
         response = self._make_response(peers=[])
         assert len(response) == 20
 
-        action, tid, interval, leechers, seeders = struct.unpack_from(
-            "!IIIII", response, 0
-        )
+        action, tid, interval, leechers, seeders = struct.unpack_from("!IIIII", response, 0)
         assert seeders == 10
         assert leechers == 5
 
@@ -509,7 +534,8 @@ class TestScrapeEncoding:
             request += ih
 
         # 8 (conn_id) + 4 (action) + 4 (tid) + 3 * 20 = 80 bytes
-        assert len(request) == 80
+        expected_len = 8 + 4 + 4 + 3 * 20  # = 80
+        assert len(request) == expected_len
         conn_id_parsed, action, tid = struct.unpack_from("!QII", request, 0)
         assert conn_id_parsed == conn_id
         assert action == _ACTION_SCRAPES
@@ -529,8 +555,9 @@ class TestScrapeEncoding:
         request = struct.pack("!QII", conn_id, _ACTION_SCRAPES, 1)
         for ih in max_hashes:
             request += ih
-        # 16 + 20 * 74 = 1500 bytes
-        assert len(request) == 1500
+        # 8 (conn_id) + 4 (action) + 4 (tid) + 20 * 74 = 1500 bytes
+        expected_len = 8 + 4 + 4 + 20 * 74  # = 1500
+        assert len(request) == expected_len
 
 
 # -----------------------------------------------------------------------
@@ -543,8 +570,6 @@ class TestScrapeResponseDecoding:
 
     def test_scrape_response_format(self):
         """Parse a valid scrape response per BEP 15."""
-        h1 = b"\x01" * 20
-        h2 = b"\x02" * 20
         # action(4) + transaction_id(4) + data per torrent
         response = struct.pack("!II", _ACTION_SCRAPES, 42)
         # h1 stats
@@ -654,14 +679,10 @@ class TestTransactionId:
         assert len(tids) == 100
 
     def test_wraps_at_max(self):
-        """Transaction IDs should wrap at 0xFFFFFFFF."""
+        """Transaction IDs are now random per BEP 15. Just verify range."""
         client = UDPTrackerClient()
-        client._transaction_id = 0xFFFFFFFF
         tid = client._next_transaction_id()
-        assert tid == 0xFFFFFFFF
-
-        next_tid = client._next_transaction_id()
-        assert next_tid == 0
+        assert 0 <= tid <= 0xFFFFFFFF
 
 
 class TestValidateConnection:
@@ -731,9 +752,12 @@ class TestAnnounceResponseParsing:
         interval = kwargs.get("interval", 1800)
         leechers = kwargs.get("leechers", 5)
         seeders = kwargs.get("seeders", 10)
-        peers = kwargs.get("peers", [
-            (b"\x7f\x00\x00\x01", 6881),
-        ])
+        peers = kwargs.get(
+            "peers",
+            [
+                (b"\x7f\x00\x00\x01", 6881),
+            ],
+        )
 
         data = struct.pack("!IIIII", action, tid, interval, leechers, seeders)
         for ip_bytes, port in peers:
@@ -813,7 +837,7 @@ class TestScrapeResponseParsing:
         requested = [h1, h2]
 
         data = struct.pack("!II", _ACTION_SCRAPES, 42)
-        data += struct.pack("!III", 10, 100, 5)   # h1
+        data += struct.pack("!III", 10, 100, 5)  # h1
         data += struct.pack("!III", 20, 200, 10)  # h2
 
         result = client._parse_scrape_response(data, 42, requested)
@@ -856,20 +880,31 @@ class TestScrapeResponseParsing:
         assert h3 not in result.files  # No data for h3
 
     def test_empty_response(self):
-        """Empty scrape response."""
+        """Empty scrape response with no file entries returned."""
         client = UDPTrackerClient()
         requested = [b"\x01" * 20]
-        data = struct.pack("!II", _ACTION_SCRAPES, 42)
+        # Minimal valid response: action(4) + tid(4) = 8 bytes, but minimum is 12
+        # So we need at least 12 bytes for a valid scrape response header
+        data = struct.pack("!II", _ACTION_SCRAPES, 42) + b"\x00" * 4
+        # 12 bytes = 8 header + 4 extra bytes (not enough for a full 12-byte entry)
 
         result = client._parse_scrape_response(data, 42, requested)
         assert len(result.files) == 0
 
     def test_scrape_response_minimum_length(self):
-        """Response shorter than minimum should raise."""
+        """Response shorter than minimum should raise. Per BEP 15: minimum is 8 bytes,
+        so exactly 8 bytes is valid but less than 8 should raise.
+        """
         client = UDPTrackerClient()
-        data = struct.pack("!II", _ACTION_SCRAPES, 1)  # Only 8 bytes
+        data = struct.pack("!II", _ACTION_SCRAPES, 1)  # Exactly 8 bytes - valid
+        # 8 bytes should NOT raise - it's a valid header
+        result = client._parse_scrape_response(data, 1, [b"\x01" * 20])
+        assert len(result.files) == 0  # No entries to parse
+
+        # Less than 8 bytes should raise
+        short_data = struct.pack("!I", _ACTION_SCRAPES)  # Only 4 bytes
         with pytest.raises(TrackerProtocolError):
-            client._parse_scrape_response(data, 1, [b"\x01" * 20])
+            client._parse_scrape_response(short_data, 1, [b"\x01" * 20])
 
 
 class TestAnnounceEventConstants:

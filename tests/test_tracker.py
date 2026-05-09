@@ -7,21 +7,29 @@ as well as the URL construction and bencode encoding/decoding utilities.
 
 from __future__ import annotations
 
+import socket
+import struct
+import urllib.error
+from unittest.mock import MagicMock, patch
+
 import pytest
+
 from dhtrack.tracker import (
+    AnnounceResponse,
+    ScrapeError,
     ScrapeInfo,
     ScrapeResponse,
     TrackerClient,
-    TrackerError,
-    ScrapeError,
     TrackerClientError,
     _build_scrape_url,
-    _encode_scrape_request,
+    _decode_announce_response,
+    _decode_compact_peers,
+    _decode_compact_peers6,
     _decode_scrape_response,
-    _parse_swarm_info,
+    _encode_scrape_request,
     _get_int_field,
+    _parse_swarm_info,
 )
-
 
 # --- _build_scrape_url tests ---
 
@@ -119,17 +127,16 @@ class TestDecodeScrapeResponse:
         """Decode a response with one torrent."""
         # Proper bencoding: d...e for outer dict
         response_bytes = (
-            b"d"                              # outer dict start
-            b"5:files"                        # key "files"
-            b"d"                              # files dict start
-            b"20:" + b"\x00" * 20 +           # 20-byte hash key
-            b"d"                              # swarm info dict start
-            b"8:completei" + b"42" + b"e"     # "complete": 42
+            b"d"  # outer dict start
+            b"5:files"  # key "files"
+            b"d"  # files dict start
+            b"20:" + b"\x00" * 20 + b"d"  # 20-byte hash key  # swarm info dict start
+            b"8:completei" + b"42" + b"e"  # "complete": 42
             b"10:downloadedi" + b"1234" + b"e"  # "downloaded": 1234
-            b"10:incompletei" + b"56" + b"e"   # "incomplete": 56
-            b"e"                              # end swarm info
-            b"e"                              # end files dict
-            b"e"                              # end outer dict
+            b"10:incompletei" + b"56" + b"e"  # "incomplete": 56
+            b"e"  # end swarm info
+            b"e"  # end files dict
+            b"e"  # end outer dict
         )
         result = _decode_scrape_response(response_bytes)
         assert not result.is_error
@@ -144,19 +151,17 @@ class TestDecodeScrapeResponse:
         hash1 = b"\x01" * 20
         hash2 = b"\x02" * 20
         response_bytes = (
-            b"d"                               # outer dict start
-            b"5:files"                         # key "files"
-            b"d"                               # files dict start
+            b"d"  # outer dict start
+            b"5:files"  # key "files"
+            b"d"  # files dict start
             # First torrent
-            b"20:" + hash1 +
-            b"d"
+            b"20:" + hash1 + b"d"
             b"8:completei" + b"10" + b"e"
             b"10:downloadedi" + b"100" + b"e"
             b"10:incompletei" + b"5" + b"e"
             b"e"
             # Second torrent
-            b"20:" + hash2 +
-            b"d"
+            b"20:" + hash2 + b"d"
             b"8:completei" + b"20" + b"e"
             b"10:downloadedi" + b"200" + b"e"
             b"10:incompletei" + b"10" + b"e"
@@ -208,17 +213,16 @@ class TestDecodeScrapeResponse:
     def test_zero_values(self):
         """Decode response with zero values."""
         response_bytes = (
-            b"d"                              # outer dict start
-            b"5:files"                        # key "files"
-            b"d"                              # files dict start
-            b"20:" + b"\xff" * 20 +           # 20-byte hash key
-            b"d"                              # swarm info dict start
-            b"8:completei" + b"0" + b"e"      # "complete": 0
-            b"10:downloadedi" + b"0" + b"e"   # "downloaded": 0
-            b"10:incompletei" + b"0" + b"e"   # "incomplete": 0
-            b"e"                              # end swarm info
-            b"e"                              # end files dict
-            b"e"                              # end outer dict
+            b"d"  # outer dict start
+            b"5:files"  # key "files"
+            b"d"  # files dict start
+            b"20:" + b"\xff" * 20 + b"d"  # 20-byte hash key  # swarm info dict start
+            b"8:completei" + b"0" + b"e"  # "complete": 0
+            b"10:downloadedi" + b"0" + b"e"  # "downloaded": 0
+            b"10:incompletei" + b"0" + b"e"  # "incomplete": 0
+            b"e"  # end swarm info
+            b"e"  # end files dict
+            b"e"  # end outer dict
         )
         result = _decode_scrape_response(response_bytes)
         assert not result.is_error
@@ -230,15 +234,14 @@ class TestDecodeScrapeResponse:
     def test_missing_fields_defaults(self):
         """Missing fields should default to 0."""
         response_bytes = (
-            b"d"                              # outer dict start
-            b"5:files"                        # key "files"
-            b"d"                              # files dict start
-            b"20:" + b"\x00" * 20 +           # 20-byte hash key
-            b"d"                              # swarm info dict start
-            b"8:completei" + b"10" + b"e"     # "complete": 10
-            b"e"                              # end swarm info
-            b"e"                              # end files dict
-            b"e"                              # end outer dict
+            b"d"  # outer dict start
+            b"5:files"  # key "files"
+            b"d"  # files dict start
+            b"20:" + b"\x00" * 20 + b"d"  # 20-byte hash key  # swarm info dict start
+            b"8:completei" + b"10" + b"e"  # "complete": 10
+            b"e"  # end swarm info
+            b"e"  # end files dict
+            b"e"  # end outer dict
         )
         result = _decode_scrape_response(response_bytes)
         info = result.files[b"\x00" * 20]
@@ -256,9 +259,9 @@ class TestParseSwarmInfo:
     def test_valid_swarm_info(self):
         """Parse valid swarm info."""
         swarm_info = {
-            "complete": 100,
-            "incomplete": 50,
-            "downloaded": 1000,
+            b"complete": 100,
+            b"incomplete": 50,
+            b"downloaded": 1000,
         }
         result = _parse_swarm_info(swarm_info)
         assert result is not None
@@ -268,7 +271,7 @@ class TestParseSwarmInfo:
 
     def test_missing_fields(self):
         """Missing fields should default to 0."""
-        swarm_info = {"complete": 10}
+        swarm_info = {b"complete": 10}
         result = _parse_swarm_info(swarm_info)
         assert result is not None
         assert result.complete == 10
@@ -282,7 +285,7 @@ class TestParseSwarmInfo:
 
     def test_negative_values(self):
         """Negative values should raise ValueError."""
-        swarm_info = {"complete": -1, "incomplete": 0, "downloaded": 0}
+        swarm_info = {b"complete": -1, b"incomplete": 0, b"downloaded": 0}
         result = _parse_swarm_info(swarm_info)
         assert result is None
 
@@ -447,7 +450,269 @@ class TestTrackerClientScrapeSingle:
         # Just verify the signature - won't actually connect
         assert hasattr(client, "scrape_single")
         import inspect
+
         sig = inspect.signature(client.scrape_single)
         params = list(sig.parameters.keys())
         assert "info_hash" in params
         assert "announce_url" in params
+
+
+# ---------------------------------------------------------------------------
+# Announce tests (BEP 3 / BEP 23)
+# ---------------------------------------------------------------------------
+
+
+class TestDecodeCompactPeers:
+    """_decode_compact_peers unpacks IPv4 compact blobs per BEP 23."""
+
+    def test_single_peer(self):
+        data = socket.inet_aton("1.2.3.4") + struct.pack("!H", 6881)
+        peers = _decode_compact_peers(data)
+        assert peers == [("1.2.3.4", 6881)]
+
+    def test_multiple_peers(self):
+        blob = b""
+        expected = []
+        for i in range(3):
+            ip = f"10.0.0.{i + 1}"
+            port = 6881 + i
+            blob += socket.inet_aton(ip) + struct.pack("!H", port)
+            expected.append((ip, port))
+        assert _decode_compact_peers(blob) == expected
+
+    def test_empty_blob(self):
+        assert _decode_compact_peers(b"") == []
+
+    def test_partial_entry_ignored(self):
+        """A trailing 5-byte fragment (< 6 bytes) must be silently skipped."""
+        data = socket.inet_aton("9.9.9.9") + struct.pack("!H", 9999) + b"\x01\x02\x03\x04\x05"
+        peers = _decode_compact_peers(data)
+        assert peers == [("9.9.9.9", 9999)]
+
+
+class TestDecodeCompactPeers6:
+    """`_decode_compact_peers6` unpacks IPv6 compact blobs (peers6)."""
+
+    def test_single_peer(self):
+        data = socket.inet_pton(socket.AF_INET6, "2001:db8::1") + struct.pack("!H", 6881)
+        peers = _decode_compact_peers6(data)
+        assert peers == [("2001:db8::1", 6881)]
+
+    def test_multiple_peers(self):
+        blob = b""
+        expected = []
+        for i in range(3):
+            ip = f"2001:db8::{i + 1}"
+            port = 7000 + i
+            blob += socket.inet_pton(socket.AF_INET6, ip) + struct.pack("!H", port)
+            expected.append((ip, port))
+        assert _decode_compact_peers6(blob) == expected
+
+    def test_partial_entry_ignored(self):
+        data = socket.inet_pton(socket.AF_INET6, "2001:db8::1") + struct.pack("!H", 6881) + b"\x00" * 17
+        peers = _decode_compact_peers6(data)
+        assert peers == [("2001:db8::1", 6881)]
+
+
+class TestDecodeAnnounceResponse:
+    """_decode_announce_response parses bencoded announce responses."""
+
+    def _encode(self, d: dict) -> bytes:
+        from dhtrack import bencode as b
+
+        return b.encode(d)
+
+    def test_compact_peers(self):
+        payload = socket.inet_aton("1.2.3.4") + struct.pack("!H", 6881)
+        data = self._encode(
+            {
+                b"interval": 900,
+                b"complete": 5,
+                b"incomplete": 3,
+                b"peers": payload,
+            }
+        )
+        resp = _decode_announce_response(data)
+        assert resp.peers == [("1.2.3.4", 6881)]
+        assert resp.interval == 900
+        assert resp.complete == 5
+        assert resp.incomplete == 3
+        assert not resp.is_error
+
+    def test_failure_reason(self):
+        data = self._encode({b"failure reason": b"banned client"})
+        resp = _decode_announce_response(data)
+        assert resp.is_error
+        assert resp.failure_reason == "banned client"
+        assert resp.peers == []
+
+    def test_legacy_dict_peers(self):
+        data = self._encode(
+            {
+                b"interval": 1800,
+                b"peers": [{b"ip": b"1.2.3.4", b"port": 6881, b"peer id": b"\x00" * 20}],
+            }
+        )
+        resp = _decode_announce_response(data)
+        assert ("1.2.3.4", 6881) in resp.peers
+
+    def test_tracker_id_stored(self):
+        data = self._encode(
+            {
+                b"interval": 1800,
+                b"peers": b"",
+                b"tracker id": b"mytracker",
+            }
+        )
+        resp = _decode_announce_response(data)
+        assert resp.tracker_id == b"mytracker"
+
+    def test_peers6_compact(self):
+        payload = socket.inet_pton(socket.AF_INET6, "2001:db8::2") + struct.pack("!H", 51413)
+        data = self._encode(
+            {
+                b"interval": 1800,
+                b"peers": b"",
+                b"peers6": payload,
+            }
+        )
+        resp = _decode_announce_response(data)
+        assert resp.peers6 == [("2001:db8::2", 51413)]
+
+    def test_min_interval(self):
+        data = self._encode(
+            {
+                b"interval": 1800,
+                b"min interval": 600,
+                b"peers": b"",
+            }
+        )
+        resp = _decode_announce_response(data)
+        assert resp.min_interval == 600
+
+    def test_warning_message(self):
+        data = self._encode(
+            {
+                b"interval": 1800,
+                b"warning message": b"please upgrade",
+                b"peers": b"",
+            }
+        )
+        resp = _decode_announce_response(data)
+        assert resp.warning_message == "please upgrade"
+
+
+class TestTrackerClientAnnounce:
+    """TrackerClient.announce sends GET requests with correct parameters."""
+
+    INFO_HASH = b"\xba" * 20
+    PEER_ID = b"-DH0001-" + b"\x01" * 12
+
+    def _make_response_data(self, peers_blob: bytes = b"") -> bytes:
+        from dhtrack import bencode as b
+
+        return b.encode(
+            {
+                b"interval": 900,
+                b"complete": 2,
+                b"incomplete": 1,
+                b"peers": peers_blob,
+            }
+        )
+
+    def test_announce_returns_response(self):
+        client = TrackerClient()
+        resp_data = self._make_response_data(socket.inet_aton("5.6.7.8") + struct.pack("!H", 1234))
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = resp_data
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client.announce(
+                "http://tracker.example.com/announce",
+                self.INFO_HASH,
+                self.PEER_ID,
+                6881,
+            )
+
+        assert isinstance(result, AnnounceResponse)
+        assert result.peers == [("5.6.7.8", 1234)]
+        assert result.interval == 900
+
+    def test_url_contains_compact_one(self):
+        client = TrackerClient()
+        captured_urls = []
+
+        def fake_urlopen(req, timeout=None):
+            captured_urls.append(req.full_url)
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.read.return_value = self._make_response_data()
+            return mock_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            client.announce(
+                "http://tracker.example.com/announce",
+                self.INFO_HASH,
+                self.PEER_ID,
+                6881,
+            )
+
+        assert captured_urls, "urlopen was not called"
+        assert "compact=1" in captured_urls[0]
+
+    def test_event_started_in_url(self):
+        client = TrackerClient()
+        captured_urls = []
+
+        def fake_urlopen(req, timeout=None):
+            captured_urls.append(req.full_url)
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.read.return_value = self._make_response_data()
+            return mock_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            client.announce(
+                "http://tracker.example.com/announce",
+                self.INFO_HASH,
+                self.PEER_ID,
+                6881,
+                event="started",
+            )
+
+        assert "event=started" in captured_urls[0]
+
+    def test_invalid_info_hash_raises(self):
+        client = TrackerClient()
+        with pytest.raises(TrackerClientError, match="info_hash must be 20 bytes"):
+            client.announce(
+                "http://tracker.example.com/announce",
+                b"\x00" * 10,
+                self.PEER_ID,
+                6881,
+            )
+
+    def test_invalid_peer_id_raises(self):
+        client = TrackerClient()
+        with pytest.raises(TrackerClientError, match="peer_id must be 20 bytes"):
+            client.announce(
+                "http://tracker.example.com/announce",
+                self.INFO_HASH,
+                b"\x00" * 5,
+                6881,
+            )
+
+    def test_http_error_raises_scrape_error(self):
+        client = TrackerClient(max_retries=0)
+        with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(None, 403, "Forbidden", {}, None)):
+            with pytest.raises(ScrapeError):
+                client.announce(
+                    "http://tracker.example.com/announce",
+                    self.INFO_HASH,
+                    self.PEER_ID,
+                    6881,
+                )

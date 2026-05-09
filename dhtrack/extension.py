@@ -22,17 +22,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from dhtrack.peer import (
-        ExtensionNegotiator,
         HolePunchHandler,
         MetadataExchange,
         PEXManager,
-        PeerConnection,
     )
-    from dhtrack.peerid import Endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +41,9 @@ logger = logging.getLogger(__name__)
 class ExtensionType:
     """Well-known extension types."""
 
-    METADATA = "ut_metadata"      # BEP 9 - Metadata Exchange
-    PEX = "ut_pex"                # BEP 11 - Peer Exchange
-    HOLEPUNCH = "ut_holepunch"    # BEP 55 - NAT Holepunching
+    METADATA = "ut_metadata"  # BEP 9 - Metadata Exchange
+    PEX = "ut_pex"  # BEP 11 - Peer Exchange
+    HOLEPUNCH = "ut_holepunch"  # BEP 55 - NAT Holepunching
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +112,7 @@ class Extension:
         """
         return False
 
-    def on_message(self, msg_type: int, payload: bytes) -> Optional[bytes]:
+    def on_message(self, msg_type: int, payload: bytes) -> bytes | None:
         """Handle an incoming message.
 
         Parameters
@@ -132,7 +129,7 @@ class Extension:
         """
         return None
 
-    def on_extended_message(self, msg_type: int, payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def on_extended_message(self, msg_type: int, payload: dict[str, Any]) -> dict[str, Any] | None:
         """Handle an incoming bencoded extended message.
 
         Parameters
@@ -203,7 +200,7 @@ class ExtensionRegistry:
         """
         self._extensions.pop(name, None)
 
-    def get(self, name: str) -> Optional[Extension]:
+    def get(self, name: str) -> Extension | None:
         """Get an extension by name.
 
         Parameters
@@ -313,7 +310,7 @@ class MetadataExtension(Extension):
         parsed = self._metadata.parse_handshake(data)
         return parsed is not None
 
-    def on_message(self, msg_type: int, payload: bytes) -> Optional[bytes]:
+    def on_message(self, msg_type: int, payload: bytes) -> bytes | None:
         """Handle an incoming message.
 
         Parameters
@@ -337,6 +334,7 @@ class MetadataExtension(Extension):
         elif msg_type == 1:  # DATA
             try:
                 from dhtrack import bencode as bencode_module
+
                 result = self._metadata.handle_data(payload)
                 if result is True:
                     return bencode_module.encode({"status": "complete"})
@@ -463,7 +461,7 @@ class PEXExtension(Extension):
         """
         self._is_private = value
 
-    def on_message(self, msg_type: int, payload: bytes) -> Optional[bytes]:
+    def on_message(self, msg_type: int, payload: bytes) -> bytes | None:
         """Handle an incoming PEX message.
 
         Per BEP-27, PEX messages are silently dropped for private torrents.
@@ -496,13 +494,12 @@ class PEXExtension(Extension):
 
         if msg_type == 0:
             try:
-                from dhtrack import bencode as bencode_module
-                new_peers, removed_peers, events = self._pex.parse_pex_message(payload)
+                new_peers, removed_peers, _events = self._pex.parse_pex_message(payload)
 
-                # Add new peers
                 for peer in new_peers:
-                    if events & 0x01:  # PEX_EVENT_NEW
-                        self._pex.add_peer(peer)
+                    self._pex.add_peer(peer)
+                for peer in removed_peers:
+                    self._pex.remove_peer(peer)
 
                 return None
             except Exception as exc:
@@ -570,7 +567,7 @@ class HolePunchExtension(Extension):
         """
         return True
 
-    def on_message(self, msg_type: int, payload: bytes) -> Optional[bytes]:
+    def on_message(self, msg_type: int, payload: bytes) -> bytes | None:
         """Handle an incoming binary holepunch message (BEP 55).
 
         Parameters
@@ -597,12 +594,12 @@ class HolePunchExtension(Extension):
                 return None
 
             elif msg_type == 1:  # CONNECT
-                decoded = self._handler.handle_connect(payload)
+                self._handler.handle_connect(payload)
                 # The callback on_holepunch_connect handles the connection
                 return None
 
             elif msg_type == 2:  # ERROR
-                decoded = self._handler.handle_error(payload)
+                self._handler.handle_error(payload)
                 # Error is stored, no response needed
                 return None
 
@@ -724,8 +721,7 @@ class ExtensionManager:
     def register_builtin_extensions(self) -> None:
         """Register all built-in extensions."""
         # Note: Actual instantiation happens when creating peers
-        logger.debug("Registered extensions: %s",
-                     self.registry.get_supported_names())
+        logger.debug("Registered extensions: %s", self.registry.get_supported_names())
 
     def get_handshake_names(self) -> list[str]:
         """Get the list of extension names for the handshake.
@@ -757,7 +753,7 @@ class ExtensionManager:
             return ext.on_handshake(data)
         return False
 
-    def handle_message(self, extension_name: str, msg_type: int, payload: bytes) -> Optional[bytes]:
+    def handle_message(self, extension_name: str, msg_type: int, payload: bytes) -> bytes | None:
         """Route a message to the appropriate extension.
 
         Parameters
@@ -801,10 +797,10 @@ class ExtensionManager:
         bytes
             Complete extended message bytes.
         """
-        from dhtrack.peer import ExtensionNegotiator, EXTENSION_MSG_TYPE_MESSAGE
+        from dhtrack.peer import EXTENSION_MSG_TYPE_MESSAGE, ExtensionNegotiator
 
         negotiator = ExtensionNegotiator()
         return negotiator.send_extended_message(
             EXTENSION_MSG_TYPE_MESSAGE,
-            {"m": extension_name, **payload},
+            {"m": extension_name.encode("utf-8"), **payload},
         )

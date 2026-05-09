@@ -5,8 +5,6 @@ from __future__ import annotations
 import pytest
 
 from dhtrack.rss_feed import (
-    RSSFeed,
-    RSSFeedError,
     RSSParseError,
     TorrentFeedItem,
     create_rss_feed,
@@ -17,7 +15,6 @@ from dhtrack.rss_feed import (
     parse_item,
     parse_rss_feed,
 )
-
 
 # ---------------------------------------------------------------------------
 # TorrentFeedItem tests
@@ -99,6 +96,7 @@ class TestParseItem:
                        type="application/x-bittorrent" length="12345"/>
         </item>"""
         import xml.etree.ElementTree as ET
+
         item_el = ET.fromstring(xml)
         item = parse_item(item_el)
         assert item.title == "Test"
@@ -115,6 +113,7 @@ class TestParseItem:
                            url="http://example.com/media.torrent"/>
         </item>"""
         import xml.etree.ElementTree as ET
+
         item_el = ET.fromstring(xml)
         item = parse_item(item_el)
         assert item.torrent_url == "http://example.com/enclosure.torrent"
@@ -127,6 +126,7 @@ class TestParseItem:
                            fileSize="1024"/>
         </item>"""
         import xml.etree.ElementTree as ET
+
         item_el = ET.fromstring(xml)
         item = parse_item(item_el)
         assert item.torrent_url == "http://example.com/torrent.torrent"
@@ -140,6 +140,7 @@ class TestParseItem:
             </media:hash>
         </item>"""
         import xml.etree.ElementTree as ET
+
         item_el = ET.fromstring(xml)
         item = parse_item(item_el)
         assert item.info_hash == "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
@@ -151,6 +152,7 @@ class TestParseItem:
             <link>http://example.com/torrent.torrent</link>
         </item>"""
         import xml.etree.ElementTree as ET
+
         item_el = ET.fromstring(xml)
         item = parse_item(item_el)
         assert item.torrent_url == "http://example.com/torrent.torrent"
@@ -162,6 +164,7 @@ class TestParseItem:
             <guid>abc123</guid>
         </item>"""
         import xml.etree.ElementTree as ET
+
         item_el = ET.fromstring(xml)
         item = parse_item(item_el)
         assert item.guid == "abc123"
@@ -177,6 +180,7 @@ class TestParseItem:
             </torrent>
         </item>"""
         import xml.etree.ElementTree as ET
+
         item_el = ET.fromstring(xml)
         item = parse_item(item_el)
         assert item.info_hash == "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
@@ -203,6 +207,7 @@ class TestParseItem:
             </torrent>
         </item>"""
         import xml.etree.ElementTree as ET
+
         item_el = ET.fromstring(xml)
         item = parse_item(item_el)
         assert item.trackers is not None
@@ -215,6 +220,7 @@ class TestParseItem:
             <pubDate>Mon, 06 May 2026 12:00:00 GMT</pubDate>
         </item>"""
         import xml.etree.ElementTree as ET
+
         item_el = ET.fromstring(xml)
         item = parse_item(item_el)
         assert item.pub_date == "Mon, 06 May 2026 12:00:00 GMT"
@@ -441,10 +447,12 @@ class TestConvenienceHelpers:
     def test_escape_xml_uses_html_escape(self):
         # Just verify html.escape is used by checking output is not plain text
         from dhtrack.rss_feed import _escape_xml
+
         result = _escape_xml("a & b")
         # The entity code for & is 38, so we should see &#38; or &
         assert "&#38;" in result or "&" in result
 
     def test_escape_xml_no_change(self):
         from dhtrack.rss_feed import _escape_xml
+
         assert _escape_xml("hello world") == "hello world"

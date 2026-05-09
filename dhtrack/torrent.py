@@ -8,19 +8,23 @@ infohashes used in BitTorrent and DHT protocols.
 from __future__ import annotations
 
 import hashlib
+import logging
 import random
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from dhtrack import bencode as bencode_module
-from dhtrack.bencode import BEncodeValue
 from dhtrack import bep47
+from dhtrack.bencode import BEncodeValue
+
+logger = logging.getLogger(__name__)
 
 
 try:
     import pymongo
     from pymongo import MongoClient
+
     MONGO_AVAILABLE = True
 except ImportError:
     MONGO_AVAILABLE = False
@@ -79,31 +83,41 @@ class Torrent:
         if not isinstance(data, dict):
             raise TorrentParseError("Torrent data must be a dictionary")
 
-        # Get info - handle both byte and string keys
-        info_value = None
-        for key in data:
-            if isinstance(key, bytes) and key.lower() == b'info' or (isinstance(key, str) and key.lower() == 'info'):
-                info_value = data[key]
-                break
+        def _normalize(obj: Any) -> Any:
+            # Convert python dict/list structures into a bytes-keyed, bencode-friendly shape.
+            # This avoids carrying str keys throughout the codebase.
+            if isinstance(obj, dict):
+                out: dict[bytes, Any] = {}
+                for k, v in obj.items():
+                    if isinstance(k, bytes):
+                        kb = k
+                    else:
+                        kb = str(k).encode("utf-8", errors="replace")
+                    out[kb] = _normalize(v)
+                return out
+            if isinstance(obj, list):
+                return [_normalize(v) for v in obj]
+            if isinstance(obj, str):
+                return obj.encode("utf-8", errors="replace")
+            return obj
+
+        normalized = _normalize(data)
+        if not isinstance(normalized, dict):
+            raise TorrentParseError("Torrent data must be a dictionary")
+
+        info_value = normalized.get(b"info")
 
         if info_value is None:
             raise TorrentParseError("Torrent data missing 'info' field")
 
-        # Store raw dict (preserve original key types)
-        self.dict: dict[Any, Any] = data
-
-        # Normalize to string keys for convenience (but keep raw dict too)
-        self._normalized_dict: dict[str, Any] = {}
-        if isinstance(self.dict, dict):
-            for k, v in self.dict.items():
-                str_key = k.decode('utf-8') if isinstance(k, bytes) else k
-                self._normalized_dict[str_key] = v
+        # Store bytes-keyed dict (torrent metainfo)
+        self.dict: dict[Any, Any] = normalized
 
         # Compute infohash: SHA-1 of the bencoded info dictionary (BEP 3)
         self.infohash: bytes = hashlib.sha1(bencode_module.encode(info_value)).digest()
 
     @property
-    def name(self) -> Optional[str]:
+    def name(self) -> str | None:
         """Get the torrent name, if available.
 
         Returns
@@ -111,43 +125,34 @@ class Torrent:
         str or None
             The torrent name from the info dictionary.
         """
-        info = self._normalized_dict.get('info')
+        info = self._get_key(self.dict, b"info")
         if isinstance(info, dict):
-            name = info.get('name')
-            if name is None:
-                name = info.get(b'name')
+            name = self._get_key(info, b"name")
             if isinstance(name, bytes):
-                return name.decode('utf-8', errors='replace')
-            return str(name) if name else None
+                return name.decode("utf-8", errors="replace")
         return None
 
-    def _get_key(self, data: dict[Any, Any], str_key: str, byte_key: bytes) -> Any:
-        """Get a value from a dict, trying string key first then byte key.
+    def _get_key(self, data: dict[Any, Any], key: bytes) -> Any:
+        """Get a value from a bytes-key dict.
 
         Parameters
         ----------
         data : dict
             The dictionary to look up.
-        str_key : str
-            The string key to try first.
-        byte_key : bytes
-            The byte key to try if string key is not found.
+        key : bytes
+            The key to look up.
 
         Returns
         -------
         Any
             The value associated with the key, or None if not found.
         """
-        if str_key in data:
-            return data[str_key]
-        if byte_key in data:
-            return data[byte_key]
-        return None
+        return data.get(key)
 
     @property
-    def info(self) -> Optional[BEncodeValue]:
+    def info(self) -> BEncodeValue | None:
         """Get the raw info dictionary."""
-        return self._get_key(self._normalized_dict, 'info', b'info')
+        return self._get_key(self.dict, b"info")
 
     @property
     def trackers(self) -> list[str]:
@@ -170,10 +175,10 @@ class Torrent:
         trackers: list[str] = []
 
         # Per BEP-12: if announce-list exists, ignore the announce key
-        announce_list = self._get_key(self._normalized_dict, 'announce-list', b'announce-list')
+        announce_list = self._get_key(self.dict, b"announce-list")
         if announce_list is None:
             # Fallback to legacy key name
-            announce_list = self._get_key(self._normalized_dict, 'announcelist', b'announcelist')
+            announce_list = self._get_key(self.dict, b"announcelist")
 
         if isinstance(announce_list, list):
             # Multi-tracker mode (BEP 12)
@@ -181,17 +186,17 @@ class Torrent:
                 if isinstance(tier, list):
                     for tracker in tier:
                         if isinstance(tracker, bytes):
-                            trackers.append(tracker.decode('utf-8', errors='replace'))
+                            trackers.append(tracker.decode("utf-8", errors="replace"))
                         elif isinstance(tracker, str):
                             trackers.append(tracker)
         else:
             # Legacy single-tracker mode: fall back to announce key
-            announce = self._get_key(self._normalized_dict, 'announce', b'announce')
+            announce = self._get_key(self.dict, b"announce")
             if announce is not None:
                 if isinstance(announce, bytes):
-                    trackers.append(announce.decode('utf-8', errors='replace'))
-                elif isinstance(announce, str):
-                    trackers.append(announce)
+                    trackers.append(announce.decode("utf-8", errors="replace"))
+                else:
+                    trackers.append(str(announce))
 
         return trackers
 
@@ -205,7 +210,7 @@ class Torrent:
         Any
             The raw value of the 'announce-list' key, or None if not present.
         """
-        return self._get_key(self._normalized_dict, 'announce-list', b'announce-list')
+        return self._get_key(self.dict, b"announce-list")
 
     def has_announce_list(self) -> bool:
         """Check if the torrent uses the multitracker format (BEP 12).
@@ -223,7 +228,7 @@ class Torrent:
         """
         if self.get_raw_announce_list() is not None:
             return True
-        return self._get_key(self._normalized_dict, 'announcelist', b'announcelist') is not None
+        return self._get_key(self.dict, b"announcelist") is not None
 
     def set_announce_list(self, tiers: list[list[str]]) -> None:
         """Set the announce-list for the torrent metadata.
@@ -243,17 +248,13 @@ class Torrent:
             encoded_tier: list[bytes] = []
             for url in tier:
                 if isinstance(url, str):
-                    encoded_tier.append(url.encode('utf-8'))
+                    encoded_tier.append(url.encode("utf-8"))
                 elif isinstance(url, bytes):
                     encoded_tier.append(url)
             encoded_tiers.append(encoded_tier)
 
-        # Set on the raw dictionary (using string key for compatibility)
-        self._normalized_dict['announce-list'] = encoded_tiers
-
-        # Also set on the raw dict - try both key types
-        raw_dict = self.dict
-        raw_dict['announce-list'] = encoded_tiers
+        # Set on the raw dictionary (bytes key)
+        self.dict[b"announce-list"] = encoded_tiers
 
     def shuffle_tier(self, tier_index: int) -> list[str]:
         """Shuffle a specific tier and return the shuffled tracker URLs.
@@ -281,9 +282,7 @@ class Torrent:
             raise ValueError("No announce-list found in torrent metadata")
 
         if tier_index < 0 or tier_index >= len(announce_list):
-            raise ValueError(
-                f"Tier index {tier_index} out of range (0-{len(announce_list) - 1})"
-            )
+            raise ValueError(f"Tier index {tier_index} out of range (0-{len(announce_list) - 1})")
 
         tier = announce_list[tier_index]
         if isinstance(tier, list):
@@ -291,7 +290,7 @@ class Torrent:
             urls: list[str] = []
             for tracker in tier:
                 if isinstance(tracker, bytes):
-                    urls.append(tracker.decode('utf-8', errors='replace'))
+                    urls.append(tracker.decode("utf-8", errors="replace"))
                 elif isinstance(tracker, str):
                     urls.append(tracker)
 
@@ -300,7 +299,7 @@ class Torrent:
 
             # Update the tier in the announce-list
             for i, url in enumerate(urls):
-                tier[i] = url.encode('utf-8') if isinstance(tier[i], bytes) else url
+                tier[i] = url.encode("utf-8") if isinstance(tier[i], bytes) else url
 
             return urls
 
@@ -329,27 +328,23 @@ class Torrent:
             raise ValueError("No announce-list found in torrent metadata")
 
         if tier_index < 0 or tier_index >= len(announce_list):
-            raise ValueError(
-                f"Tier index {tier_index} out of range (0-{len(announce_list) - 1})"
-            )
+            raise ValueError(f"Tier index {tier_index} out of range (0-{len(announce_list) - 1})")
 
         tier = announce_list[tier_index]
         if not isinstance(tier, list):
             raise ValueError(f"Tier {tier_index} is not a list")
 
         # Find the tracker URL and move to front
-        target_url = tracker_url.encode('utf-8') if isinstance(tracker_url, str) else tracker_url
+        target_url = tracker_url.encode("utf-8") if isinstance(tracker_url, str) else tracker_url
         found_index = None
         for i, tracker in enumerate(tier):
-            tracker_str = tracker.decode('utf-8', errors='replace') if isinstance(tracker, bytes) else tracker
+            tracker_str = tracker.decode("utf-8", errors="replace") if isinstance(tracker, bytes) else tracker
             if tracker_str == tracker_url or tracker == target_url:
                 found_index = i
                 break
 
         if found_index is None:
-            raise ValueError(
-                f"Tracker '{tracker_url}' not found in tier {tier_index}"
-            )
+            raise ValueError(f"Tracker '{tracker_url}' not found in tier {tier_index}")
 
         # Move to front
         if found_index != 0:
@@ -386,14 +381,14 @@ class Torrent:
             urls: list[str] = []
             for tracker in tier:
                 if isinstance(tracker, bytes):
-                    urls.append(tracker.decode('utf-8', errors='replace'))
+                    urls.append(tracker.decode("utf-8", errors="replace"))
                 elif isinstance(tracker, str):
                     urls.append(tracker)
             random.shuffle(urls)
 
             # Update the tier in place
             for i, url in enumerate(urls):
-                tier[i] = url.encode('utf-8') if isinstance(tier[i], bytes) else url
+                tier[i] = url.encode("utf-8") if isinstance(tier[i], bytes) else url
 
             all_shuffled.append(urls)
 
@@ -493,9 +488,7 @@ class Torrent:
 
         tier_index = self.get_current_tier_index()
         if tier_index < 0 or tier_index >= len(announce_list):
-            raise ValueError(
-                f"Invalid tier index {tier_index} (valid range: 0-{len(announce_list) - 1})"
-            )
+            raise ValueError(f"Invalid tier index {tier_index} (valid range: 0-{len(announce_list) - 1})")
 
         tier = announce_list[tier_index]
         if not isinstance(tier, list):
@@ -504,7 +497,7 @@ class Torrent:
         urls: list[str] = []
         for tracker in tier:
             if isinstance(tracker, bytes):
-                urls.append(tracker.decode('utf-8', errors='replace'))
+                urls.append(tracker.decode("utf-8", errors="replace"))
             elif isinstance(tracker, str):
                 urls.append(tracker)
 
@@ -532,27 +525,20 @@ class Torrent:
         """
         urls: list[str] = []
 
-        # Try both string and bytes keys at top level
-        url_list = self._normalized_dict.get('url-list')
-        if url_list is None:
-            # Try the raw dict with bytes key
-            url_list = self.dict.get(b'url-list')
-        if url_list is None:
-            # Try string key on raw dict
-            url_list = self.dict.get('url-list')
+        url_list = self.dict.get(b"url-list")
 
         if url_list is None:
             return urls
 
         # Handle both single URL string and list of URLs
         if isinstance(url_list, bytes):
-            urls.append(url_list.decode('utf-8', errors='replace'))
+            urls.append(url_list.decode("utf-8", errors="replace"))
         elif isinstance(url_list, str):
             urls.append(url_list)
         elif isinstance(url_list, list):
             for url in url_list:
                 if isinstance(url, bytes):
-                    urls.append(url.decode('utf-8', errors='replace'))
+                    urls.append(url.decode("utf-8", errors="replace"))
                 elif isinstance(url, str):
                     urls.append(url)
 
@@ -571,15 +557,14 @@ class Torrent:
         encoded_urls: list[bytes] = []
         for url in urls:
             if isinstance(url, str):
-                encoded_urls.append(url.encode('utf-8'))
+                encoded_urls.append(url.encode("utf-8"))
             elif isinstance(url, bytes):
                 encoded_urls.append(url)
 
         # Set on both normalized and raw dict
-        self._normalized_dict['url-list'] = encoded_urls
-        self.dict['url-list'] = encoded_urls
+        self.dict[b"url-list"] = encoded_urls
 
-    def get_webseeding_url_for_file(self, file_index: int = 0) -> Optional[str]:
+    def get_webseeding_url_for_file(self, file_index: int = 0) -> str | None:
         """Get the full webseed URL for a specific file in multi-file torrents.
 
         Constructs the full URL by appending the torrent name and file path
@@ -610,7 +595,7 @@ class Torrent:
         base_url = urls[0]
 
         # Check if URL ends with "/" - if so, we need to append name/path
-        if base_url.endswith('/'):
+        if base_url.endswith("/"):
             # Get the torrent name
             name = self.name
             if not name:
@@ -628,7 +613,7 @@ class Torrent:
 
         return base_url if urls else None
 
-    def get_file_path(self, file_index: int) -> Optional[str]:
+    def get_file_path(self, file_index: int) -> str | None:
         """Get the path of a file in a multi-file torrent.
 
         Parameters
@@ -648,7 +633,7 @@ class Torrent:
         if not isinstance(info, dict):
             return None
 
-        files = self._get_key(info, 'files', b'files')
+        files = self._get_key(info, b"files")
         if files is None or not isinstance(files, list):
             return None  # Single-file torrent
 
@@ -660,21 +645,21 @@ class Torrent:
             return None
 
         # Get the path list
-        path = self._get_key(file_entry, 'path', b'path')
+        path = self._get_key(file_entry, b"path")
         if path is None:
             return None
 
         if isinstance(path, bytes):
-            return path.decode('utf-8', errors='replace')
+            return path.decode("utf-8", errors="replace")
         elif isinstance(path, list):
             # Path can be a list of path components (BEP 32)
             parts: list[str] = []
             for component in path:
                 if isinstance(component, bytes):
-                    parts.append(component.decode('utf-8', errors='replace'))
+                    parts.append(component.decode("utf-8", errors="replace"))
                 elif isinstance(component, str):
                     parts.append(component)
-            return '/'.join(parts)
+            return "/".join(parts)
 
         return None
 
@@ -695,10 +680,10 @@ class Torrent:
         tier are shuffled on first read and successful trackers move
         to the front of their tier.
         """
-        announce_list = self._get_key(self._normalized_dict, 'announce-list', b'announce-list')
+        announce_list = self._get_key(self.dict, b"announce-list")
         if announce_list is None:
             # Fallback to legacy key name
-            announce_list = self._get_key(self._normalized_dict, 'announcelist', b'announcelist')
+            announce_list = self._get_key(self.dict, b"announcelist")
 
         if isinstance(announce_list, list):
             tiers: list[list[str]] = []
@@ -707,7 +692,7 @@ class Torrent:
                     tier_urls: list[str] = []
                     for tracker in tier:
                         if isinstance(tracker, bytes):
-                            tier_urls.append(tracker.decode('utf-8', errors='replace'))
+                            tier_urls.append(tracker.decode("utf-8", errors="replace"))
                         elif isinstance(tracker, str):
                             tier_urls.append(tracker)
                     if tier_urls:
@@ -716,12 +701,12 @@ class Torrent:
                 return tiers
 
         # Fallback: return single announce as a single-tier list
-        announce = self._get_key(self._normalized_dict, 'announce', b'announce')
+        announce = self._get_key(self.dict, b"announce")
         if announce is not None:
             if isinstance(announce, bytes):
-                return [[announce.decode('utf-8', errors='replace')]]
-            elif isinstance(announce, str):
-                return [[announce]]
+                return [[announce.decode("utf-8", errors="replace")]]
+            else:
+                return [[str(announce)]]
 
         return []
 
@@ -739,14 +724,14 @@ class Torrent:
             return 0
 
         if isinstance(info, dict):
-            files = self._get_key(info, 'files', b'files')
+            files = self._get_key(info, b"files")
             if files is not None and isinstance(files, list):
                 return len(files)
         return 1  # Single-file torrent
 
     # ---- BEP-47: Padding Files and Extended File Attributes ----
 
-    def _get_files_list(self) -> Optional[list[dict[str, Any]]]:
+    def _get_files_list(self) -> list[dict[str, Any]] | None:
         """Get the files list from the info dictionary.
 
         Returns
@@ -758,13 +743,13 @@ class Torrent:
         if not isinstance(info, dict):
             return None
 
-        files = self._get_key(info, 'files', b'files')
+        files = self._get_key(info, b"files")
         if not isinstance(files, list):
             return None
 
         return files  # type: ignore[return-value]
 
-    def _get_normalized_file_entry(self, file_index: int) -> Optional[dict[str, Any]]:
+    def _get_normalized_file_entry(self, file_index: int) -> dict[str, Any] | None:
         """Get a normalized file entry at the given index.
 
         Parameters
@@ -783,7 +768,7 @@ class Torrent:
 
         return bep47.normalize_file_entry(files[file_index])
 
-    def get_file_attribute(self, file_index: int) -> str:
+    def get_file_attribute(self, file_index: int) -> bytes:
         """Get the attribute string for a file.
 
         Parameters
@@ -793,14 +778,15 @@ class Torrent:
 
         Returns
         -------
-        str
-            The attribute string (e.g., "hx" for hidden+executable),
-            or empty string if no attributes are set.
+        bytes
+            The attribute bytes (e.g., b\"hx\" for hidden+executable),
+            or b\"\" if no attributes are set.
         """
         entry = self._get_normalized_file_entry(file_index)
         if entry is None:
-            return ""
-        return entry.get("attr", "")
+            return b""
+        attr = entry.get(b"attr", b"")
+        return attr if isinstance(attr, bytes) else b""
 
     def has_file_attribute(self, file_index: int, attr: str) -> bool:
         """Check if a file has a specific attribute.
@@ -817,8 +803,8 @@ class Torrent:
         bool
             True if the file has the specified attribute.
         """
-        attr_str = self.get_file_attribute(file_index)
-        return bep47.has_attribute(attr_str, attr)
+        attr_bytes = self.get_file_attribute(file_index)
+        return isinstance(attr_bytes, bytes) and attr.encode("ascii") in attr_bytes
 
     def set_file_attribute(self, file_index: int, attr: str, set_value: bool = True) -> None:
         """Set or unset an attribute on a file entry.
@@ -840,21 +826,20 @@ class Torrent:
         if not isinstance(entry, dict):
             return
 
-        # Normalize attr field
-        current_attr = entry.get("attr", "") or entry.get(b"attr", "")
-        if isinstance(current_attr, bytes):
-            current_attr = current_attr.decode("utf-8", errors="replace")
+        # Bytes-only bencode invariant
+        current_attr = entry.get(b"attr", b"")
+        if not isinstance(current_attr, bytes):
+            current_attr = b""
 
-        current_attr = str(current_attr)
-
+        attr_b = attr.encode("ascii")
         if set_value:
-            new_attr = current_attr + attr if attr not in current_attr else current_attr
+            new_attr = current_attr if attr_b in current_attr else current_attr + attr_b
         else:
-            new_attr = "".join(c for c in current_attr if c != attr)
+            new_attr = current_attr.replace(attr_b, b"")
 
-        entry["attr"] = new_attr
+        entry[b"attr"] = new_attr
 
-    def get_file_sha1(self, file_index: int) -> Optional[bytes]:
+    def get_file_sha1(self, file_index: int) -> bytes | None:
         """Get the SHA1 hash for a file.
 
         Parameters
@@ -916,7 +901,7 @@ class Torrent:
         self.set_file_sha1(file_index, sha1)
         return sha1
 
-    def get_symlink_path(self, file_index: int) -> Optional[list[str]]:
+    def get_symlink_path(self, file_index: int) -> list[str] | None:
         """Get the symlink target path for a file.
 
         Parameters
@@ -932,6 +917,7 @@ class Torrent:
         entry = self._get_normalized_file_entry(file_index)
         if entry is None:
             return None
+        # Bytes-only bencode invariant
         return bep47.get_symlink_path(entry)
 
     def is_symlink(self, file_index: int) -> bool:
@@ -987,7 +973,8 @@ class Torrent:
         if entry is None:
             return 0
         if self.is_padding_file(file_index):
-            return entry.get("length", 0)
+            length = entry.get(b"length", 0)
+            return int(length) if isinstance(length, int) else 0
         return 0
 
     # ---- BEP-27: Private Torrents ----
@@ -1014,13 +1001,11 @@ class Torrent:
         https://www.bittorrent.org/beps/bep_0027.html
         """
         if isinstance(self.info, dict):
-            for key in (b"private", "private"):
-                if key in self.info:
-                    value = self.info[key]
-                    if isinstance(value, (bytes, str)):
-                        return value in (b"1", "1", b"true", "true")
-                    elif isinstance(value, int) and not isinstance(value, bool):
-                        return value == 1
+            value = self.info.get(b"private")
+            if isinstance(value, bytes):
+                return value.strip().lower() in (b"1", b"true")
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value == 1
         return False
 
     @is_private.setter
@@ -1040,18 +1025,9 @@ class Torrent:
             return
 
         if value:
-            # Check if key exists as bytes or string and update accordingly
-            if b"private" in self.info:
-                self.info[b"private"] = b"1"
-            elif "private" in self.info:
-                self.info["private"] = "1"
-            else:
-                # Default to bytes key for BEncode compatibility
-                self.info[b"private"] = b"1"
+            self.info[b"private"] = b"1"
         else:
-            # Remove the private key
             self.info.pop(b"private", None)
-            self.info.pop("private", None)
 
     def get_piece_length(self) -> int:
         """Get the piece length from the torrent.
@@ -1063,12 +1039,12 @@ class Torrent:
         """
         info = self.info
         if isinstance(info, dict):
-            piece_length = self._get_key(info, 'piece length', b'piece length')
+            piece_length = self._get_key(info, b"piece length")
             if isinstance(piece_length, int) and piece_length > 0:
                 return piece_length
         return 0
 
-    def add_padding_file(self, file_index: int) -> Optional[dict[str, Any]]:
+    def add_padding_file(self, file_index: int) -> dict[str, Any] | None:
         """Add a padding file before the specified file to align it to a piece boundary.
 
         Parameters
@@ -1100,9 +1076,7 @@ class Torrent:
                 if isinstance(length, int):
                     cumulative_length += length
 
-        padding_entry = bep47.create_padding_file_entry(
-            piece_length, cumulative_length
-        )
+        padding_entry = bep47.create_padding_file_entry(piece_length, cumulative_length)
 
         if padding_entry is None:
             return None
@@ -1151,9 +1125,7 @@ class Torrent:
 
             padding_len = bep47.create_padding_length(piece_length, cumulative_length)
             if padding_len > 0:
-                padding_entry = bep47.create_padding_file_entry(
-                    piece_length, cumulative_length
-                )
+                padding_entry = bep47.create_padding_file_entry(piece_length, cumulative_length)
                 if padding_entry is not None:
                     insert_positions.insert(0, (i, padding_entry))
 
@@ -1182,9 +1154,9 @@ class Torrent:
         for entry in files:
             if not isinstance(entry, dict):
                 continue
-            attr = entry.get("attr") or entry.get(b"attr")
-            sha1 = entry.get("sha1") or entry.get(b"sha1")
-            symlink = entry.get("symlink path") or entry.get(b"symlink path")
+            attr = entry.get(b"attr")
+            sha1 = entry.get(b"sha1")
+            symlink = entry.get(b"symlink path")
             if attr or sha1 or symlink:
                 return True
 
@@ -1211,8 +1183,8 @@ class Torrent:
         for entry in files:
             if not isinstance(entry, dict):
                 continue
-            file_attr = entry.get("attr") or entry.get(b"attr")
-            if file_attr and isinstance(file_attr, str) and attr in file_attr:
+            file_attr = entry.get(b"attr")
+            if file_attr and isinstance(file_attr, bytes) and attr.encode("ascii") in file_attr:
                 count += 1
 
         return count
@@ -1275,7 +1247,8 @@ class Torrent:
             if self.is_padding_file(i):
                 entry = self._get_normalized_file_entry(i)
                 if entry:
-                    total += entry.get("length", 0)
+                    length = entry.get(b"length", 0)
+                    total += int(length) if isinstance(length, int) else 0
         return total
 
     @classmethod
@@ -1309,7 +1282,7 @@ class Torrent:
         Torrent
             The parsed Torrent object.
         """
-        with closing(open(path, 'rb')) as fd:
+        with closing(open(path, "rb")) as fd:
             return cls.parse(fd.read())
 
     @staticmethod
@@ -1331,11 +1304,11 @@ class Torrent:
         return hashlib.sha1(bencode_module.encode(info)).digest()
 
     def __repr__(self) -> str:
-        name = self.name or 'unknown'
+        name = self.name or "unknown"
         return f"Torrent(name={name!r}, infohash={self.infohash.hex()!r})"
 
     def __str__(self) -> str:
-        name = self.name or 'unknown'
+        name = self.name or "unknown"
         return f"Torrent: {name} ({self.infohash.hex()})"
 
     # ---- MongoDB integration (optional) ----
@@ -1357,7 +1330,7 @@ class Torrent:
                 cls._mongo_client = pymongo.MongoClient(serverSelectionTimeoutMS=1000)
                 cls._db = cls._mongo_client.dht
                 cls._torrents = cls._db.torrents
-                cls._torrents.create_index('infohash', unique=True)
+                cls._torrents.create_index("infohash", unique=True)
             except Exception:
                 cls._mongo_client = None
                 return False
@@ -1384,26 +1357,23 @@ class Torrent:
         info = torrent.info
         if isinstance(info, dict):
             # Convert byte keys to string keys for storage
-            info = {
-                k.decode('utf-8') if isinstance(k, bytes) else k: v
-                for k, v in info.items()
-            }
+            info = {k.decode("utf-8") if isinstance(k, bytes) else k: v for k, v in info.items()}
 
         doc = {
-            'infohash': torrent.infohash.hex(),
-            'name': torrent.name,
-            'info': info,
-            'trackers': torrent.trackers,
+            "infohash": torrent.infohash.hex(),
+            "name": torrent.name,
+            "info": info,
+            "trackers": torrent.trackers,
         }
 
         cls._torrents.replace_one(
-            {'infohash': torrent.infohash.hex()},
+            {"infohash": torrent.infohash.hex()},
             doc,
             upsert=True,
         )
 
     @classmethod
-    def find_by_infohash(cls, infohash: bytes | str) -> Optional[dict]:
+    def find_by_infohash(cls, infohash: bytes | str) -> dict | None:
         """Find a torrent by its infohash.
 
         Parameters
@@ -1422,7 +1392,7 @@ class Torrent:
         if isinstance(infohash, bytes):
             infohash = infohash.hex()
 
-        return cls._torrents.find_one({'infohash': infohash})
+        return cls._torrents.find_one({"infohash": infohash})
 
     @classmethod
     def search(cls, query: str) -> list[dict]:
@@ -1441,6 +1411,4 @@ class Torrent:
         if not cls._ensure_mongo():
             return []
 
-        return list(cls._torrents.find(
-            {'name': {'$regex': query, '$options': 'i'}}
-        ))
+        return list(cls._torrents.find({"name": {"$regex": query, "$options": "i"}}))

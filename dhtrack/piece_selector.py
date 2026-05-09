@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # Gap Dataclass
@@ -54,7 +52,7 @@ class Gap:
     def __repr__(self) -> str:
         return f"Gap(start={self.start}, end={self.end}, length={self.length})"
 
-    def __lt__(self, other: "Gap") -> bool:
+    def __lt__(self, other: Gap) -> bool:
         return self.length > other.length  # Sort by length descending
 
 
@@ -121,7 +119,7 @@ class PieceSelector:
             return []
 
         gaps: list[Gap] = []
-        gap_start: Optional[int] = None
+        gap_start: int | None = None
 
         for i in range(self.total_pieces):
             # Check if we have this piece
@@ -163,13 +161,13 @@ class PieceSelector:
             All gaps of missing pieces (where '0' = missing).
         """
         gaps: list[Gap] = []
-        gap_start: Optional[int] = None
+        gap_start: int | None = None
 
         for i, has_piece in enumerate(bitfield):
             if i >= self.total_pieces:
                 break
 
-            if has_piece == '0':  # Missing piece
+            if has_piece == "0":  # Missing piece
                 if gap_start is None:
                     gap_start = i
             else:
@@ -188,7 +186,7 @@ class PieceSelector:
         bitfield: bytes,
         peer_counts: dict[int, int],
         peer_count: int = 0,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Select the next piece using "pretty rare with biggest gap" algorithm.
 
         Per BEP 19, when scanning for the rarest piece, if the distance from
@@ -218,10 +216,10 @@ class PieceSelector:
         # Calculate X = sqrt(peers) - 1
         x = math.sqrt(max(peer_count, 1)) - 1
 
-        cur_rarest: Optional[int] = None
+        cur_rarest: int | None = None
         cur_gap = 0
-        cur_rarest_count = float('inf')
-        next_piece: Optional[int] = None
+        cur_rarest_count = float("inf")
+        next_piece: int | None = None
 
         gap = 0
         for i in range(self.total_pieces):
@@ -244,8 +242,7 @@ class PieceSelector:
                     cur_rarest_count = count
                     cur_gap = gap
                     next_piece = i
-                elif count < cur_rarest_count - x or \
-                     (count <= cur_rarest_count + x and gap > cur_gap):
+                elif count < cur_rarest_count - x or (count <= cur_rarest_count + x and gap > cur_gap):
                     # This piece is rarer or has a bigger gap
                     cur_rarest = i
                     cur_rarest_count = count
@@ -259,9 +256,9 @@ class PieceSelector:
     def fill_in_gaps(
         self,
         bitfield: bytes,
-        peer_counts: Optional[dict[int, int]] = None,
+        peer_counts: dict[int, int] | None = None,
         completion_threshold: float = 0.5,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Select piece with smallest gap from a completed piece.
 
         When a file is more than 50% complete (or the configured threshold),
@@ -325,7 +322,7 @@ class PieceSelector:
         webseed_urls: int = 0,
         is_fresh_download: bool = True,
         random_start_range: int = 0,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Select the optimal piece for downloading.
 
         Combines standard rarest-first with WebSeed gap-aware selection.
@@ -371,6 +368,7 @@ class PieceSelector:
             if missing_pieces:
                 # Pick a random piece, but biased toward later pieces for webseed
                 import random
+
                 if len(missing_pieces) > 100:
                     # Pick from the last 20% of the file
                     start_idx = int(len(missing_pieces) * 0.8)
@@ -498,8 +496,8 @@ def bitfield_to_string(bitfield: bytes, total_pieces: int) -> str:
             has_piece = bool(bitfield[byte_index] & (1 << bit_index))
         else:
             has_piece = False
-        result.append('1' if has_piece else '0')
-    return ''.join(result[:total_pieces])
+        result.append("1" if has_piece else "0")
+    return "".join(result[:total_pieces])
 
 
 def string_to_bitfield(bitfield_str: str) -> bytes:
@@ -524,7 +522,7 @@ def string_to_bitfield(bitfield_str: str) -> bytes:
             bit_index = 7 - (i % 8)
             byte_index = i // 8
             if byte_index < num_bytes:
-                if ch == '1':
-                    result[byte_index] |= (1 << bit_index)
+                if ch == "1":
+                    result[byte_index] |= 1 << bit_index
 
     return bytes(result)

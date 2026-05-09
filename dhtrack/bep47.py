@@ -24,13 +24,16 @@ Examples
 from __future__ import annotations
 
 import hashlib
-from pathlib import PurePosixPath
-from typing import Any, Optional
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
 # File Attribute Constants
 # ---------------------------------------------------------------------------
+
 
 class FileAttribute:
     """File attribute flags as defined in BEP-47.
@@ -118,10 +121,10 @@ def format_attr(attributes: set[str]) -> str:
     ''
     """
     known = set(attributes) & FileAttribute.ALL_ATTRIBUTES
-    return ''.join(sorted(known))
+    return "".join(sorted(known))
 
 
-def has_attribute(attr_str: Optional[str], attr: str) -> bool:
+def has_attribute(attr_str: str | None, attr: str) -> bool:
     """Check if a specific attribute flag is set.
 
     Parameters
@@ -231,7 +234,7 @@ def create_padding_length(piece_length: int, file_length: int) -> int:
     >>> create_padding_length(16384, 0)
     0
     """
-    if file_length <= 0:
+    if piece_length <= 0 or file_length <= 0:
         return 0
     remainder = file_length % piece_length
     if remainder == 0:
@@ -243,7 +246,7 @@ def create_padding_file_entry(
     piece_length: int,
     previous_cumulative_length: int,
     torrent_name: str = "unnamed",
-) -> dict[str, Any]:
+) -> dict[bytes, Any] | None:
     """Create a padding file metadata entry for a torrent.
 
     This creates a synthetic file entry that, when inserted into the file
@@ -280,18 +283,18 @@ def create_padding_file_entry(
     if padding_length == 0:
         return None  # type: ignore[return-value]
 
-    padding_path = [".pad", str(padding_length)]
+    padding_path = [b".pad", str(padding_length).encode("ascii")]
 
-    entry: dict[str, Any] = {
-        "path": padding_path,
-        "length": padding_length,
-        "attr": FileAttribute.PADDING,
+    entry: dict[bytes, Any] = {
+        b"path": padding_path,
+        b"length": padding_length,
+        b"attr": FileAttribute.PADDING.encode("ascii"),
     }
 
     return entry
 
 
-def is_padding_file(file_entry: dict[str, Any]) -> bool:
+def is_padding_file(file_entry: dict[bytes, Any]) -> bool:
     """Check if a file entry is a padding file.
 
     Checks both the ``attr`` field and the path structure for
@@ -314,18 +317,16 @@ def is_padding_file(file_entry: dict[str, Any]) -> bool:
     >>> is_padding_file({"path": ["file.txt"], "length": 100})
     False
     """
-    # Check attr field first
-    attr = file_entry.get("attr") or file_entry.get(b"attr")
-    if attr and isinstance(attr, str) and FileAttribute.PADDING in attr:
+    # Bytes-only bencode invariant
+    attr = file_entry.get(b"attr")
+    if attr and isinstance(attr, bytes) and FileAttribute.PADDING.encode("ascii") in attr:
         return True
 
     # Check path structure as fallback
-    path = file_entry.get("path") or file_entry.get(b"path")
+    path = file_entry.get(b"path")
     if isinstance(path, list) and len(path) >= 1:
         first_component = path[0]
-        if isinstance(first_component, bytes):
-            first_component = first_component.decode("utf-8", errors="replace")
-        if first_component == ".pad":
+        if isinstance(first_component, bytes) and first_component == b".pad":
             return True
 
     return False
@@ -336,7 +337,7 @@ def is_padding_file(file_entry: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def is_symlink(file_entry: dict[str, Any]) -> bool:
+def is_symlink(file_entry: dict[bytes, Any]) -> bool:
     """Check if a file entry is a symlink.
 
     Checks both the ``attr`` field and presence of ``symlink path``
@@ -359,20 +360,20 @@ def is_symlink(file_entry: dict[str, Any]) -> bool:
     >>> is_symlink({"path": ["regular"], "length": 100})
     False
     """
-    # Check attr field
-    attr = file_entry.get("attr") or file_entry.get(b"attr")
-    if attr and isinstance(attr, str) and FileAttribute.SYMLINK in attr:
+    # Bytes-only bencode invariant
+    attr = file_entry.get(b"attr")
+    if attr and isinstance(attr, bytes) and FileAttribute.SYMLINK.encode("ascii") in attr:
         return True
 
     # Check for symlink path field
-    symlink_path = file_entry.get("symlink path") or file_entry.get(b"symlink path")
+    symlink_path = file_entry.get(b"symlink path")
     if symlink_path is not None:
         return True
 
     return False
 
 
-def get_symlink_path(file_entry: dict[str, Any]) -> Optional[list[str]]:
+def get_symlink_path(file_entry: dict[bytes, Any]) -> list[bytes] | None:
     """Get the symlink target path from a file entry.
 
     Parameters
@@ -392,30 +393,21 @@ def get_symlink_path(file_entry: dict[str, Any]) -> Optional[list[str]]:
     >>> get_symlink_path({"path": ["regular"]})
 
     """
-    symlink_path = file_entry.get("symlink path") or file_entry.get(b"symlink path")
+    symlink_path = file_entry.get(b"symlink path")
     if symlink_path is None:
         return None
 
     if not isinstance(symlink_path, list):
         return None
 
-    result: list[str] = []
-    for component in symlink_path:
-        if isinstance(component, bytes):
-            result.append(component.decode("utf-8", errors="replace"))
-        elif isinstance(component, str):
-            result.append(component)
-        else:
-            result.append(str(component))
-
-    return result
+    return [c for c in symlink_path if isinstance(c, bytes)]
 
 
 def create_symlink_file_entry(
     path: list[str],
     target_path: list[str],
     length: int = 0,
-) -> dict[str, Any]:
+) -> dict[bytes, Any]:
     """Create a symlink file metadata entry.
 
     Parameters
@@ -445,11 +437,11 @@ def create_symlink_file_entry(
     >>> entry["attr"]
     'l'
     """
-    entry: dict[str, Any] = {
-        "path": path,
-        "length": length,
-        "attr": FileAttribute.SYMLINK,
-        "symlink path": target_path,
+    entry: dict[bytes, Any] = {
+        b"path": [p.encode("utf-8") for p in path],
+        b"length": length,
+        b"attr": FileAttribute.SYMLINK.encode("ascii"),
+        b"symlink path": [p.encode("utf-8") for p in target_path],
     }
 
     return entry
@@ -460,7 +452,7 @@ def create_symlink_file_entry(
 # ---------------------------------------------------------------------------
 
 
-def get_file_sha1(file_entry: dict[str, Any]) -> Optional[bytes]:
+def get_file_sha1(file_entry: dict[bytes, Any]) -> bytes | None:
     """Get the SHA1 hash from a file entry.
 
     Parameters
@@ -482,15 +474,15 @@ def get_file_sha1(file_entry: dict[str, Any]) -> Optional[bytes]:
     >>> get_file_sha1({"path": ["file.txt"]})
 
     """
-    sha1 = file_entry.get("sha1") or file_entry.get(b"sha1")
+    sha1 = file_entry.get(b"sha1")
     if sha1 is None:
+        logger.debug("No SHA1 hash found in file entry")
         return None
-    if isinstance(sha1, str):
-        return sha1.encode("latin-1")
+    logger.debug("Got SHA1 hash from bytes key: %s", bytes(sha1).hex())
     return bytes(sha1)
 
 
-def set_file_sha1(file_entry: dict[str, Any], sha1: bytes) -> None:
+def set_file_sha1(file_entry: dict[bytes, Any], sha1: bytes) -> None:
     """Set the SHA1 hash on a file entry.
 
     Parameters
@@ -510,49 +502,19 @@ def set_file_sha1(file_entry: dict[str, Any], sha1: bytes) -> None:
     """
     if not isinstance(sha1, bytes) or len(sha1) != 20:
         raise ValueError("SHA1 must be exactly 20 bytes")
-    file_entry["sha1"] = sha1
+    file_entry[b"sha1"] = sha1
 
 
-def normalize_file_entry(file_entry: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a file entry, ensuring consistent key types and fields.
+def normalize_file_entry(file_entry: dict[bytes, Any]) -> dict[bytes, Any]:
+    """Normalize a file entry to bytes-key form.
 
-    - Converts byte string keys to string keys
-    - Ensures ``attr`` field exists (defaults to empty string)
-    - Ensures ``path`` field exists
-    - Ensures ``length`` field exists
-
-    Parameters
-    ----------
-    file_entry : dict
-        The raw file entry from a torrent.
-
-    Returns
-    -------
-    dict
-        The normalized file entry with string keys.
-
-    Examples
-    --------
-    >>> entry = {"path": [b"file.txt"], b"length": 100}
-    >>> normalized = normalize_file_entry(entry)
-    >>> "path" in normalized and "length" in normalized
-    True
-    >>> "attr" in normalized
-    True
+    This preserves the bytes-only bencode invariant for metainfo structures.
     """
-    normalized: dict[str, Any] = {}
+    normalized: dict[bytes, Any] = {k: v for k, v in file_entry.items() if isinstance(k, bytes)}
 
-    for key, value in file_entry.items():
-        str_key = key.decode("utf-8", errors="replace") if isinstance(key, bytes) else key
-        normalized[str_key] = value
-
-    # Ensure required fields exist
-    if "path" not in normalized:
-        normalized["path"] = []
-    if "length" not in normalized:
-        normalized["length"] = 0
-    if "attr" not in normalized:
-        normalized["attr"] = ""
+    normalized.setdefault(b"path", [])
+    normalized.setdefault(b"length", 0)
+    normalized.setdefault(b"attr", b"")
 
     return normalized
 
@@ -560,10 +522,10 @@ def normalize_file_entry(file_entry: dict[str, Any]) -> dict[str, Any]:
 def build_file_entry(
     path: list[str],
     length: int,
-    attr: Optional[str] = None,
-    sha1: Optional[bytes] = None,
-    symlink_path: Optional[list[str]] = None,
-) -> dict[str, Any]:
+    attr: str | None = None,
+    sha1: bytes | None = None,
+    symlink_path: list[str] | None = None,
+) -> dict[bytes, Any]:
     """Build a complete file entry dictionary.
 
     Parameters
@@ -594,16 +556,16 @@ def build_file_entry(
     >>> entry["attr"]
     'hx'
     """
-    entry: dict[str, Any] = {
-        "path": path,
-        "length": length,
+    entry: dict[bytes, Any] = {
+        b"path": [p.encode("utf-8") for p in path],
+        b"length": length,
     }
 
     if attr is not None:
-        entry["attr"] = attr
+        entry[b"attr"] = attr.encode("ascii")
     if sha1 is not None:
-        entry["sha1"] = sha1
+        entry[b"sha1"] = sha1
     if symlink_path is not None:
-        entry["symlink path"] = symlink_path
+        entry[b"symlink path"] = [p.encode("utf-8") for p in symlink_path]
 
     return entry

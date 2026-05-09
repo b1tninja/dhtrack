@@ -15,34 +15,15 @@ This module provides:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
+from dhtrack.dht import Endpoint  # canonical endpoint type
 
 # ---------------------------------------------------------------------------
 # Endpoint dataclass
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class Endpoint:
-    """Network endpoint for DHT peers.
-
-    Attributes
-    ----------
-    ip : str
-        IP address string.
-    port : int
-        Port number.
-    is_ipv6 : bool
-        Whether this is an IPv6 address.
-    """
-
-    ip: str
-    port: int
-    is_ipv6: bool = False
-
-    def __repr__(self) -> str:
-        return f"Endpoint({self.ip}:{self.port})"
+__all__ = ["Endpoint", "PeerIdParser", "PeerInfo"]
 
 
 # ---------------------------------------------------------------------------
@@ -82,13 +63,13 @@ class PeerInfo:
 
     client_name: str
     client_code: str
-    version: Optional[tuple[int, ...]] = None
-    build: Optional[int] = None
+    version: tuple[int, ...] | None = None
+    build: int | None = None
     is_debug: bool = False
-    nickname: Optional[str] = None
+    nickname: str | None = None
     peer_id_format: str = "unknown"
     raw_peer_id: bytes = b""
-    comment: Optional[str] = None
+    comment: str | None = None
 
 
 class PeerIdParser:
@@ -135,7 +116,7 @@ class PeerIdParser:
         "BF": ("Bitflu", "dash"),
         "BG": ("BTG", "dash"),  # Uses Rasterbar libtorrent
         "BR": ("BitRocket", "dash"),
-        "BS": ("BTSlave", "dash"),
+        "BS": ("BTSlave", "dash"),  # BitSpirit is detected earlier via _is_bitspirit_style
         "BX": ("Bittorrent X", "dash"),
         "CD": ("Enhanced CTorrent", "dash"),
         "CT": ("CTorrent", "dash"),
@@ -176,7 +157,7 @@ class PeerIdParser:
         "TN": ("TorrentDotNET", "dash"),
         "TR": ("Transmission", "dash"),
         "TS": ("Torrentstorm", "dash"),
-        "TT": ("TuoTu", "dash"),
+        "TT": ("TuoTu", "dash"),  # TorrenTopia is detected earlier via its own check
         "UL": ("uLeecher!", "dash"),
         "UT": ("µTorrent", "dash"),
         "UW": ("µTorrent Web", "dash"),
@@ -189,55 +170,35 @@ class PeerIdParser:
         "XT": ("XanTorrent", "dash"),
         "XX": ("Xtorrent", "dash"),
         "ZT": ("ZipTorrent", "dash"),
-
         # Shadow/BitTornado style
         "A": ("ABC", "shadow"),
         "O": ("Osprey Permaseed", "shadow"),
-        "Q": ("BTQueue", "shadow"),
         "R": ("Tribler", "shadow"),
         "S": ("Shadow's client", "shadow"),
         "T": ("BitTornado", "shadow"),
         "U": ("UPnP NAT Bit Torrent", "shadow"),
-
         # uTorrent variants (uT prefix)
         "uT": ("µTorrent", "utorrent"),
-
         # FlashGet
         "FG": ("FlashGet", "flashget"),
-
         # AllPeers
         "AP": ("AllPeers", "allpeers"),
-
         # Opera
         "OP": ("Opera", "opera"),
-
         # Queen Bee
         "Q": ("Queen Bee", "queenbee"),
-
         # BitTyrant (Azureus fork)
         "BT": ("BitTyrant", "bittyrant"),
-
-        # BitSpirit
-        "BS": ("BitSpirit", "bitspirit"),
-
         # Rufus
         "RS": ("Rufus", "rufus"),
-
         # G3 Torrent
         "G3": ("G3 Torrent", "g3"),
-
         # XBT
         "XB": ("XBT", "xbt"),
-
         # MLdonkey (starts with -ML)
         "ML": ("MLdonkey", "mldonkey"),
-
         # Bits on Wheels
         "BOW": ("Bits on Wheels", "bow"),
-
-        # TorrenTopia
-        "TT": ("TorrenTopia", "torrentopia"),
-
         # Mainline
         "M": ("Mainline", "mainline"),
     }
@@ -277,65 +238,65 @@ class PeerIdParser:
         if peer_id[0:2] == b"uT":
             return cls._parse_utorrent(peer_id)
 
-        # 3. Shadow/BitTornado style: S58B----- (single char + 4 version chars + ---)
-        if cls._is_shadow_style(peer_id):
-            return cls._parse_shadow(peer_id)
+        # 3. BitLord style: exbcLORD + version bytes (must precede BitComet's exbc check)
+        if peer_id[0:8] == b"exbcLORD":
+            return cls._parse_bitlord(peer_id)
 
         # 4. BitComet style: exbc + version bytes
         if peer_id[0:4] == b"exbc":
             return cls._parse_bitcomet(peer_id)
 
-        # 5. BitLord style: exbcLORD + version bytes
-        if peer_id[0:8] == b"exbcLORD":
-            return cls._parse_bitlord(peer_id)
-
-        # 6. XBT style: XBTxxx (d or - for debug)
+        # 5. XBT style: XBTxxx (d or - for debug)
         if peer_id[0:3] == b"XBT":
             return cls._parse_xbt(peer_id)
 
-        # 7. Opera style: OP + 4 digits build number
+        # 6. Opera style: OP + 4 digits build number (must precede Shadow's O check)
         if peer_id[0:2] == b"OP" and cls._is_opera_style(peer_id):
             return cls._parse_opera(peer_id)
 
-        # 8. MLdonkey style: -MLx.x.x-
+        # 7. BitTyrant style: AZ2500BT + random (must precede Shadow's A check)
+        if peer_id[0:8] == b"AZ2500BT":
+            return cls._parse_bittyrant(peer_id)
+
+        # 8. AllPeers style: AP + version + - (must precede Shadow's A check)
+        if peer_id[0:2] == b"AP":
+            return cls._parse_allpeers(peer_id)
+
+        # 9. Shadow/BitTornado style: S58B----- (single char + 4 version chars + ---)
+        if cls._is_shadow_style(peer_id):
+            return cls._parse_shadow(peer_id)
+
+        # 10. MLdonkey style: -MLx.x.x-
         if peer_id[0:3] == b"-ML":
             return cls._parse_mldonkey(peer_id)
 
-        # 9. Bits on Wheels style: -BOWxxx-yyyyyyyyyyyy
+        # 11. Bits on Wheels style: -BOWxxx-yyyyyyyyyyyy
         if peer_id[0:4] == b"-BOW":
             return cls._parse_bow(peer_id)
 
-        # 10. Queen Bee style: Q1-0-0--
+        # 12. Queen Bee style: Q1-0-0--
         if peer_id[0:1] == b"Q" and cls._is_queenbee_style(peer_id):
             return cls._parse_queenbee(peer_id)
 
-        # 11. BitTyrant style: AZ2500BT + random
-        if peer_id[0:6] == b"AZ2500BT":
-            return cls._parse_bittyrant(peer_id)
-
-        # 12. TorrenTopia style: 346------
+        # 13. TorrenTopia style: 346------
         if peer_id[0:3] == b"346":
             return cls._parse_torrentopia(peer_id)
 
-        # 13. BitSpirit style: \0\3BS or \0\2BS
+        # 14. BitSpirit style: \0\3BS or \0\2BS
         if cls._is_bitspirit_style(peer_id):
             return cls._parse_bitspirit(peer_id)
 
-        # 14. Rufus style: ASCII version + RS + nickname
+        # 15. Rufus style: ASCII version + RS + nickname
         if cls._is_rufus_style(peer_id):
             return cls._parse_rufus(peer_id)
 
-        # 15. G3 Torrent style: -G3 + nickname
+        # 16. G3 Torrent style: -G3 + nickname
         if peer_id[0:3] == b"-G3":
             return cls._parse_g3(peer_id)
 
-        # 16. FlashGet style: FG + version (Azureus-style without trailing -)
+        # 17. FlashGet style: FG + version (Azureus-style without trailing -)
         if peer_id[0:2] == b"FG":
             return cls._parse_flashget(peer_id)
-
-        # 17. AllPeers style: AP + version + -
-        if peer_id[0:2] == b"AP":
-            return cls._parse_allpeers(peer_id)
 
         # 18. Dash-style: -XXnnnnn- (dash + 2 char code + 6 digits + dash)
         if peer_id[0:1] == b"-" and len(peer_id) >= 10:
@@ -391,9 +352,9 @@ class PeerIdParser:
         """Parse mainline client peer ID: M4-3-6--"""
         version_parts = []
         i = 1
-        while i < len(peer_id) and peer_id[i:i + 1] != b"-":
-            if peer_id[i:i + 1].isdigit():
-                version_parts.append(int(peer_id[i:i + 1]))
+        while i < len(peer_id) and peer_id[i : i + 1] != b"-":
+            if peer_id[i : i + 1].isdigit():
+                version_parts.append(int(peer_id[i : i + 1]))
             i += 1
         i += 1  # Skip the '-'
 
@@ -589,13 +550,13 @@ class PeerIdParser:
     @classmethod
     def _parse_mldonkey(cls, peer_id: bytes) -> PeerInfo:
         """Parse MLdonkey peer ID: -MLx.x.x-"""
-        # Find the version between -ML and the trailing -
+        # Find the version between -ML and the trailing -; version starts at byte 3
         version_str = ""
-        end = peer_id.find(b"-", 4)
-        if end > 4:
-            version_str = peer_id[4:end].decode("ascii", errors="replace")
+        end = peer_id.find(b"-", 3)
+        if end > 3:
+            version_str = peer_id[3:end].decode("ascii", errors="replace")
         else:
-            version_str = peer_id[4:].decode("ascii", errors="replace")
+            version_str = peer_id[3:].decode("ascii", errors="replace")
 
         version = None
         if version_str:

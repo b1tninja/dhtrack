@@ -6,10 +6,12 @@ import pytest
 
 from dhtrack.bep53 import (
     MagnetInfo,
-    parse_magnet_uri,
-    _parse_so_parameter,
     _format_select_only,
+    _parse_so_parameter,
     create_magnet_from_torrent,
+    magnet_peer_strings_to_triplets,
+    merge_peer_triplets_preferred,
+    parse_magnet_uri,
 )
 
 
@@ -77,6 +79,70 @@ class TestMagnetInfo:
         """Upper-case hex info hash."""
         info = MagnetInfo(info_hash=b"\x01\x02\x03")
         assert info.info_hash_base16 == "010203"
+
+
+class TestMagnetPeerHints:
+    """Magnet ``pe`` → triplets and merge ordering (GUI / CLI hints)."""
+
+    def test_ipv4_triplet(self) -> None:
+        assert magnet_peer_strings_to_triplets(["192.0.2.10:6881"]) == [
+            ("192.0.2.10", 6881, False),
+        ]
+
+    def test_ipv6_bracketed(self) -> None:
+        assert magnet_peer_strings_to_triplets(["[2001:db8::1]:51413"]) == [
+            ("2001:db8::1", 51413, True),
+        ]
+
+    def test_hostname_passthrough(self) -> None:
+        assert magnet_peer_strings_to_triplets(["example.invalid:6881"]) == [
+            ("example.invalid", 6881, False),
+        ]
+
+    def test_invalid_entries_skipped(self) -> None:
+        assert (
+            magnet_peer_strings_to_triplets(
+                ["", "nocolon", "::1:not-bracket", "bad:xyz", "[no-bracket-close:89"],
+            )
+            == []
+        )
+
+    def test_merge_prepends_magnet_hints_dedupe(self) -> None:
+        first = [("10.0.0.1", 6881, False), ("10.0.0.2", 6882, False)]
+        second = [("10.0.0.2", 6882, True), ("10.0.0.3", 6883, False)]
+        assert merge_peer_triplets_preferred(first, second) == [
+            ("10.0.0.1", 6881, False),
+            ("10.0.0.2", 6882, False),
+            ("10.0.0.3", 6883, False),
+        ]
+
+    def test_parse_magnet_uri_collects_pe(self) -> None:
+        xt = "abcdef1234567890abcdef1234567890abcdef12"
+        uri = f"magnet:?xt=urn:btih:{xt}&pe=192.0.2.6:6881&pe=[2001:db8::5]:6882"
+        info = parse_magnet_uri(uri)
+        assert info.peers == ["192.0.2.6:6881", "[2001:db8::5]:6882"]
+        trip = magnet_peer_strings_to_triplets(info.peers)
+        assert trip == [
+            ("192.0.2.6", 6881, False),
+            ("2001:db8::5", 6882, True),
+        ]
+
+
+class TestCliResolveMagnetParsing:
+    """Light tests for CLI resolve target parsing."""
+
+    def test_hex_and_magnet_equivalent_btih(self) -> None:
+        from dhtrack.cli import _parse_resolve_target
+
+        h = "abcdef1234567890abcdef1234567890abcdef12"
+        a, dn_a, init_a = _parse_resolve_target(h)
+        uri = f"magnet:?xt=urn:btih:{h}&dn=My+Name&pe=192.0.2.1:7000"
+        b, dn_b, init_b = _parse_resolve_target(uri)
+        assert a == b
+        assert dn_a is None
+        assert dn_b == "My Name"
+        assert init_a == []
+        assert init_b == [("192.0.2.1", 7000)]
 
 
 class TestParseMagnetUri:
@@ -162,11 +228,15 @@ class TestCreateMagnetFromTorrent:
 
     def test_basic_magnet(self):
         """Create basic magnet URI from a torrent-like object."""
-        mock_torrent = type("MockTorrent", (), {
-            "infohash": b"\x01" * 20,
-            "name": "Test Torrent",
-            "file_count": 5,
-        })()
+        mock_torrent = type(
+            "MockTorrent",
+            (),
+            {
+                "infohash": b"\x01" * 20,
+                "name": "Test Torrent",
+                "file_count": 5,
+            },
+        )()
 
         uri = create_magnet_from_torrent(mock_torrent)
         assert uri.startswith("magnet:?")
@@ -175,21 +245,29 @@ class TestCreateMagnetFromTorrent:
 
     def test_magnet_with_select_only(self):
         """Create magnet with select-only parameter."""
-        mock_torrent = type("MockTorrent", (), {
-            "infohash": b"\x01" * 20,
-            "name": "Test Torrent",
-            "file_count": 5,
-        })()
+        mock_torrent = type(
+            "MockTorrent",
+            (),
+            {
+                "infohash": b"\x01" * 20,
+                "name": "Test Torrent",
+                "file_count": 5,
+            },
+        )()
 
         uri = create_magnet_from_torrent(mock_torrent, select_only={0, 2, 3})
         assert "so=0,2-3" in uri
 
     def test_magnet_with_trackers(self):
         """Create magnet with tracker URLs."""
-        mock_torrent = type("MockTorrent", (), {
-            "infohash": b"\x01" * 20,
-            "name": "Test Torrent",
-        })()
+        mock_torrent = type(
+            "MockTorrent",
+            (),
+            {
+                "infohash": b"\x01" * 20,
+                "name": "Test Torrent",
+            },
+        )()
 
         trackers = ["http://tracker1.example.com/announce", "http://tracker2.example.com/announce"]
         uri = create_magnet_from_torrent(mock_torrent, trackers=trackers)

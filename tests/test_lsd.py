@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import binascii
 import os
-import socket
-import threading
 import time
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from dhtrack.lsd import (
     LSD_MULTICAST_V4,
@@ -20,7 +15,6 @@ from dhtrack.lsd import (
     LSDManager,
     build_lsd_announce,
 )
-
 
 # ============================================================================
 # LSDAnnouncement Tests
@@ -145,16 +139,16 @@ class TestLSDAnnouncement:
     def test_decode_invalid_port(self):
         """Decode a packet with an invalid port."""
         infohash = os.urandom(20)
-        lines = "\r\n".join([
-            "BT-SEARCH * HTTP/1.1",
-            f"Host: {LSD_MULTICAST_V4}",
-            "Port: invalid",
-            f"Infohash: {infohash.hex()}",
-            "",
-        ])
-        parsed = LSDAnnouncement.from_bytes(
-            lines.encode("latin-1"), "127.0.0.1", 6881
+        lines = "\r\n".join(
+            [
+                "BT-SEARCH * HTTP/1.1",
+                f"Host: {LSD_MULTICAST_V4}",
+                "Port: invalid",
+                f"Infohash: {infohash.hex()}",
+                "",
+            ]
         )
+        parsed = LSDAnnouncement.from_bytes(lines.encode("latin-1"), "127.0.0.1", 6881)
         assert parsed is None
 
     def test_decode_empty_data(self):
@@ -184,16 +178,16 @@ class TestLSDAnnouncement:
 
     def test_decode_invalid_infohash_hex(self):
         """Decode a packet with invalid infohash hex."""
-        lines = "\r\n".join([
-            "BT-SEARCH * HTTP/1.1",
-            f"Host: {LSD_MULTICAST_V4}",
-            "Port: 6881",
-            "Infohash: not_hex",
-            "",
-        ])
-        parsed = LSDAnnouncement.from_bytes(
-            lines.encode("latin-1"), "127.0.0.1", 6881
+        lines = "\r\n".join(
+            [
+                "BT-SEARCH * HTTP/1.1",
+                f"Host: {LSD_MULTICAST_V4}",
+                "Port: 6881",
+                "Infohash: not_hex",
+                "",
+            ]
         )
+        parsed = LSDAnnouncement.from_bytes(lines.encode("latin-1"), "127.0.0.1", 6881)
         # Should still parse, just skip the invalid infohash
         assert parsed is not None
         assert len(parsed.infohashes) == 0
@@ -318,12 +312,12 @@ class TestLSDManager:
         manager._last_announce_time = time.time() - 10  # 10 seconds ago
 
         # First call should be rate-limited
-        with patch.object(manager, '_send_multicast'):
+        with patch.object(manager, "_send_multicast"):
             manager.send_announcement(infohashes=[os.urandom(20)])
 
         # Force update the time and try again
         manager._last_announce_time = time.time()
-        with patch.object(manager, '_send_multicast'):
+        with patch.object(manager, "_send_multicast"):
             manager.send_announcement(infohashes=[os.urandom(20)])
         # Should have been called (rate limit passed)
 
@@ -408,28 +402,28 @@ class TestMulticastGroups:
     def test_decode_host_header_detection(self):
         """Host header should determine IPv4/IPv6."""
         # IPv4 host
-        lines = "\r\n".join([
-            "BT-SEARCH * HTTP/1.1",
-            f"Host: {LSD_MULTICAST_V4}",
-            "Port: 6881",
-            "",
-        ])
-        parsed = LSDAnnouncement.from_bytes(
-            lines.encode("latin-1"), "192.168.1.100", 6881
+        lines = "\r\n".join(
+            [
+                "BT-SEARCH * HTTP/1.1",
+                f"Host: {LSD_MULTICAST_V4}",
+                "Port: 6881",
+                "",
+            ]
         )
+        parsed = LSDAnnouncement.from_bytes(lines.encode("latin-1"), "192.168.1.100", 6881)
         assert parsed is not None
         assert parsed.is_ipv6 is False
 
         # IPv6 host
-        lines = "\r\n".join([
-            "BT-SEARCH * HTTP/1.1",
-            f"Host: {LSD_MULTICAST_V6}",
-            "Port: 6881",
-            "",
-        ])
-        parsed = LSDAnnouncement.from_bytes(
-            lines.encode("latin-1"), "::1", 6881
+        lines = "\r\n".join(
+            [
+                "BT-SEARCH * HTTP/1.1",
+                f"Host: {LSD_MULTICAST_V6}",
+                "Port: 6881",
+                "",
+            ]
         )
+        parsed = LSDAnnouncement.from_bytes(lines.encode("latin-1"), "::1", 6881)
         assert parsed is not None
         assert parsed.is_ipv6 is True
 
@@ -571,7 +565,10 @@ class TestLSDIntegration:
         """Test a complete announce receive cycle."""
         config = LSDConfig()
         received = []
-        callback = lambda ann: received.append(ann)
+
+        def callback(ann):
+            return received.append(ann)
+
         manager = LSDManager(config=config, on_announcement_received=callback)
 
         # Simulate receiving an announcement
@@ -603,7 +600,7 @@ class TestLSDIntegration:
     def test_packet_size_limit(self):
         """Large announcements should be truncated to avoid MTU issues."""
         config = LSDConfig()
-        manager = LSDManager(config=config)
+        LSDManager(config=config)
 
         # Create an announcement with many infohashes
         infohashes = [os.urandom(20) for _ in range(50)]
@@ -620,15 +617,15 @@ class TestLSDIntegration:
     def test_announcement_from_bytes_handles_edge_cases(self):
         """Test edge cases in from_bytes."""
         # Empty infohash list
-        lines = "\r\n".join([
-            "BT-SEARCH * HTTP/1.1",
-            f"Host: {LSD_MULTICAST_V4}",
-            "Port: 6881",
-            "",
-        ])
-        parsed = LSDAnnouncement.from_bytes(
-            lines.encode("latin-1"), "127.0.0.1", 6881
+        lines = "\r\n".join(
+            [
+                "BT-SEARCH * HTTP/1.1",
+                f"Host: {LSD_MULTICAST_V4}",
+                "Port: 6881",
+                "",
+            ]
         )
+        parsed = LSDAnnouncement.from_bytes(lines.encode("latin-1"), "127.0.0.1", 6881)
         assert parsed is not None
         assert len(parsed.infohashes) == 0
 

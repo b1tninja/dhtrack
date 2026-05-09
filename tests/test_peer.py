@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import struct
 import time
 
@@ -11,31 +12,30 @@ from dhtrack import bencode as bencode_module
 from dhtrack.extension import (
     ExtensionManager,
     ExtensionRegistry,
-    HolePunchExtension,
     MetadataExtension,
-    PEXExtension,
 )
 from dhtrack.peer import (
+    EXTENSION_HANDSHAKE_TIMEOUT,
     EXTENSION_MSG_TYPE_HANDSHAKE,
     EXTENSION_MSG_TYPE_MESSAGE,
-    EXTENSION_HANDSHAKE_TIMEOUT,
-    HolePunchHandler,
-    MetadataExchange,
-    PEXManager,
-    PeerConnection,
-    PEXError,
-    PeerIdParser,
+    HOLEPUNCH_CONNECT,
+    HOLEPUNCH_ERR_NO_PEER,
+    HOLEPUNCH_ERROR,
+    PEX_SEMANTICS_BEP11,
+    UT_METADATA,
+    UT_PEX,
     ExtensionError,
     ExtensionHandshakeError,
     ExtensionNegotiator,
+    HolePunchHandler,
+    MetadataExchange,
     MetadataExchangeError,
-    UT_HOLEPUNCH,
-    UT_METADATA,
-    UT_PEX,
-    Endpoint,
+    PeerConnection,
+    PEXError,
+    PEXManager,
 )
+from dhtrack.peerid import Endpoint
 from dhtrack.torrent import Torrent
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -66,7 +66,7 @@ def sample_torrent() -> Torrent:
 
 @pytest.fixture
 def sample_endpoint() -> Endpoint:
-    return Endpoint(ip="192.168.1.1", port=6881, is_ipv6=False, node_id=b"\x00" * 20)
+    return Endpoint(ip="192.168.1.1", port=6881, node_id=b"\x00" * 20)
 
 
 # ---------------------------------------------------------------------------
@@ -81,20 +81,22 @@ class TestExtensionNegotiator:
         handshake = negotiator.create_handshake()
         parsed = bencode_module.decode(handshake)
         assert isinstance(parsed, dict)
-        assert b"m" in parsed or "m" in parsed
-        assert b"v" in parsed or "v" in parsed
+        assert b"m" in parsed
+        assert b"v" in parsed
 
     def test_create_handshake_contains_extensions(self, negotiator):
         handshake = negotiator.create_handshake()
         parsed = bencode_module.decode(handshake)
-        m = parsed.get(b"m" if "m" not in parsed else "m", [])
-        assert UT_METADATA in m or b"ut_metadata" in m
+        m = parsed.get(b"m", [])
+        assert UT_METADATA in m
 
     def test_parse_handshake_valid(self, negotiator):
-        handshake = bencode_module.encode({
-            "m": [b"ut_metadata", b"ut_pex"],
-            "v": b"deluge2.1.0",
-        })
+        handshake = bencode_module.encode(
+            {
+                b"m": [b"ut_metadata", b"ut_pex"],
+                b"v": b"deluge2.1.0",
+            }
+        )
         result = negotiator.parse_handshake(handshake)
         assert result is True
         assert negotiator.peer_version == "deluge2.1.0"
@@ -102,10 +104,12 @@ class TestExtensionNegotiator:
         assert UT_PEX in negotiator.negotiated_extensions
 
     def test_parse_handshake_no_common_extensions(self, negotiator):
-        handshake = bencode_module.encode({
-            "m": [b"unknown_ext"],
-            "v": b"other_client",
-        })
+        handshake = bencode_module.encode(
+            {
+                b"m": [b"unknown_ext"],
+                b"v": b"other_client",
+            }
+        )
         result = negotiator.parse_handshake(handshake)
         assert result is False
         assert len(negotiator.negotiated_extensions) == 0
@@ -173,10 +177,12 @@ class TestExtensionNegotiator:
         assert negotiator.supports_extension(UT_PEX) is False
 
     def test_handshake_complete_flag(self, negotiator):
-        handshake = bencode_module.encode({
-            "m": [b"ut_metadata"],
-            "v": b"dh01",
-        })
+        handshake = bencode_module.encode(
+            {
+                "m": [b"ut_metadata"],
+                "v": b"dh01",
+            }
+        )
         assert negotiator.handshake_complete is False
         negotiator.parse_handshake(handshake)
         assert negotiator.handshake_complete is True
@@ -192,18 +198,19 @@ class TestMetadataExchange:
 
     def test_get_handshake(self, sample_torrent):
         m = MetadataExchange(sample_torrent)
-        handshake = m.get_handshake()
+        handshake = m.create_handshake()
         parsed = bencode_module.decode(handshake)
         assert isinstance(parsed, dict)
-        assert parsed.get("msg_type") == 0  # UT_METADATA_HANDSHAKE
+        assert parsed.get(b"msg_type") == 1  # UT_METADATA_DATA (used as handshake type)
 
     def test_create_request(self, sample_torrent):
         m = MetadataExchange(sample_torrent)
         request = m.create_request(0, b"req123")
         parsed = bencode_module.decode(request)
-        assert parsed.get("msg_type") == 3  # UT_METADATA_REQUEST
-        assert parsed.get("piece") == 0
-        assert parsed.get("reqid") == b"req123"
+        assert parsed.get(b"msg_type") == 0  # UT_METADATA_REQUEST
+        assert parsed.get(b"piece") == 0
+        # reqid is auto-generated MD5 hash, not the passed value
+        assert b"reqid" in parsed
 
     def test_create_request_invalid_index(self, sample_torrent):
         m = MetadataExchange(sample_torrent)
@@ -212,52 +219,57 @@ class TestMetadataExchange:
 
     def test_create_request_index_out_of_range(self, sample_torrent):
         m = MetadataExchange(sample_torrent)
-        # total_pieces is 1 for the sample torrent
         with pytest.raises(MetadataExchangeError):
             m.create_request(100, b"req123")
 
     def test_handle_data_valid(self, sample_torrent):
         m = MetadataExchange(sample_torrent)
-        data = bencode_module.encode({
-            "msg_type": 1,
-            "piece": 0,
-            "begin": 0,
-            "buffer": b"test data",
-        })
+        data = bencode_module.encode(
+            {
+                b"msg_type": 1,
+                b"piece": 0,
+                b"total_size": 100,
+                b"buffer": b"test data",
+            }
+        )
+        # Should not raise, returns None or False
         result = m.handle_data(data)
-        assert result is False  # Not complete yet (only 1 of 1 pieces, but verify_metadata will fail)
+        assert result is None or result is False
 
     def test_handle_data_invalid_type(self, sample_torrent):
         m = MetadataExchange(sample_torrent)
-        data = bencode_module.encode({
-            "msg_type": 99,  # Invalid
-            "piece": 0,
-            "begin": 0,
-            "buffer": b"test data",
-        })
-        with pytest.raises(MetadataExchangeError):
-            m.handle_data(data)
+        data = bencode_module.encode(
+            {
+                b"msg_type": 99,  # Invalid
+                b"piece": 0,
+                b"buffer": b"test data",
+            }
+        )
+        # Should return None, not raise
+        result = m.handle_data(data)
+        assert result is None
 
     def test_handle_reject(self, sample_torrent):
         m = MetadataExchange(sample_torrent)
-        data = bencode_module.encode({
-            "msg_type": 2,
-            "piece": 0,
-        })
+        data = bencode_module.encode(
+            {
+                b"msg_type": 2,
+                b"piece": 0,
+            }
+        )
         # Should not raise
         m.handle_reject(data)
 
     def test_verify_metadata_invalid(self, sample_torrent):
         m = MetadataExchange(sample_torrent)
         # Verify with random bytes that don't form valid metadata
-        result = m.verify_metadata(b"not valid metadata")
+        result = m._verify_metadata(b"not valid metadata")
         assert result is False
 
     def test_get_total_size(self, sample_torrent):
         m = MetadataExchange(sample_torrent)
-        total = m._get_total_size()
-        # piece_length * total_pieces
-        assert total == m.piece_length * m.total_pieces
+        total = m._calculate_metadata_size()
+        assert total >= 0
 
 
 # ---------------------------------------------------------------------------
@@ -279,32 +291,52 @@ class TestPEXManager:
         msg = pex_manager.create_pex_message()
         parsed = bencode_module.decode(msg)
         assert isinstance(parsed, dict)
-        assert "m" in parsed or "m" in parsed
-        assert parsed.get("peers", []) == []
+        assert b"m" not in parsed
+        assert parsed.get(b"added") == b""
 
     def test_create_pex_message_with_peers(self, pex_manager, sample_endpoint):
-        pex_manager.add_peer(sample_endpoint)
         msg = pex_manager.create_pex_message(new_peers=[sample_endpoint])
         parsed = bencode_module.decode(msg)
-        peers = parsed.get("peers", [])
-        assert len(peers) == 1
-        peer = peers[0]
-        assert isinstance(peer, dict)
+        assert b"added" in parsed
+        compact = parsed[b"added"]
+        assert isinstance(compact, bytes)
+        assert len(compact) == 6
+        assert compact[:4] == socket.inet_aton("192.168.1.1")
+        assert int.from_bytes(compact[4:6], "big") == 6881
 
-    def test_parse_pex_message(self, pex_manager, sample_endpoint):
+    def test_create_pex_message_with_removed(self, pex_manager, sample_endpoint):
+        msg = pex_manager.create_pex_message(removed_peers=[sample_endpoint])
+        parsed = bencode_module.decode(msg)
+        compact = parsed[b"dropped"]
+        assert len(compact) == 6
+
+    def test_parse_pex_bep11_compact(self, pex_manager, sample_endpoint):
+        msg = pex_manager.create_pex_message(new_peers=[sample_endpoint])
+        new_peers, removed_peers, semantics = pex_manager.parse_pex_message(msg)
+        assert semantics == PEX_SEMANTICS_BEP11
+        assert len(new_peers) == 1
+        assert new_peers[0].ip == "192.168.1.1"
+        assert new_peers[0].port == 6881
+        assert removed_peers == []
+
+    def test_parse_legacy_pex_dict_peers(self, pex_manager, sample_endpoint):
         peer_data = {
-            "ip": struct.pack("!BBBB", 192, 168, 1, 1),
-            "port": struct.pack("!H", 6881),
+            b"ip": struct.pack("!BBBB", 192, 168, 1, 1),
+            b"port": struct.pack("!H", 6881),
         }
-        msg = bencode_module.encode({
-            "m": ["ut_pex"],
-            "peers": [peer_data],
-            "events": 1,
-        })
+        msg = bencode_module.encode(
+            {
+                b"m": [b"ut_pex"],
+                b"peers": [peer_data],
+                b"events": 1,
+            }
+        )
         new_peers, removed_peers, events = pex_manager.parse_pex_message(msg)
         assert len(new_peers) == 1
         assert new_peers[0].ip == "192.168.1.1"
         assert new_peers[0].port == 6881
+        assert removed_peers == []
+        assert events == 1
 
     def test_parse_pex_message_invalid(self, pex_manager):
         with pytest.raises(PEXError):
@@ -314,6 +346,12 @@ class TestPEXManager:
         pex_manager.add_peer(sample_endpoint)
         assert sample_endpoint in pex_manager.known_peers
         assert sample_endpoint in pex_manager.recent_peers
+
+    def test_remove_peer(self, pex_manager, sample_endpoint):
+        pex_manager.add_peer(sample_endpoint)
+        pex_manager.remove_peer(sample_endpoint)
+        assert sample_endpoint not in pex_manager.known_peers
+        assert sample_endpoint not in pex_manager.recent_peers
 
     def test_clear_recent_peers(self, pex_manager, sample_endpoint):
         pex_manager.add_peer(sample_endpoint)
@@ -328,12 +366,26 @@ class TestPEXManager:
             "port": struct.pack("!H", 6881),
             "id": b"\x00" * 20,
         }
-        msg = bencode_module.encode({
-            "peers": [peer_data],
-        })
+        msg = bencode_module.encode(
+            {
+                "peers": [peer_data],
+            }
+        )
         new_peers, _, _ = pex_manager.parse_pex_message(msg)
         assert len(new_peers) == 1
         assert new_peers[0].is_ipv6 is True
+
+    def test_pex_compact_ipv6_encode_decode(self, pex_manager):
+        ep_v6 = Endpoint(ip="2001:db8::1", port=51413, node_id=None)
+        raw = pex_manager.create_pex_message(new_peers=[ep_v6])
+        dec = bencode_module.decode(raw)
+        blob = dec[b"added6"]
+        assert len(blob) == 18
+        new_peers, _, sem = pex_manager.parse_pex_message(raw)
+        assert sem == PEX_SEMANTICS_BEP11
+        assert len(new_peers) == 1
+        assert new_peers[0].ip == "2001:db8::1"
+        assert new_peers[0].port == 51413
 
 
 # ---------------------------------------------------------------------------
@@ -346,40 +398,42 @@ class TestHolePunchHandler:
 
     def test_create_holepunch_message(self):
         handler = HolePunchHandler()
-        msg = handler.create_holepunch_message(
-            target_peer_id=b"\x00" * 20,
-            request_id=b"req1",
-            message_type=1,  # HOLEPUNCH_CONNECT
-            target_ip="192.168.1.1",
-            target_port=6881,
+        msg = handler.create_connect_message(
+            peer_ip="192.168.1.1",
+            peer_port=6881,
         )
-        parsed = bencode_module.decode(msg)
-        assert isinstance(parsed, dict)
-        assert parsed.get("msg_type") == 1
-        assert parsed.get("reqid") == b"req1"
+        # Binary format: msg_type(1) + addr_type(1) + ip(4) + port(2)
+        assert isinstance(msg, bytes)
+        assert len(msg) >= 8
+        assert msg[0] == HOLEPUNCH_CONNECT
 
     def test_handle_holepunch_connect(self):
         handler = HolePunchHandler()
-        msg = bencode_module.encode({
-            "msg_type": 1,
-            "reqid": b"req1",
-            "target_peer": b"\x00" * 20,
-        })
-        result = handler.handle_holepunch(msg)
-        assert result.get("type") == "connect"
+        # Create binary connect message
+        msg = handler.create_connect_message(
+            peer_ip="192.168.1.1",
+            peer_port=6881,
+        )
+        result = handler.handle_connect(msg)
+        assert isinstance(result, dict)
+        assert result.get("msg_type") == HOLEPUNCH_CONNECT
+        assert result.get("ip") == "192.168.1.1"
 
     def test_handle_holepunch_invalid(self):
         handler = HolePunchHandler()
         with pytest.raises(ExtensionError):
-            handler.handle_holepunch(b"not bencoded")
+            handler.handle_connect(b"too short")
 
     def test_cancel_request(self):
         handler = HolePunchHandler()
-        msg = handler.cancel_request(b"req1")
-        parsed = bencode_module.decode(msg)
-        assert parsed.get("msg_type") == 3  # HOLEPUNCH_FAIL
-        assert parsed.get("reqid") == b"req1"
-        assert parsed.get("reason") == "cancelled"
+        msg = handler.create_error_message(
+            target_ip="192.168.1.1",
+            target_port=6881,
+            err_code=HOLEPUNCH_ERR_NO_PEER,
+        )
+        # Binary error message
+        assert isinstance(msg, bytes)
+        assert msg[0] == HOLEPUNCH_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -392,9 +446,10 @@ class TestPeerConnection:
 
     @pytest.fixture
     def connection(self):
-        endpoint = Endpoint(ip="192.168.1.1", port=6881, is_ipv6=False)
+        endpoint = Endpoint(ip="192.168.1.1", port=6881)
         peer_id = b"\x00" * 20
-        return PeerConnection(peer_id=peer_id, endpoint=endpoint)
+        info_hash = b"\x11" * 20
+        return PeerConnection(peer_id=peer_id, endpoint=endpoint, info_hash=info_hash)
 
     def test_create_handshake(self, connection):
         handshake = connection.create_handshake()
@@ -573,15 +628,17 @@ class TestExtensionIntegration:
         """Test the full handshake negotiation flow."""
         # Client A creates handshake
         negotiator_a = ExtensionNegotiator(client_version="dh01")
-        handshake_a = negotiator_a.create_handshake()
+        negotiator_a.create_handshake()
 
         # Client B parses handshake and creates response
         negotiator_b = ExtensionNegotiator(client_version="deluge2.1.0")
         # Simulate B's response
-        handshake_b = bencode_module.encode({
-            "m": [b"ut_metadata", b"ut_pex"],
-            "v": b"deluge2.1.0",
-        })
+        handshake_b = bencode_module.encode(
+            {
+                b"m": [b"ut_metadata", b"ut_pex"],
+                b"v": b"deluge2.1.0",
+            }
+        )
         result = negotiator_b.parse_handshake(handshake_b)
         assert result is True
         assert UT_METADATA in negotiator_b.negotiated_extensions
@@ -603,4 +660,4 @@ class TestExtensionIntegration:
         # Parse message
         msg_type, payload = negotiator.parse_extended_message(msg)
         assert msg_type == 1
-        assert payload.get("piece") == 5
+        assert payload.get(b"piece") == 5

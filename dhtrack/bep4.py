@@ -25,6 +25,13 @@ DHT Extension Message IDs
 
 Message types used with BEP 6 (DHT support).
 
+BEP 10 - Extension Protocol
+===========================
+
+BEP 10 specifies that bit 4 (0x10) in reserved[5] indicates LTEP (Libtorrent
+Extension Protocol) support. This is the correct location for the extension
+protocol flag, NOT reserved[7] as was previously used.
+
 References
 ----------
 - BEP-4: https://www.bittorrent.org/beps/bep_0004.html
@@ -34,10 +41,6 @@ References
 """
 
 from __future__ import annotations
-
-import struct
-from typing import Optional
-
 
 # ============================================================================
 # Reserved Byte Constants (BEP-4)
@@ -49,25 +52,24 @@ RESERVED_AZUREUS_MSG = 0x80  # Bit 7 (0x80) in reserved[0]
 # reserved[2] - BitTorrent Location-aware Protocol (no known implementations)
 RESERVED_LOCATION_AWARE = 0x08  # Bit 3 (0x08) in reserved[2]
 
-# reserved[5] - Extension Protocol Bits
-RESERVED_LTEP = 0x10  # Bit 4 (0x10) in reserved[5] - Libtorrent Extension Protocol
-RESERVED_EXT_NEGOTIATION_HIGH = 0x02  # Bit 1 (0x02) in reserved[5] - Extension Negotiation
-RESERVED_EXT_NEGOTIATION_LOW = 0x01  # Bit 0 (0x01) in reserved[5] - Extension Negotiation
+# reserved[5] - Extension Protocol Bits (BEP 10)
+# BEP 10 specifies that bit 4 (0x10) in reserved[5] indicates LTEP support
+RESERVED_LTEP = 0x10  # Bit 4 (0x10) in reserved[5] - LTEP (BEP 10)
+RESERVED_EXT_NEGOTIATION_HIGH = 0x02  # Bit 1 (0x02) in reserved[5]
+RESERVED_EXT_NEGOTIATION_LOW = 0x01  # Bit 0 (0x01) in reserved[5]
 
 # reserved[7] - DHT and Other Extensions
 RESERVED_DHT = 0x01  # Bit 0 (0x01) in reserved[7] - BitTorrent DHT
 RESERVED_PEER_EXCHANGE = 0x02  # Bit 1 (0x02) in reserved[7] - XBT Peer Exchange
 RESERVED_FAST_EXTENSIONS = 0x04  # Bit 2 (0x04) in reserved[7] - Fast extensions
 RESERVED_NAT_TRAVERSAL = 0x08  # Bit 3 (0x08) in reserved[7] - NAT Traversal
-RESERVED_HYBRID_TORRENT_LEGACY = 0x10  # Bit 4 (0x10) in reserved[7] - Hybrid torrent legacy to v2 upgrade
+RESERVED_HYBRID_TORRENT_LEGACY = 0x10  # Bit 4 (0x10) in reserved[7] - Hybrid torrent legacy
 
 # Known collision flags
 RESERVED_BITCOMET_MSG = 0xFF  # reserved[0] - BitComet Extension Protocol
 RESERVED_BITCOMET_EXT = 0xFF  # reserved[1] - BitComet Extension Protocol
 RESERVED_XBT_METADATA_EXCHANGE = 0x01  # reserved[7] - XBT Metadata Exchange (known collision)
 
-# BEP 10 support flag (Bit 2 in reserved[7])
-RESERVED_BEP10 = 0x04
 
 # ============================================================================
 # BEP 3 - Core Protocol Message IDs
@@ -115,44 +117,54 @@ MSG_HASH_REJECT = 0x17
 # ============================================================================
 
 # Set of all core protocol message IDs
-CORE_MESSAGE_IDS = frozenset({
-    MSG_CHOKE,
-    MSG_UNCHOKE,
-    MSG_INTERESTED,
-    MSG_NOT_INTERESTED,
-    MSG_HAVE,
-    MSG_BITFIELD,
-    MSG_REQUEST,
-    MSG_PIECE,
-    MSG_CANCEL,
-})
+CORE_MESSAGE_IDS = frozenset(
+    {
+        MSG_CHOKE,
+        MSG_UNCHOKE,
+        MSG_INTERESTED,
+        MSG_NOT_INTERESTED,
+        MSG_HAVE,
+        MSG_BITFIELD,
+        MSG_REQUEST,
+        MSG_PIECE,
+        MSG_CANCEL,
+    }
+)
 
 # Set of all fast extension message IDs
-FAST_EXTENSION_MESSAGE_IDS = frozenset({
-    MSG_SUGGEST,
-    MSG_HAVE_ALL,
-    MSG_HAVE_NONE,
-    MSG_REJECT_REQUEST,
-    MSG_ALLOWED_FAST,
-})
+FAST_EXTENSION_MESSAGE_IDS = frozenset(
+    {
+        MSG_SUGGEST,
+        MSG_HAVE_ALL,
+        MSG_HAVE_NONE,
+        MSG_REJECT_REQUEST,
+        MSG_ALLOWED_FAST,
+    }
+)
 
 # Set of all DHT extension message IDs
-DHT_EXTENSION_MESSAGE_IDS = frozenset({
-    MSG_PORT,
-})
+DHT_EXTENSION_MESSAGE_IDS = frozenset(
+    {
+        MSG_PORT,
+    }
+)
 
 # Set of all deployed extension message IDs
-DEPLOYED_EXTENSION_MESSAGE_IDS = frozenset({
-    MSG_LTEP_HANDSHAKE,
-})
+DEPLOYED_EXTENSION_MESSAGE_IDS = frozenset(
+    {
+        MSG_LTEP_HANDSHAKE,
+    }
+)
 
 # Complete set of all known BitTorrent message IDs
-ALL_KNOWN_MESSAGE_IDS = frozenset({
-    *CORE_MESSAGE_IDS,
-    *FAST_EXTENSION_MESSAGE_IDS,
-    *DHT_EXTENSION_MESSAGE_IDS,
-    *DEPLOYED_EXTENSION_MESSAGE_IDS,
-})
+ALL_KNOWN_MESSAGE_IDS = frozenset(
+    {
+        *CORE_MESSAGE_IDS,
+        *FAST_EXTENSION_MESSAGE_IDS,
+        *DHT_EXTENSION_MESSAGE_IDS,
+        *DEPLOYED_EXTENSION_MESSAGE_IDS,
+    }
+)
 
 # Message type names for display/debugging
 MESSAGE_NAMES: dict[int, str] = {
@@ -211,13 +223,9 @@ def is_reserved_bit_set(reserved_byte: int, flag: int) -> bool:
         If the parameters are out of valid range.
     """
     if not (0 <= reserved_byte <= 255):
-        raise InvalidReservedByteError(
-            f"reserved_byte must be 0-255, got {reserved_byte}"
-        )
+        raise InvalidReservedByteError(f"reserved_byte must be 0-255, got {reserved_byte}")
     if not (flag & (flag - 1) == 0) or flag == 0:
-        raise InvalidReservedByteError(
-            f"flag must be a power of 2, got {flag}"
-        )
+        raise InvalidReservedByteError(f"flag must be a power of 2, got {flag}")
     return bool(reserved_byte & flag)
 
 
@@ -242,13 +250,9 @@ def set_reserved_bit(reserved_byte: int, flag: int) -> int:
         If the parameters are out of valid range.
     """
     if not (0 <= reserved_byte <= 255):
-        raise InvalidReservedByteError(
-            f"reserved_byte must be 0-255, got {reserved_byte}"
-        )
+        raise InvalidReservedByteError(f"reserved_byte must be 0-255, got {reserved_byte}")
     if not (flag & (flag - 1) == 0) or flag == 0:
-        raise InvalidReservedByteError(
-            f"flag must be a power of 2, got {flag}"
-        )
+        raise InvalidReservedByteError(f"flag must be a power of 2, got {flag}")
     return reserved_byte | flag
 
 
@@ -273,13 +277,9 @@ def clear_reserved_bit(reserved_byte: int, flag: int) -> int:
         If the parameters are out of valid range.
     """
     if not (0 <= reserved_byte <= 255):
-        raise InvalidReservedByteError(
-            f"reserved_byte must be 0-255, got {reserved_byte}"
-        )
+        raise InvalidReservedByteError(f"reserved_byte must be 0-255, got {reserved_byte}")
     if not (flag & (flag - 1) == 0) or flag == 0:
-        raise InvalidReservedByteError(
-            f"flag must be a power of 2, got {flag}"
-        )
+        raise InvalidReservedByteError(f"flag must be a power of 2, got {flag}")
     return reserved_byte & ~flag
 
 
@@ -367,6 +367,11 @@ def is_dht_extension_message(msg_type: int) -> bool:
 def decode_reserved_bytes(reserved: bytes) -> dict[str, bool]:
     """Decode all 8 reserved bytes into named flags.
 
+    Per BEP-4 and BEP-10:
+    - reserved[5] bit 4 (0x10) = LTEP (Extension Protocol) per BEP 10
+    - reserved[7] bit 0 (0x01) = DHT
+    - reserved[7] bit 2 (0x04) = Fast Extensions
+
     Parameters
     ----------
     reserved : bytes
@@ -383,9 +388,7 @@ def decode_reserved_bytes(reserved: bytes) -> dict[str, bool]:
         If the reserved bytes are not exactly 8 bytes.
     """
     if len(reserved) != 8:
-        raise InvalidReservedByteError(
-            f"reserved bytes must be 8 bytes, got {len(reserved)}"
-        )
+        raise InvalidReservedByteError(f"reserved bytes must be 8 bytes, got {len(reserved)}")
 
     result: dict[str, bool] = {}
 
@@ -395,10 +398,9 @@ def decode_reserved_bytes(reserved: bytes) -> dict[str, bool]:
     # reserved[2]
     result["location_aware_protocol"] = is_reserved_bit_set(reserved[2], 0x08)
 
-    # reserved[5]
+    # reserved[5] - BEP 10 Extension Protocol flag is at bit 4 (0x10)
     result["ltep"] = is_reserved_bit_set(reserved[5], 0x10)
-    result["ext_negotiation"] = is_reserved_bit_set(reserved[5], 0x02) or \
-        is_reserved_bit_set(reserved[5], 0x01)
+    result["ext_negotiation"] = is_reserved_bit_set(reserved[5], 0x02) or is_reserved_bit_set(reserved[5], 0x01)
 
     # reserved[7]
     result["dht"] = is_reserved_bit_set(reserved[7], 0x01)
@@ -406,7 +408,6 @@ def decode_reserved_bytes(reserved: bytes) -> dict[str, bool]:
     result["fast_extensions"] = is_reserved_bit_set(reserved[7], 0x04)
     result["nat_traversal"] = is_reserved_bit_set(reserved[7], 0x08)
     result["hybrid_torrent_legacy"] = is_reserved_bit_set(reserved[7], 0x10)
-    result["bep10"] = is_reserved_bit_set(reserved[7], 0x04)
 
     return result
 
@@ -425,7 +426,7 @@ def make_handshake_reserved(
     support_fast_extensions : bool
         Set the fast extensions flag (reserved[7] bit 2).
     support_bep10 : bool
-        Set the BEP 10 flag (reserved[7] bit 2).
+        Set the BEP 10/LTEP flag (reserved[5] bit 4, 0x10).
 
     Returns
     -------
@@ -441,6 +442,7 @@ def make_handshake_reserved(
         reserved[7] = set_reserved_bit(reserved[7], RESERVED_FAST_EXTENSIONS)
 
     if support_bep10:
-        reserved[7] = set_reserved_bit(reserved[7], RESERVED_BEP10)
+        # BEP 10 flag is at reserved[5] bit 4 (0x10), NOT reserved[7]
+        reserved[5] = set_reserved_bit(reserved[5], RESERVED_LTEP)
 
     return bytes(reserved)

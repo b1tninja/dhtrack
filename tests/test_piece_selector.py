@@ -80,7 +80,7 @@ class TestPieceSelector(unittest.TestCase):
         # byte 0: 10110000 = bits 7,5,4 set = pieces 0,2,3
         # Use a cleaner bitfield: byte = 11100001
         # bit 7 (piece 0): 1 = have
-        # bit 6 (piece 1): 1 = have  
+        # bit 6 (piece 1): 1 = have
         # bit 5 (piece 2): 1 = have
         # bits 4-1 (pieces 3-6): 0 = missing
         # bit 0 (piece 7): 1 = have
@@ -203,7 +203,7 @@ class TestPieceSelectorEdgeCases(unittest.TestCase):
     def test_empty_bitfield_all_missing(self):
         """Test with empty bitfield (all missing)."""
         selector = PieceSelector(total_pieces=10)
-        result = selector.select_rarest_with_gap(b"", {i: 1 for i in range(10)}, 10)
+        result = selector.select_rarest_with_gap(b"", dict.fromkeys(range(10), 1), 10)
         self.assertIsNotNone(result)
 
     def test_fill_in_gaps_below_threshold(self):

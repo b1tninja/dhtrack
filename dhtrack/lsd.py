@@ -36,8 +36,8 @@ import socket
 import struct
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ LSD_MULTICAST_V4 = "239.192.152.143"
 LSD_MULTICAST_V6 = "ff15::efc0:988f"
 LSD_PORT = 6771
 
-#announce timing
+# announce timing
 LSD_ANNOUNCE_INTERVAL = 300  # 5 minutes in seconds (while participating in a swarm)
 LSD_MIN_ANNOUNCE_INTERVAL = 60  # 60 seconds between announces (rate limit)
 LSD_MAX_PACKET_SIZE = 1400  # Max packet size to avoid MTU fragmentation
@@ -86,9 +86,9 @@ class LSDAnnouncement:
     host: str
     port: int
     infohashes: list[bytes] = field(default_factory=list)
-    cookie: Optional[str] = None
-    source_ip: Optional[str] = None
-    source_port: Optional[int] = None
+    cookie: str | None = None
+    source_ip: str | None = None
+    source_port: int | None = None
     is_ipv6: bool = False
 
     def to_bytes(self) -> bytes:
@@ -115,7 +115,7 @@ class LSDAnnouncement:
         return "\r\n".join(lines).encode("latin-1")
 
     @staticmethod
-    def from_bytes(data: bytes, source_ip: str, source_port: int) -> Optional["LSDAnnouncement"]:
+    def from_bytes(data: bytes, source_ip: str, source_port: int) -> LSDAnnouncement | None:
         """Parse an LSD announcement from a UDP packet.
 
         Parameters
@@ -224,8 +224,8 @@ class LSDConfig:
 
     listen_port: int = 6881
     infohashes: list[bytes] = field(default_factory=list)
-    cookie: Optional[str] = None
-    multicast_interface: Optional[str] = None
+    cookie: str | None = None
+    multicast_interface: str | None = None
     ttl: int = 1
     enabled: bool = True
 
@@ -260,20 +260,23 @@ class LSDManager:
 
     def __init__(
         self,
-        config: Optional[LSDConfig] = None,
-        on_announcement_received: Optional[Callable[[LSDAnnouncement], None]] = None,
+        config: LSDConfig | None = None,
+        on_announcement_received: Callable[[LSDAnnouncement], None] | None = None,
     ) -> None:
         self.config = config or LSDConfig()
         self.on_announcement_received = on_announcement_received
-        self._sock_v4: Optional[socket.socket] = None
-        self._sock_v6: Optional[socket.socket] = None
+        self._sock_v4: socket.socket | None = None
+        self._sock_v6: socket.socket | None = None
         self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
         # Timing
         self._last_announce_time: float = 0.0
-        self._last_multicast_group: Optional[str] = None
+        self._last_multicast_group: str | None = None
+
+        # BEP 27: infohashes for private torrents — never announced, never accepted
+        self._private_infohashes: set[bytes] = set()
 
         # Peer discovery results: (ip, port, infohash) -> timestamp
         self._discovered_peers: dict[tuple[str, int, bytes], float] = {}
@@ -316,8 +319,7 @@ class LSDManager:
                     )
                     self._thread.start()
 
-                    logger.info("LSD manager started (IPv4=%s, IPv6=%s)",
-                                bool(self._sock_v4), bool(self._sock_v6))
+                    logger.info("LSD manager started (IPv4=%s, IPv6=%s)", bool(self._sock_v4), bool(self._sock_v6))
                     return True
 
         except OSError as exc:
@@ -364,12 +366,28 @@ class LSDManager:
             New list of 20-byte infohashes to announce.
         """
         with self._lock:
-            self.config.infohashes = [
-                ih for ih in infohashes
-                if len(ih) == 20
-            ]
+            self.config.infohashes = [ih for ih in infohashes if len(ih) == 20]
 
-    def send_announcement(self, infohashes: Optional[list[bytes]] = None) -> None:
+    def set_private(self, info_hash: bytes, private: bool) -> None:
+        """Mark or unmark an infohash as belonging to a private torrent (BEP 27).
+
+        Private infohashes are silently excluded from outbound LSD announces and
+        from inbound peer-discovery results, per BEP 27.
+
+        Parameters
+        ----------
+        info_hash : bytes
+            20-byte infohash to mark.
+        private : bool
+            True to suppress LSD for this hash; False to restore normal behaviour.
+        """
+        with self._lock:
+            if private:
+                self._private_infohashes.add(info_hash)
+            else:
+                self._private_infohashes.discard(info_hash)
+
+    def send_announcement(self, infohashes: list[bytes] | None = None) -> None:
         """Send an LSD announcement for the given infohashes.
 
         If infohashes is None, uses the configured infohashes.
@@ -396,6 +414,10 @@ class LSDManager:
             self._last_announce_time = now
 
         announce_hashes = infohashes or self.config.infohashes
+        # BEP 27: exclude private-torrent infohashes from LSD announces
+        with self._lock:
+            private = self._private_infohashes.copy()
+        announce_hashes = [ih for ih in announce_hashes if ih not in private]
         if not announce_hashes:
             return
 
@@ -434,10 +456,7 @@ class LSDManager:
         # Filter out old discoveries (> 10 minutes)
         cutoff = now - 600
         with self._lock:
-            self._discovered_peers = {
-                k: v for k, v in self._discovered_peers.items()
-                if v >= cutoff
-            }
+            self._discovered_peers = {k: v for k, v in self._discovered_peers.items() if v >= cutoff}
         return list(self._discovered_peers.keys())
 
     # -------------------------------------------------------------------
@@ -569,6 +588,14 @@ class LSDManager:
 
         logger.info("Received LSD announcement: %s", announcement)
 
+        # BEP 27: drop any infohashes that belong to private torrents
+        with self._lock:
+            private = self._private_infohashes.copy()
+        announcement.infohashes = [ih for ih in announcement.infohashes if ih not in private]
+        if not announcement.infohashes:
+            logger.debug("LSD announcement from %s contains only private infohashes; ignored", source_ip)
+            return
+
         # Store discovered peer
         now = time.time()
         for ih in announcement.infohashes:
@@ -591,7 +618,7 @@ class LSDManager:
 def build_lsd_announce(
     port: int,
     infohashes: list[bytes],
-    cookie: Optional[str] = None,
+    cookie: str | None = None,
 ) -> bytes:
     """Build a BEP-14 LSD announce packet.
 

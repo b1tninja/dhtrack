@@ -1,0 +1,24 @@
+# Run the GitHub Actions "lint" job locally (parity with `.github/workflows/ci.yml`).
+#
+# Usage (from repo root):
+#   docker compose -f compose.lint.yml run --rm lint
+#
+# Matches: ruff check, ruff format --check, black --check, isort --check, mypy.
+# mypy reads [tool.mypy] in pyproject.toml (excludes dhtrack/gui; ignores known noisy modules).
+
+services:
+  lint:
+    image: python:3.12-bookworm
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    command: >
+      bash -lc "
+      set -euo pipefail
+      pip install --disable-pip-version-check -q ruff black 'isort>=5.13' mypy &&
+      ruff check dhtrack/ tests/ &&
+      ruff format --check dhtrack/ tests/ &&
+      black --check dhtrack/ tests/ &&
+      isort --check dhtrack/ tests/ &&
+      mypy dhtrack/
+      "

@@ -14,8 +14,14 @@ b'lle3:hei5:helloi42ee'
 
 from __future__ import annotations
 
-import struct
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
+# Per-token decode trace (integers, strings, each dict key). Off unless set to DEBUG:
+#   logging.getLogger("dhtrack.bencode.steps").setLevel(logging.DEBUG)
+_steps = logging.getLogger(__name__ + ".steps")
+_steps.setLevel(logging.WARNING)
 
 
 class BEncodeError(Exception):
@@ -30,14 +36,37 @@ class EncodeError(BEncodeError):
     """Raised when an object cannot be encoded."""
 
 
-# Type aliases for BEncoded data
+# Type aliases for BEncoded data.
+#
+# IMPORTANT: Bencoded data (the raw serialized form) is always `bytes`.
+# When bencode decodes byte strings from the wire, they remain as `bytes`.
+# When encoding, byte strings (`bytes`) are the canonical form -- avoid
+# using `str` for bencoded values whenever possible to prevent unnecessary
+# bytes↔str conversions.
+#
+# BEncodeRaw     -- raw serialized bencode bytes (the wire format)
+# BEncodeInt     -- integer values (Python `int`)
+# BEncodeBytes   -- raw byte strings from bencode (Python `bytes`)
+# BEncodeString  -- UTF-8 strings that will be encoded as bytes (use sparingly)
+# BEncodeList    -- list of bencode values
+# BEncodeDict    -- dict with bytes keys mapping to bencode values
+#                  (decoded dictionaries MUST use bytes keys; do not accept str keys)
+# BEncodeValue   -- any valid bencode value
+# BEncodeItem    -- tuple of (key, value) for dictionary encoding
+
+BEncodeRaw = bytes
 BEncodeInt = int
 BEncodeBytes = bytes
 BEncodeString = str
 BEncodeList = list[Any]
-BEncodeDict = dict[str, Any]
+BEncodeDict = dict[bytes, Any]
 BEncodeValue = BEncodeInt | BEncodeBytes | BEncodeString | BEncodeList | BEncodeDict
 BEncodeItem = tuple[str, BEncodeValue]
+
+
+def _decode_buffer(buffer: bytes | bytearray) -> bytes:
+    """Internal parsers use ``bytes`` only; copy once when callers pass ``bytearray``."""
+    return bytes(buffer) if isinstance(buffer, bytearray) else buffer
 
 
 def decode(buffer: bytes | bytearray) -> BEncodeValue:
@@ -59,9 +88,13 @@ def decode(buffer: bytes | bytearray) -> BEncodeValue:
         If the buffer is malformed or contains unsupported types.
     """
     if not buffer:
+        logger.debug("Decode rejected: empty buffer")
         raise DecodeError("Empty buffer")
 
-    parsed, _ = _decode_item(buffer, 0)
+    logger.debug("Decoding %d bytes of bencode data", len(buffer))
+    buf = _decode_buffer(buffer)
+    parsed, _ = _decode_item(buf, 0)
+    logger.debug("Decoded value type: %s", type(parsed).__name__)
     return parsed
 
 
@@ -83,7 +116,8 @@ def decode_item(buffer: bytes | bytearray, offset: int = 0) -> tuple[BEncodeValu
     if offset >= len(buffer):
         raise DecodeError(f"Buffer exhausted at offset {offset}")
 
-    parsed, new_offset = _decode_item(buffer, offset)
+    buf = _decode_buffer(buffer)
+    parsed, new_offset = _decode_item(buf, offset)
     return parsed, new_offset
 
 
@@ -111,13 +145,13 @@ def encode(value: BEncodeValue) -> bytes:
         raise EncodeError(f"Cannot encode value: {type(value).__name__}") from exc
 
 
-def _decode_item(buffer: bytes | bytearray, offset: int) -> tuple[BEncodeValue, int]:
+def _decode_item(buffer: bytes, offset: int) -> tuple[BEncodeValue, int]:
     """Internal: decode a single BEncode item from buffer at offset.
 
     Parameters
     ----------
-    buffer : bytes | bytearray
-        The raw BEncode buffer.
+    buffer : bytes
+        The raw BEncode buffer (callers normalize via :func:`_decode_buffer`).
     offset : int
         The byte offset to start parsing from.
 
@@ -132,109 +166,154 @@ def _decode_item(buffer: bytes | bytearray, offset: int) -> tuple[BEncodeValue, 
     byte = buffer[offset]
 
     # Integer: i<digits>e
-    if byte == ord(b'i'):
+    if byte == ord(b"i"):
         return _decode_integer(buffer, offset)
 
     # Byte string: <length>:<data>
-    if ord(b'0') <= byte <= ord(b'9'):
+    if ord(b"0") <= byte <= ord(b"9"):
         return _decode_string(buffer, offset)
 
     # Dictionary: d<items>e
-    if byte == ord(b'd'):
+    if byte == ord(b"d"):
         return _decode_dict(buffer, offset)
 
     # List: l<items>e
-    if byte == ord(b'l'):
+    if byte == ord(b"l"):
         return _decode_list(buffer, offset)
 
     raise DecodeError(f"Unexpected byte 0x{byte:02x} at offset {offset}")
 
 
-def _decode_integer(buffer: bytes | bytearray, offset: int) -> tuple[BEncodeInt, int]:
+def _decode_integer(buffer: bytes, offset: int) -> tuple[BEncodeInt, int]:
     """Decode an integer from BEncode format.
 
     Format: i<digits>e
     """
     start = offset + 1  # skip 'i'
-    end = buffer.index(ord(b'e'), start)
+    try:
+        end = buffer.index(ord(b"e"), start)
+    except ValueError:
+        logger.debug("Unterminated integer at offset %d: no closing 'e'", offset)
+        raise DecodeError(f"Unterminated integer at offset {offset}") from None
 
     try:
         value = int(buffer[start:end])
     except ValueError:
-        raise DecodeError(f"Invalid integer at offset {offset}")
+        logger.debug("Invalid integer at offset %d: %r", offset, buffer[start:end])
+        raise DecodeError(f"Invalid integer at offset {offset}") from None
 
+    _steps.debug(
+        "Decoded integer i%sie at offset %d: %d",
+        buffer[start:end].decode("ascii"),
+        offset,
+        value,
+    )
     return value, end + 1
 
 
-def _decode_string(buffer: bytes | bytearray, offset: int) -> tuple[BEncodeBytes, int]:
+def _decode_string(buffer: bytes, offset: int) -> tuple[BEncodeBytes, int]:
     """Decode a byte string from BEncode format.
 
     Format: <length>:<data>
     """
-    colon = buffer.index(ord(b':'), offset)
+    try:
+        colon = buffer.index(ord(b":"), offset)
+    except ValueError:
+        logger.debug("Unterminated string at offset %d: no colon found", offset)
+        raise DecodeError(f"Unterminated string at offset {offset}") from None
 
     try:
         length = int(buffer[offset:colon])
     except ValueError:
-        raise DecodeError(f"Invalid string length at offset {offset}")
+        logger.debug("Invalid string length at offset %d: %r", offset, buffer[offset:colon])
+        raise DecodeError(f"Invalid string length at offset {offset}") from None
 
     if length < 0:
+        logger.debug("Negative string length at offset %d: %d", offset, length)
         raise DecodeError(f"Negative string length at offset {offset}")
 
     start = colon + 1
     end = start + length
 
     if end > len(buffer):
+        logger.debug("String extends beyond buffer: need %d, have %d at offset %d", end, len(buffer), offset)
         raise DecodeError(f"String extends beyond buffer (need {end}, have {len(buffer)})")
 
+    _steps.debug(
+        "Decoded byte string length %d at offset %d (first 32 bytes: %r)",
+        length,
+        offset,
+        buffer[start : start + 32],
+    )
     return buffer[start:end], end
 
 
-def _decode_dict(buffer: bytes | bytearray, offset: int) -> tuple[BEncodeDict, int]:
+def _decode_dict(buffer: bytes, offset: int) -> tuple[BEncodeDict, int]:
     """Decode a dictionary from BEncode format.
 
     Format: d<key><value><key><value>...e
-    Keys are always byte strings.
+    Keys are raw byte strings (bencoded as length-prefixed bytes).
+    Keys are stored as bytes in the decoded dict, sorted by raw bytes.
     """
     start = offset + 1  # skip 'd'
-    result: dict[str, Any] = {}
+    result: dict[bytes, Any] = {}
+    item_count = 0
 
     while True:
         if start >= len(buffer):
+            logger.debug("Dictionary not terminated, reached end of buffer at offset %d", start)
             raise DecodeError("Dictionary not terminated")
 
         # Check for termination
-        if buffer[start] == ord(b'e'):
+        if buffer[start] == ord(b"e"):
+            _steps.debug("Decoded dictionary with %d keys at offset %d", item_count, offset)
             return result, start + 1
 
-        # Decode key
+        # Decode key (keys are bencoded byte strings)
         key, start = _decode_string(buffer, start)
-        key_str = key.decode('latin-1')  # BEncode keys are raw bytes, use latin-1 for compatibility
 
         # Decode value
         value, start = _decode_item(buffer, start)
-        result[key_str] = value
+        result[key] = value
+        item_count += 1
+
+        _steps.debug(
+            "Decoded dict entry key=%r value_type=%s offset_after=%d",
+            key,
+            type(value).__name__,
+            start,
+        )
 
     raise DecodeError("Unreachable")
 
 
-def _decode_list(buffer: bytes | bytearray, offset: int) -> tuple[BEncodeList, int]:
+def _decode_list(buffer: bytes, offset: int) -> tuple[BEncodeList, int]:
     """Decode a list from BEncode format.
 
     Format: l<items>e
     """
     start = offset + 1  # skip 'l'
     result: list[Any] = []
+    item_count = 0
 
     while True:
         if start >= len(buffer):
+            logger.debug("List not terminated, reached end of buffer at offset %d", start)
             raise DecodeError("List not terminated")
 
-        if buffer[start] == ord(b'e'):
+        if buffer[start] == ord(b"e"):
+            _steps.debug("Decoded list with %d items at offset %d", item_count, offset)
             return result, start + 1
 
         value, start = _decode_item(buffer, start)
         result.append(value)
+        item_count += 1
+        _steps.debug(
+            "Decoded list item %d (type: %s) at offset %d",
+            item_count,
+            type(value).__name__,
+            start,
+        )
 
     raise DecodeError("Unreachable")
 
@@ -275,7 +354,7 @@ def _encode_bytes(value: bytes) -> bytes:
 
     Format: <length>:<data>
     """
-    return f"{len(value)}:".encode('ascii') + value
+    return f"{len(value)}:".encode("ascii") + value
 
 
 def _encode_int(value: int) -> bytes:
@@ -283,13 +362,13 @@ def _encode_int(value: int) -> bytes:
 
     Format: i<digits>e
     """
-    return f"i{value}e".encode('ascii')
+    return f"i{value}e".encode("ascii")
 
 
 def _encode_str(value: str) -> bytes:
     """Encode a string as a BEncode byte string (UTF-8 encoded)."""
-    encoded = value.encode('utf-8')
-    return f"{len(encoded)}:".encode('ascii') + encoded
+    encoded = value.encode("utf-8")
+    return f"{len(encoded)}:".encode("ascii") + encoded
 
 
 def _encode_list(value: list) -> bytes:
@@ -297,11 +376,19 @@ def _encode_list(value: list) -> bytes:
 
     Format: l<items>e
     """
-    result = bytearray(b'l')
+    result = bytearray(b"l")
     for item in value:
         result.extend(_encode_item(item))
-    result.extend(b'e')
+    result.extend(b"e")
     return bytes(result)
+
+
+def _encode_list_as_str(value: list) -> bytes:
+    """Encode a Python list containing a single list value (for test compatibility).
+
+    This helper encodes the outer container and inner items properly.
+    """
+    return _encode_list(value)
 
 
 def _encode_dict(value: dict) -> bytes:
@@ -309,15 +396,19 @@ def _encode_dict(value: dict) -> bytes:
 
     Format: d<key><value><key><value>...e
 
-    Keys are sorted by their UTF-8 byte representation, as required
-    by the BitTorrent specification.
+    Keys are sorted by their raw byte representation, as required
+    by BEP 3 (The BitTorrent Protocol Specification):
+    "Keys must be strings and appear in sorted order (sorted as raw strings, not alphanumerics)."
     """
-    result = bytearray(b'd')
+    result = bytearray(b"d")
 
-    # Sort keys by their byte representation
-    for key in sorted(value.keys(), key=lambda k: k.encode('utf-8')):
-        result.extend(_encode_bytes(key.encode('utf-8')))
+    # Sort keys by raw bytes (BEP 3: "sorted as raw strings")
+    sorted_keys = sorted(value.keys(), key=lambda k: k if isinstance(k, bytes) else k.encode("utf-8"))
+
+    for key in sorted_keys:
+        key_bytes = key if isinstance(key, bytes) else key.encode("utf-8")
+        result.extend(_encode_bytes(key_bytes))
         result.extend(_encode_item(value[key]))
 
-    result.extend(b'e')
+    result.extend(b"e")
     return bytes(result)

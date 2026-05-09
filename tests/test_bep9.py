@@ -7,21 +7,20 @@ protocol for BitTorrent's extension protocol.
 from __future__ import annotations
 
 import hashlib
+
 import pytest
 
+from dhtrack import bencode as bencode_module
 from dhtrack.peer import (
-    MetadataExchange,
-    MetadataExchangeError,
-    UT_METADATA,
-    UT_METADATA_REQUEST,
+    MAX_METADATA_SIZE,
+    METADATA_BLOCK_SIZE,
     UT_METADATA_DATA,
     UT_METADATA_REJECT,
-    METADATA_BLOCK_SIZE,
-    MAX_METADATA_SIZE,
+    UT_METADATA_REQUEST,
+    MetadataExchange,
+    MetadataExchangeError,
 )
-from dhtrack import bencode as bencode_module
 from dhtrack.torrent import Torrent
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -128,10 +127,10 @@ class TestMetadataExchangeHandshake:
         handshake_bytes = mex.create_handshake()
         handshake = bencode_module.decode(handshake_bytes)
 
-        assert "msg_type" in handshake
-        assert handshake["msg_type"] == UT_METADATA_DATA  # 1
-        assert "total_size" in handshake
-        assert handshake["total_size"] == mex.metadata_size
+        assert b"msg_type" in handshake
+        assert handshake[b"msg_type"] == UT_METADATA_DATA  # 1
+        assert b"total_size" in handshake
+        assert handshake[b"total_size"] == mex.metadata_size
 
     def test_parse_handshake(self):
         """Should parse a valid handshake."""
@@ -142,8 +141,8 @@ class TestMetadataExchangeHandshake:
         parsed = mex.parse_handshake(handshake_bytes)
 
         assert parsed is not None
-        assert parsed["msg_type"] == UT_METADATA_DATA
-        assert parsed["total_size"] == mex.metadata_size
+        assert parsed[b"msg_type"] == UT_METADATA_DATA
+        assert parsed[b"total_size"] == mex.metadata_size
 
     def test_parse_invalid_handshake(self):
         """Should return None for invalid handshake."""
@@ -168,10 +167,10 @@ class TestMetadataExchangeRequest:
         request_bytes = mex.create_request(0, b"peer_id_test")
         request = bencode_module.decode(request_bytes)
 
-        assert request["msg_type"] == UT_METADATA_REQUEST  # 0
-        assert request["piece"] == 0
-        assert "reqid" in request
-        assert len(request["reqid"]) == 4
+        assert request[b"msg_type"] == UT_METADATA_REQUEST  # 0
+        assert request[b"piece"] == 0
+        assert b"reqid" in request
+        assert len(request[b"reqid"]) == 4
 
     def test_create_request_invalid_piece(self):
         """Should raise error for invalid piece index."""
@@ -192,7 +191,7 @@ class TestMetadataExchangeRequest:
         for i in range(mex.num_pieces):
             req_bytes = mex.create_request(i, b"peer_id_test")
             req = bencode_module.decode(req_bytes)
-            assert req["piece"] == i
+            assert req[b"piece"] == i
 
 
 # ---------------------------------------------------------------------------
@@ -211,11 +210,11 @@ class TestMetadataExchangeData:
         data_bytes = mex.create_data_message(0)
         data = bencode_module.decode(data_bytes)
 
-        assert data["msg_type"] == UT_METADATA_DATA  # 1
-        assert data["piece"] == 0
-        assert data["total_size"] == mex.metadata_size
-        assert "buffer" in data
-        assert isinstance(data["buffer"], bytes)
+        assert data[b"msg_type"] == UT_METADATA_DATA  # 1
+        assert data[b"piece"] == 0
+        assert data[b"total_size"] == mex.metadata_size
+        assert b"buffer" in data
+        assert isinstance(data[b"buffer"], bytes)
 
     def test_create_data_message_invalid_piece(self):
         """Should raise error for invalid piece index."""
@@ -239,7 +238,7 @@ class TestMetadataExchangeData:
 
         # For a single-piece metadata, should return True
         # since the metadata is complete and verified
-        assert result is not None
+        assert result is True
 
     def test_handle_data_with_peer_tracking(self):
         """Should track received data per peer."""
@@ -251,8 +250,8 @@ class TestMetadataExchangeData:
         result2 = mex.handle_data(data_bytes, peer_id=b"peer2")
 
         # Both peers should receive the data
-        assert result1 is not None
-        assert result2 is not None
+        assert result1 is True
+        assert result2 is True
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +268,9 @@ class TestMetadataExchangeReject:
         reject_bytes = mex.create_reject_message(0)
         reject = bencode_module.decode(reject_bytes)
 
-        assert reject["msg_type"] == UT_METADATA_REJECT  # 2
-        assert reject["piece"] == 0
-        assert "reqid" in reject
+        assert reject[b"msg_type"] == UT_METADATA_REJECT  # 2
+        assert reject[b"piece"] == 0
+        assert b"reqid" in reject
 
     def test_handle_reject_message(self):
         """Should handle a reject message without errors."""
@@ -305,7 +304,7 @@ class TestMetadataExchangeFullTransfer:
 
         # Receiver should have the complete metadata
         assert receiver_mex.metadata is not None
-        assert receiver_mex.is_complete()
+        assert receiver_mex.is_complete() is True
 
     def test_metadata_verification(self):
         """Metadata should be verified against info hash."""
@@ -324,7 +323,6 @@ class TestMetadataExchangeFullTransfer:
         assert receiver_mex.metadata is not None
         # Per BEP 9, the metadata is the info dict itself (not wrapped in 'info' key)
         metadata_dict = bencode_module.decode(receiver_mex.metadata)
-        import hashlib
         info_hash = hashlib.sha1(bencode_module.encode(metadata_dict)).digest()
         assert info_hash == torrent.infohash
 
@@ -342,7 +340,7 @@ class TestMetadataExchangeFullTransfer:
 
         assert response_bytes is not None
         response = bencode_module.decode(response_bytes)
-        assert response["msg_type"] == UT_METADATA_DATA
+        assert response[b"msg_type"] == UT_METADATA_DATA
 
     def test_incomplete_metadata_not_returned(self):
         """Incomplete metadata should not be returned."""
@@ -364,16 +362,18 @@ class TestMetadataExchangeEdgeCases:
         """Request handling without metadata should return reject."""
         mex = MetadataExchange()
 
-        request_bytes = bencode_module.encode({
-            "msg_type": UT_METADATA_REQUEST,
-            "piece": 0,
-            "reqid": b"\x00\x00\x00\x00",
-        })
+        request_bytes = bencode_module.encode(
+            {
+                b"msg_type": UT_METADATA_REQUEST,
+                b"piece": 0,
+                b"reqid": b"\x00\x00\x00\x00",
+            }
+        )
 
         result = mex.handle_request(request_bytes)
         assert result is not None
         result_decoded = bencode_module.decode(result)
-        assert result_decoded["msg_type"] == UT_METADATA_REJECT
+        assert result_decoded[b"msg_type"] == UT_METADATA_REJECT
 
     def test_empty_peer_id(self):
         """Should handle empty peer ID."""
@@ -382,7 +382,7 @@ class TestMetadataExchangeEdgeCases:
 
         data_bytes = mex.create_data_message(0)
         result = mex.handle_data(data_bytes, peer_id=b"")
-        assert result is not None
+        assert result is True
 
     def test_handle_invalid_data_message(self):
         """Should handle malformed data messages gracefully."""
@@ -391,7 +391,7 @@ class TestMetadataExchangeEdgeCases:
         result = mex.handle_data(b"not bencoded")
         assert result is None
 
-        result = mex.handle_data(bencode_module.encode({"msg_type": 99}))
+        result = mex.handle_data(bencode_module.encode({b"msg_type": 99}))
         assert result is None
 
     def test_handle_exceedingly_large_metadata(self):
@@ -400,12 +400,14 @@ class TestMetadataExchangeEdgeCases:
         mex = MetadataExchange(torrent=torrent)
 
         large_size = MAX_METADATA_SIZE + 1
-        large_data = bencode_module.encode({
-            "msg_type": UT_METADATA_DATA,
-            "piece": 0,
-            "total_size": large_size,
-            "buffer": b"x" * 100,
-        })
+        large_data = bencode_module.encode(
+            {
+                b"msg_type": UT_METADATA_DATA,
+                b"piece": 0,
+                b"total_size": large_size,
+                b"buffer": b"x" * 100,
+            }
+        )
 
         result = mex.handle_data(large_data, peer_id=b"test")
         assert result is None
@@ -426,5 +428,5 @@ class TestMetadataExchangeEdgeCases:
         counter_before = mex.msg_counter
         mex.create_request(0, b"peer1")
         assert mex.msg_counter == counter_before + 1
-        mex.create_request(1, b"peer2")
+        mex.create_request(0, b"peer2")
         assert mex.msg_counter == counter_before + 2

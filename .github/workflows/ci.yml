@@ -75,8 +75,14 @@ jobs:
           mypy dhtrack/
 
   build:
-    runs-on: ubuntu-22.04
     needs: [test, lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -87,14 +93,24 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Build package
+      - name: Build source distribution and wheel (PEP 517)
         run: |
           python -m pip install --upgrade pip
-          pip install build
+          python -m pip install build
           python -m build --sdist --wheel
 
-      - name: Upload artifact
+      - name: Build wheelhouse with PyQt6 (PEP 508 extra gui)
+        run: |
+          python -m pip wheel ".[gui]" -w wheelhouse
+
+      - name: Upload distribution artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dhtrack-dist
+          name: dhtrack-dist-${{ runner.os }}
           path: dist/
+
+      - name: Upload PyQt6 wheelhouse (dhtrack + GUI deps)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dhtrack-wheelhouse-pyqt6-${{ runner.os }}
+          path: wheelhouse/

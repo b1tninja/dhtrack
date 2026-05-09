@@ -9,26 +9,27 @@ This module tests:
 - HolePunchExtension integration
 """
 
-import pytest
 import struct
 
+import pytest
+
+from dhtrack.extension import HolePunchExtension
 from dhtrack.peer import (
-    HolePunchHandler,
-    encode_holepunch_message,
-    decode_holepunch_message,
-    HOLEPUNCH_RENDEZVOUS,
-    HOLEPUNCH_CONNECT,
-    HOLEPUNCH_ERROR,
     HOLEPUNCH_ADDR_IPV4,
     HOLEPUNCH_ADDR_IPV6,
+    HOLEPUNCH_CONNECT,
     HOLEPUNCH_ERR_NO_PEER,
-    HOLEPUNCH_ERR_NOT_CONNECTED,
-    HOLEPUNCH_ERR_NO_SUPPORT,
     HOLEPUNCH_ERR_NO_SELF,
+    HOLEPUNCH_ERR_NO_SUPPORT,
+    HOLEPUNCH_ERR_NOT_CONNECTED,
+    HOLEPUNCH_ERROR,
+    HOLEPUNCH_RENDEZVOUS,
     ExtensionError,
+    HolePunchHandler,
+    decode_holepunch_message,
+    encode_holepunch_message,
 )
 from dhtrack.peerid import Endpoint
-from dhtrack.extension import HolePunchExtension
 
 
 class TestEncodeHolePunchMessage:
@@ -36,9 +37,7 @@ class TestEncodeHolePunchMessage:
 
     def test_encode_rendezvous_ipv4(self):
         """Test encoding a rendezvous message with IPv4."""
-        payload = encode_holepunch_message(
-            HOLEPUNCH_RENDEZVOUS, "192.168.1.1", 6881
-        )
+        payload = encode_holepunch_message(HOLEPUNCH_RENDEZVOUS, "192.168.1.1", 6881)
 
         # Verify structure: msg_type(1) + addr_type(1) + ip(4) + port(2) = 8 bytes
         assert len(payload) == 8
@@ -51,9 +50,7 @@ class TestEncodeHolePunchMessage:
 
     def test_encode_rendezvous_ipv6(self):
         """Test encoding a rendezvous message with IPv6."""
-        payload = encode_holepunch_message(
-            HOLEPUNCH_RENDEZVOUS, "2001:db8::1", 6881
-        )
+        payload = encode_holepunch_message(HOLEPUNCH_RENDEZVOUS, "2001:db8::1", 6881)
 
         # IPv6: msg_type(1) + addr_type(1) + ip(16) + port(2) = 20 bytes
         assert len(payload) == 20
@@ -65,9 +62,7 @@ class TestEncodeHolePunchMessage:
 
     def test_encode_connect_ipv4(self):
         """Test encoding a connect message with IPv4."""
-        payload = encode_holepunch_message(
-            HOLEPUNCH_CONNECT, "10.0.0.1", 50000
-        )
+        payload = encode_holepunch_message(HOLEPUNCH_CONNECT, "10.0.0.1", 50000)
 
         assert len(payload) == 8
         assert payload[0] == HOLEPUNCH_CONNECT
@@ -75,9 +70,7 @@ class TestEncodeHolePunchMessage:
 
     def test_encode_error_ipv4(self):
         """Test encoding an error message with IPv4."""
-        payload = encode_holepunch_message(
-            HOLEPUNCH_ERROR, "192.168.1.1", 6881, HOLEPUNCH_ERR_NO_PEER
-        )
+        payload = encode_holepunch_message(HOLEPUNCH_ERROR, "192.168.1.1", 6881, HOLEPUNCH_ERR_NO_PEER)
 
         # Error: msg_type(1) + addr_type(1) + ip(4) + port(2) + err_code(4) = 12 bytes
         assert len(payload) == 12
@@ -89,9 +82,7 @@ class TestEncodeHolePunchMessage:
 
     def test_encode_error_ipv6(self):
         """Test encoding an error message with IPv6."""
-        payload = encode_holepunch_message(
-            HOLEPUNCH_ERROR, "2001:db8::1", 6881, HOLEPUNCH_ERR_NO_SUPPORT
-        )
+        payload = encode_holepunch_message(HOLEPUNCH_ERROR, "2001:db8::1", 6881, HOLEPUNCH_ERR_NO_SUPPORT)
 
         # Error IPv6: msg_type(1) + addr_type(1) + ip(16) + port(2) + err_code(4) = 24 bytes
         assert len(payload) == 24
@@ -122,9 +113,7 @@ class TestDecodeHolePunchMessage:
 
     def test_decode_rendezvous_ipv4(self):
         """Test decoding a rendezvous message with IPv4."""
-        payload = encode_holepunch_message(
-            HOLEPUNCH_RENDEZVOUS, "192.168.1.1", 6881
-        )
+        payload = encode_holepunch_message(HOLEPUNCH_RENDEZVOUS, "192.168.1.1", 6881)
         decoded = decode_holepunch_message(payload)
 
         assert decoded["msg_type"] == HOLEPUNCH_RENDEZVOUS
@@ -135,9 +124,7 @@ class TestDecodeHolePunchMessage:
 
     def test_decode_connect_ipv6(self):
         """Test decoding a connect message with IPv6."""
-        payload = encode_holepunch_message(
-            HOLEPUNCH_CONNECT, "2001:db8::1", 50000
-        )
+        payload = encode_holepunch_message(HOLEPUNCH_CONNECT, "2001:db8::1", 50000)
         decoded = decode_holepunch_message(payload)
 
         assert decoded["msg_type"] == HOLEPUNCH_CONNECT
@@ -147,9 +134,7 @@ class TestDecodeHolePunchMessage:
 
     def test_decode_error_ipv4(self):
         """Test decoding an error message with IPv4."""
-        payload = encode_holepunch_message(
-            HOLEPUNCH_ERROR, "10.0.0.1", 8080, HOLEPUNCH_ERR_NOT_CONNECTED
-        )
+        payload = encode_holepunch_message(HOLEPUNCH_ERROR, "10.0.0.1", 8080, HOLEPUNCH_ERR_NOT_CONNECTED)
         decoded = decode_holepunch_message(payload)
 
         assert decoded["msg_type"] == HOLEPUNCH_ERROR
@@ -164,7 +149,7 @@ class TestDecodeHolePunchMessage:
 
     def test_decode_invalid_msg_type(self):
         """Test that invalid message types raise ExtensionError."""
-        invalid_payload = bytearray(b"\xFF\x00")
+        invalid_payload = bytearray(b"\xff\x00")
         invalid_payload.extend(b"\xc0\xa8\x01\x01")
         invalid_payload.extend(struct.pack("!H", 6881))
 
@@ -173,7 +158,7 @@ class TestDecodeHolePunchMessage:
 
     def test_decode_invalid_addr_type(self):
         """Test that invalid address types raise ExtensionError."""
-        invalid_payload = bytearray(b"\x00\xFF")  # invalid addr_type
+        invalid_payload = bytearray(b"\x00\xff")  # invalid addr_type
         invalid_payload.extend(b"\xc0\xa8\x01\x01")
         invalid_payload.extend(struct.pack("!H", 6881))
 
@@ -225,9 +210,7 @@ class TestHolePunchHandler:
     def test_create_error_message(self):
         """Test creating an error message."""
         handler = HolePunchHandler()
-        payload = handler.create_error_message(
-            "192.168.1.1", 6881, HOLEPUNCH_ERR_NO_PEER
-        )
+        payload = handler.create_error_message("192.168.1.1", 6881, HOLEPUNCH_ERR_NO_PEER)
 
         assert len(payload) == 12
         assert payload[0] == HOLEPUNCH_ERROR
@@ -287,9 +270,7 @@ class TestHolePunchHandler:
     def test_handle_error(self):
         """Test handling an error message."""
         handler = HolePunchHandler()
-        payload = handler.create_error_message(
-            "192.168.1.1", 6881, HOLEPUNCH_ERR_NO_SUPPORT
-        )
+        payload = handler.create_error_message("192.168.1.1", 6881, HOLEPUNCH_ERR_NO_SUPPORT)
 
         decoded = handler.handle_error(payload)
 
@@ -300,21 +281,21 @@ class TestHolePunchHandler:
 
     def test_is_self_address_true(self):
         """Test is_self_address returns True for matching address."""
-        endpoint = Endpoint(ip="192.168.1.1", port=6881, is_ipv6=False)
+        endpoint = Endpoint(ip="192.168.1.1", port=6881)
         handler = HolePunchHandler(endpoint=endpoint)
 
         assert handler.is_self_address("192.168.1.1", 6881) is True
 
     def test_is_self_address_false_ip(self):
         """Test is_self_address returns False for different IP."""
-        endpoint = Endpoint(ip="192.168.1.1", port=6881, is_ipv6=False)
+        endpoint = Endpoint(ip="192.168.1.1", port=6881)
         handler = HolePunchHandler(endpoint=endpoint)
 
         assert handler.is_self_address("10.0.0.1", 6881) is False
 
     def test_is_self_address_false_port(self):
         """Test is_self_address returns False for different port."""
-        endpoint = Endpoint(ip="192.168.1.1", port=6881, is_ipv6=False)
+        endpoint = Endpoint(ip="192.168.1.1", port=6881)
         handler = HolePunchHandler(endpoint=endpoint)
 
         assert handler.is_self_address("192.168.1.1", 9000) is False
@@ -410,9 +391,7 @@ class TestHolePunchExtension:
         handler = HolePunchHandler()
         ext = HolePunchExtension(handler)
 
-        payload = handler.create_error_message(
-            "192.168.1.1", 6881, HOLEPUNCH_ERR_NOT_CONNECTED
-        )
+        payload = handler.create_error_message("192.168.1.1", 6881, HOLEPUNCH_ERR_NOT_CONNECTED)
         result = ext.on_message(2, payload)  # msg_type 2 = ERROR
 
         assert result is None
@@ -443,36 +422,28 @@ class TestAllErrorCodes:
     def test_err_no_peer(self):
         """Test HOLEPUNCH_ERR_NO_PEER."""
         handler = HolePunchHandler()
-        payload = handler.create_error_message(
-            "192.168.1.1", 6881, HOLEPUNCH_ERR_NO_PEER
-        )
+        payload = handler.create_error_message("192.168.1.1", 6881, HOLEPUNCH_ERR_NO_PEER)
         decoded = decode_holepunch_message(payload)
         assert decoded["err_code"] == HOLEPUNCH_ERR_NO_PEER
 
     def test_err_not_connected(self):
         """Test HOLEPUNCH_ERR_NOT_CONNECTED."""
         handler = HolePunchHandler()
-        payload = handler.create_error_message(
-            "192.168.1.1", 6881, HOLEPUNCH_ERR_NOT_CONNECTED
-        )
+        payload = handler.create_error_message("192.168.1.1", 6881, HOLEPUNCH_ERR_NOT_CONNECTED)
         decoded = decode_holepunch_message(payload)
         assert decoded["err_code"] == HOLEPUNCH_ERR_NOT_CONNECTED
 
     def test_err_no_support(self):
         """Test HOLEPUNCH_ERR_NO_SUPPORT."""
         handler = HolePunchHandler()
-        payload = handler.create_error_message(
-            "192.168.1.1", 6881, HOLEPUNCH_ERR_NO_SUPPORT
-        )
+        payload = handler.create_error_message("192.168.1.1", 6881, HOLEPUNCH_ERR_NO_SUPPORT)
         decoded = decode_holepunch_message(payload)
         assert decoded["err_code"] == HOLEPUNCH_ERR_NO_SUPPORT
 
     def test_err_no_self(self):
         """Test HOLEPUNCH_ERR_NO_SELF."""
         handler = HolePunchHandler()
-        payload = handler.create_error_message(
-            "192.168.1.1", 6881, HOLEPUNCH_ERR_NO_SELF
-        )
+        payload = handler.create_error_message("192.168.1.1", 6881, HOLEPUNCH_ERR_NO_SELF)
         decoded = decode_holepunch_message(payload)
         assert decoded["err_code"] == HOLEPUNCH_ERR_NO_SELF
 
@@ -484,9 +455,7 @@ class TestHolePunchProtocolFlow:
         """Test the rendezvous message flow."""
         # Initiator creates rendezvous message
         initiator_handler = HolePunchHandler()
-        rendezvous_payload = initiator_handler.create_rendezvous_message(
-            "192.168.1.100", 6881
-        )
+        rendezvous_payload = initiator_handler.create_rendezvous_message("192.168.1.100", 6881)
 
         # Relay receives and processes rendezvous
         relay_handler = HolePunchHandler()
@@ -520,10 +489,12 @@ class TestHolePunchProtocolFlow:
         handler = HolePunchHandler()
 
         # Create error for various reasons
-        for err_code in [HOLEPUNCH_ERR_NO_PEER, HOLEPUNCH_ERR_NOT_CONNECTED,
-                         HOLEPUNCH_ERR_NO_SUPPORT, HOLEPUNCH_ERR_NO_SELF]:
-            payload = handler.create_error_message(
-                "192.168.1.1", 6881, err_code
-            )
+        for err_code in [
+            HOLEPUNCH_ERR_NO_PEER,
+            HOLEPUNCH_ERR_NOT_CONNECTED,
+            HOLEPUNCH_ERR_NO_SUPPORT,
+            HOLEPUNCH_ERR_NO_SELF,
+        ]:
+            payload = handler.create_error_message("192.168.1.1", 6881, err_code)
             decoded = handler.handle_error(payload)
             assert decoded["err_code"] == err_code

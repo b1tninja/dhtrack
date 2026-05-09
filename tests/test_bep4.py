@@ -1,4 +1,9 @@
-"""Tests for BEP-4 constants and utilities (BEP-4: Assigned Numbers)."""
+"""Tests for BEP-4 constants and utilities (BEP-4: Assigned Numbers).
+
+Imports cover message ID sets, reserved bytes, and LTEP/DHT/fast extensions (BEP
+4/6/10/16-related constants).  RESERVED_BEP10 was superseded by RESERVED_LTEP
+(0x10 at ``reserved[5]`` bit 4) for LTEP identification.
+"""
 
 from __future__ import annotations
 
@@ -6,52 +11,45 @@ import unittest
 
 from dhtrack import bep4
 from dhtrack.bep4 import (
-    BEP4Error,
-    InvalidReservedByteError,
-    InvalidMessageTypeError,
-    # Core protocol message types
-    MSG_CHOKE,
-    MSG_UNCHOKE,
-    MSG_INTERESTED,
-    MSG_NOT_INTERESTED,
-    MSG_HAVE,
-    MSG_BITFIELD,
-    MSG_REQUEST,
-    MSG_PIECE,
-    MSG_CANCEL,
-    # BEP 6 / BEP 16 message types
-    MSG_PORT,
-    MSG_SUGGEST,
-    MSG_HAVE_ALL,
-    MSG_HAVE_NONE,
-    MSG_REJECT_REQUEST,
+    ALL_KNOWN_MESSAGE_IDS,
+    CORE_MESSAGE_IDS,
+    DEPLOYED_EXTENSION_MESSAGE_IDS,
+    DHT_EXTENSION_MESSAGE_IDS,
+    FAST_EXTENSION_MESSAGE_IDS,
+    MESSAGE_NAMES,
     MSG_ALLOWED_FAST,
-    # BEP 10
-    MSG_LTEP_HANDSHAKE,
-    # Hash Transfer Protocol
+    MSG_BITFIELD,
+    MSG_CANCEL,
+    MSG_CHOKE,
+    MSG_HASH_REJECT,
     MSG_HASH_REQUEST,
     MSG_HASH_REQUESTS,
-    MSG_HASH_REJECT,
-    # Reserved byte constants
+    MSG_HAVE,
+    MSG_HAVE_ALL,
+    MSG_HAVE_NONE,
+    MSG_INTERESTED,
+    MSG_LTEP_HANDSHAKE,
+    MSG_NOT_INTERESTED,
+    MSG_PIECE,
+    MSG_PORT,
+    MSG_REJECT_REQUEST,
+    MSG_REQUEST,
+    MSG_SUGGEST,
+    MSG_UNCHOKE,
     RESERVED_AZUREUS_MSG,
+    RESERVED_BITCOMET_EXT,
+    RESERVED_BITCOMET_MSG,
+    RESERVED_DHT,
+    RESERVED_FAST_EXTENSIONS,
+    RESERVED_HYBRID_TORRENT_LEGACY,
     RESERVED_LOCATION_AWARE,
     RESERVED_LTEP,
-    RESERVED_DHT,
-    RESERVED_PEER_EXCHANGE,
-    RESERVED_FAST_EXTENSIONS,
     RESERVED_NAT_TRAVERSAL,
-    RESERVED_HYBRID_TORRENT_LEGACY,
-    RESERVED_BITCOMET_MSG,
-    RESERVED_BITCOMET_EXT,
+    RESERVED_PEER_EXCHANGE,
     RESERVED_XBT_METADATA_EXCHANGE,
-    RESERVED_BEP10,
-    # Sets
-    CORE_MESSAGE_IDS,
-    FAST_EXTENSION_MESSAGE_IDS,
-    DHT_EXTENSION_MESSAGE_IDS,
-    DEPLOYED_EXTENSION_MESSAGE_IDS,
-    ALL_KNOWN_MESSAGE_IDS,
-    MESSAGE_NAMES,
+    BEP4Error,
+    InvalidMessageTypeError,
+    InvalidReservedByteError,
 )
 
 
@@ -168,15 +166,25 @@ class TestMessageIDSets(unittest.TestCase):
 
     def test_core_message_ids(self):
         expected = {
-            MSG_CHOKE, MSG_UNCHOKE, MSG_INTERESTED, MSG_NOT_INTERESTED,
-            MSG_HAVE, MSG_BITFIELD, MSG_REQUEST, MSG_PIECE, MSG_CANCEL,
+            MSG_CHOKE,
+            MSG_UNCHOKE,
+            MSG_INTERESTED,
+            MSG_NOT_INTERESTED,
+            MSG_HAVE,
+            MSG_BITFIELD,
+            MSG_REQUEST,
+            MSG_PIECE,
+            MSG_CANCEL,
         }
         self.assertEqual(CORE_MESSAGE_IDS, frozenset(expected))
 
     def test_fast_extension_message_ids(self):
         expected = {
-            MSG_SUGGEST, MSG_HAVE_ALL, MSG_HAVE_NONE,
-            MSG_REJECT_REQUEST, MSG_ALLOWED_FAST,
+            MSG_SUGGEST,
+            MSG_HAVE_ALL,
+            MSG_HAVE_NONE,
+            MSG_REJECT_REQUEST,
+            MSG_ALLOWED_FAST,
         }
         self.assertEqual(FAST_EXTENSION_MESSAGE_IDS, frozenset(expected))
 
@@ -187,8 +195,9 @@ class TestMessageIDSets(unittest.TestCase):
         self.assertEqual(DEPLOYED_EXTENSION_MESSAGE_IDS, frozenset({MSG_LTEP_HANDSHAKE}))
 
     def test_all_known_message_ids(self):
-        combined = CORE_MESSAGE_IDS | FAST_EXTENSION_MESSAGE_IDS | \
-                   DHT_EXTENSION_MESSAGE_IDS | DEPLOYED_EXTENSION_MESSAGE_IDS
+        combined = (
+            CORE_MESSAGE_IDS | FAST_EXTENSION_MESSAGE_IDS | DHT_EXTENSION_MESSAGE_IDS | DEPLOYED_EXTENSION_MESSAGE_IDS
+        )
         self.assertEqual(ALL_KNOWN_MESSAGE_IDS, frozenset(combined))
 
 
@@ -340,7 +349,6 @@ class TestDecodeReservedBytes(unittest.TestCase):
         result = bep4.decode_reserved_bytes(reserved)
         self.assertFalse(result["dht"])
         self.assertFalse(result["fast_extensions"])
-        self.assertFalse(result["bep10"])
         self.assertFalse(result["azureus_msg_protocol"])
         self.assertFalse(result["ltep"])
 
@@ -355,10 +363,11 @@ class TestDecodeReservedBytes(unittest.TestCase):
         result = bep4.decode_reserved_bytes(reserved)
         self.assertTrue(result["fast_extensions"])
 
-    def test_bep10_flag(self):
-        reserved = b"\x00" * 7 + b"\x04"
+    def test_ext_negotiation_flag(self):
+        # ext_negotiation is at reserved[5] bits 0x01 or 0x02
+        reserved = b"\x00\x00\x00\x00\x00\x02\x00\x00"
         result = bep4.decode_reserved_bytes(reserved)
-        self.assertTrue(result["bep10"])
+        self.assertTrue(result["ext_negotiation"])
 
     def test_ltep_flag(self):
         # ltep flag is at reserved[5] = 0x10
@@ -392,7 +401,8 @@ class TestMakeHandshakeReserved(unittest.TestCase):
 
     def test_bep10_enabled(self):
         result = bep4.make_handshake_reserved(support_bep10=True)
-        self.assertEqual(result[7] & 0x04, 0x04)
+        # BEP10 sets RESERVED_LTEP (0x10) in reserved[5], not reserved[7]
+        self.assertEqual(result[5] & 0x10, 0x10)
 
     def test_all_enabled(self):
         result = bep4.make_handshake_reserved(
@@ -400,9 +410,11 @@ class TestMakeHandshakeReserved(unittest.TestCase):
             support_fast_extensions=True,
             support_bep10=True,
         )
-        # DHT sets 0x01, fast_extensions sets 0x04, bep10 sets 0x04
-        # Combined: 0x01 | 0x04 | 0x04 = 0x05
+        # DHT sets 0x01 in reserved[7], fast_extensions sets 0x04 in reserved[7]
+        # bep10 sets 0x10 in reserved[5]
+        # reserved[7] = 0x01 | 0x04 = 0x05, reserved[5] = 0x10
         self.assertEqual(result[7], 0x05)
+        self.assertEqual(result[5] & 0x10, 0x10)
 
 
 class TestExceptionClasses(unittest.TestCase):

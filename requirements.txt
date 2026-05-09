@@ -1,5 +1,8 @@
 # Core dependencies
-PyGObject>=3.40
+# None required - dhtrack uses only standard library modules
+
+# GUI dependencies
+PyQt6>=6.6
 
 # Optional dependencies
 pymongo>=4.0

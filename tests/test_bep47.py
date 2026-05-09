@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+
 import pytest
 
 from dhtrack import bep47
 from dhtrack.torrent import Torrent
-
 
 # ============================================================================
 # Test FileAttribute Constants
@@ -215,15 +215,16 @@ class TestPaddingFileUtilities:
 
     def test_padding_length_larger_than_piece(self):
         """Should handle file larger than piece length."""
-        assert bep47.create_padding_length(16384, 20000) == 16368
+        # 20000 % 16384 = 3616, padding = 16384 - 3616 = 12768
+        assert bep47.create_padding_length(16384, 20000) == 12768
 
     def test_create_padding_file_entry(self):
         """Should create padding file entry."""
         entry = bep47.create_padding_file_entry(16384, 10000)
         assert entry is not None
-        assert entry["path"] == [".pad", "6384"]
-        assert entry["length"] == 6384
-        assert entry["attr"] == "p"
+        assert entry[b"path"] == [b".pad", b"6384"]
+        assert entry[b"length"] == 6384
+        assert entry[b"attr"] == b"p"
 
     def test_create_padding_file_entry_no_padding_needed(self):
         """Should return None when no padding needed."""
@@ -246,17 +247,17 @@ class TestPaddingFileDetection:
 
     def test_is_padding_file_by_attr(self):
         """Should detect padding file by attr."""
-        entry = {"path": [".pad", "6384"], "length": 6384, "attr": "p"}
+        entry = {b"path": [b".pad", b"6384"], b"length": 6384, b"attr": b"p"}
         assert bep47.is_padding_file(entry) is True
 
     def test_is_padding_file_by_path(self):
         """Should detect padding file by path."""
-        entry = {"path": [".pad", "6384"], "length": 6384}
+        entry = {b"path": [b".pad", b"6384"], b"length": 6384}
         assert bep47.is_padding_file(entry) is True
 
     def test_is_not_padding_file(self):
         """Should return False for regular file."""
-        entry = {"path": ["file.txt"], "length": 100}
+        entry = {b"path": [b"file.txt"], b"length": 100}
         assert bep47.is_padding_file(entry) is False
 
     def test_is_padding_file_empty_entry(self):
@@ -274,12 +275,12 @@ class TestSymlinkDetection:
 
     def test_is_symlink_by_attr(self):
         """Should detect symlink by attr."""
-        entry = {"path": ["link"], "length": 0, "attr": "l"}
+        entry = {b"path": [b"link"], b"length": 0, b"attr": b"l"}
         assert bep47.is_symlink(entry) is True
 
     def test_is_symlink_by_path(self):
         """Should detect symlink by symlink path."""
-        entry = {"path": ["link"], "length": 0, "symlink path": ["target"]}
+        entry = {b"path": [b"link"], b"length": 0, b"symlink path": [b"target"]}
         assert bep47.is_symlink(entry) is True
 
     def test_is_not_symlink(self):
@@ -302,19 +303,19 @@ class TestSymlinkPathRetrieval:
 
     def test_get_symlink_path(self):
         """Should return symlink target path."""
-        entry = {"symlink path": ["dir", "target.txt"]}
+        entry = {b"symlink path": [b"dir", b"target.txt"]}
         result = bep47.get_symlink_path(entry)
-        assert result == ["dir", "target.txt"]
+        assert result == [b"dir", b"target.txt"]
 
     def test_get_symlink_path_bytes(self):
         """Should handle byte string components."""
-        entry = {"symlink path": [b"dir", b"target.txt"]}
+        entry = {b"symlink path": [b"dir", b"target.txt"]}
         result = bep47.get_symlink_path(entry)
-        assert result == ["dir", "target.txt"]
+        assert result == [b"dir", b"target.txt"]
 
     def test_get_symlink_path_none(self):
         """Should return None for non-symlink."""
-        entry = {"path": ["file.txt"]}
+        entry = {b"path": [b"file.txt"]}
         result = bep47.get_symlink_path(entry)
         assert result is None
 
@@ -334,23 +335,16 @@ class TestSymlinkEntryCreation:
 
     def test_create_symlink_entry(self):
         """Should create complete symlink entry."""
-        entry = bep47.create_symlink_file_entry(
-            path=["link_file"],
-            target_path=["data", "target.txt"]
-        )
-        assert entry["path"] == ["link_file"]
-        assert entry["length"] == 0
-        assert entry["attr"] == "l"
-        assert entry["symlink path"] == ["data", "target.txt"]
+        entry = bep47.create_symlink_file_entry(path=["link_file"], target_path=["data", "target.txt"])
+        assert entry[b"path"] == [b"link_file"]
+        assert entry[b"length"] == 0
+        assert entry[b"attr"] == b"l"
+        assert entry[b"symlink path"] == [b"data", b"target.txt"]
 
     def test_create_symlink_entry_custom_length(self):
         """Should allow custom length (though always 0 for symlinks)."""
-        entry = bep47.create_symlink_file_entry(
-            path=["link"],
-            target_path=["target"],
-            length=0
-        )
-        assert entry["length"] == 0
+        entry = bep47.create_symlink_file_entry(path=["link"], target_path=["target"], length=0)
+        assert entry[b"length"] == 0
 
 
 # ============================================================================
@@ -364,26 +358,26 @@ class TestSHA1FileEntry:
     def test_get_file_sha1(self):
         """Should retrieve SHA1 from entry."""
         sha1 = hashlib.sha1(b"test").digest()
-        entry = {"sha1": sha1}
+        entry = {b"sha1": sha1}
         result = bep47.get_file_sha1(entry)
         assert result == sha1
 
     def test_get_file_sha1_missing(self):
         """Should return None when SHA1 missing."""
-        entry = {"path": ["file.txt"]}
+        entry = {b"path": [b"file.txt"]}
         result = bep47.get_file_sha1(entry)
         assert result is None
 
     def test_set_file_sha1(self):
         """Should set SHA1 on entry."""
-        entry = {"path": ["file.txt"]}
+        entry = {b"path": [b"file.txt"]}
         sha1 = hashlib.sha1(b"test").digest()
         bep47.set_file_sha1(entry, sha1)
-        assert entry["sha1"] == sha1
+        assert entry[b"sha1"] == sha1
 
     def test_set_file_sha1_invalid_length(self):
         """Should raise ValueError for wrong length."""
-        entry: dict = {"path": ["file.txt"]}
+        entry: dict = {b"path": [b"file.txt"]}
         with pytest.raises(ValueError):
             bep47.set_file_sha1(entry, b"too short")
 
@@ -397,33 +391,33 @@ class TestFileEntryNormalization:
     """Tests for file entry normalization."""
 
     def test_normalize_byte_keys(self):
-        """Should convert byte keys to string keys."""
+        """Should preserve bytes-key form."""
         entry = {b"path": [b"file.txt"], b"length": 100}
         result = bep47.normalize_file_entry(entry)
         assert isinstance(result, dict)
-        assert "path" in result
-        assert "length" in result
+        assert b"path" in result
+        assert b"length" in result
 
     def test_normalize_missing_fields(self):
         """Should add missing required fields."""
-        entry: dict = {"path": ["file.txt"]}
+        entry: dict = {b"path": [b"file.txt"]}
         result = bep47.normalize_file_entry(entry)
-        assert "attr" in result
-        assert result["attr"] == ""
-        assert "length" in result
+        assert b"attr" in result
+        assert result[b"attr"] == b""
+        assert b"length" in result
 
     def test_normalize_all_fields(self):
         """Should preserve all fields."""
         entry = {
-            "path": ["dir", "file.txt"],
-            "length": 1024,
-            "attr": "hx",
-            "sha1": hashlib.sha1(b"test").digest(),
+            b"path": [b"dir", b"file.txt"],
+            b"length": 1024,
+            b"attr": b"hx",
+            b"sha1": hashlib.sha1(b"test").digest(),
         }
         result = bep47.normalize_file_entry(entry)
-        assert result["path"] == ["dir", "file.txt"]
-        assert result["length"] == 1024
-        assert result["attr"] == "hx"
+        assert result[b"path"] == [b"dir", b"file.txt"]
+        assert result[b"length"] == 1024
+        assert result[b"attr"] == b"hx"
 
 
 # ============================================================================
@@ -437,26 +431,24 @@ class TestBuildFileEntry:
     def test_build_minimal(self):
         """Should build minimal entry."""
         entry = bep47.build_file_entry(["file.txt"], 100)
-        assert entry["path"] == ["file.txt"]
-        assert entry["length"] == 100
+        assert entry[b"path"] == [b"file.txt"]
+        assert entry[b"length"] == 100
 
     def test_build_with_attr(self):
         """Should include attribute."""
         entry = bep47.build_file_entry(["file.txt"], 100, attr="hx")
-        assert entry["attr"] == "hx"
+        assert entry[b"attr"] == b"hx"
 
     def test_build_with_sha1(self):
         """Should include SHA1."""
         sha1 = hashlib.sha1(b"test").digest()
         entry = bep47.build_file_entry(["file.txt"], 100, sha1=sha1)
-        assert entry["sha1"] == sha1
+        assert entry[b"sha1"] == sha1
 
     def test_build_with_symlink(self):
         """Should include symlink path."""
-        entry = bep47.build_file_entry(
-            ["link"], 0, symlink_path=["target"]
-        )
-        assert entry["symlink path"] == ["target"]
+        entry = bep47.build_file_entry(["link"], 0, symlink_path=["target"])
+        assert entry[b"symlink path"] == [b"target"]
 
 
 # ============================================================================
@@ -471,27 +463,27 @@ class TestTorrentExtendedAttributes:
         """Create a torrent with extended attributes."""
         files = [
             {
-                "path": ["executable"],
-                "length": 1024,
-                "attr": "x",
+                b"path": [b"executable"],
+                b"length": 1024,
+                b"attr": b"x",
             },
             {
-                "path": ["hidden_file.txt"],
-                "length": 512,
-                "attr": "h",
+                b"path": [b"hidden_file.txt"],
+                b"length": 512,
+                b"attr": b"h",
             },
             {
-                "path": ["regular.txt"],
-                "length": 256,
+                b"path": [b"regular.txt"],
+                b"length": 256,
             },
         ]
         data = {
-            "announce": b"http://tracker.example.com/announce",
-            "info": {
-                "name": b"test_torrent",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"announce": b"http://tracker.example.com/announce",
+            b"info": {
+                b"name": b"test_torrent",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         return Torrent(data)
@@ -499,9 +491,9 @@ class TestTorrentExtendedAttributes:
     def test_get_file_attribute(self):
         """Should get file attribute."""
         torrent = self.create_multifile_torrent()
-        assert torrent.get_file_attribute(0) == "x"
-        assert torrent.get_file_attribute(1) == "h"
-        assert torrent.get_file_attribute(2) == ""
+        assert torrent.get_file_attribute(0) == b"x"
+        assert torrent.get_file_attribute(1) == b"h"
+        assert torrent.get_file_attribute(2) == b""
 
     def test_has_file_attribute(self):
         """Should check file attribute."""
@@ -527,7 +519,7 @@ class TestTorrentExtendedAttributes:
         torrent = self.create_multifile_torrent()
         torrent.set_file_attribute(2, "x")
         torrent.set_file_attribute(2, "h")
-        assert torrent.get_file_attribute(2) == "xh"
+        assert torrent.get_file_attribute(2) in (b"xh", b"hx")
 
     def test_symlink_count(self):
         """Should count symlinks."""
@@ -557,11 +549,11 @@ class TestTorrentExtendedAttributes:
     def test_no_extended_attributes(self):
         """Should return False when no extended attributes."""
         data = {
-            "announce": b"http://tracker.example.com/announce",
-            "info": {
-                "name": b"simple",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
+            b"announce": b"http://tracker.example.com/announce",
+            b"info": {
+                b"name": b"simple",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
@@ -574,10 +566,10 @@ class TestTorrentPaddingFiles:
     def test_get_piece_length(self):
         """Should get piece length."""
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
@@ -586,9 +578,9 @@ class TestTorrentPaddingFiles:
     def test_get_piece_length_missing(self):
         """Should return 0 when piece length missing."""
         data = {
-            "info": {
-                "name": b"test",
-                "pieces": b"\x00" * 20,
+            b"info": {
+                b"name": b"test",
+                b"pieces": b"\x00" * 20,
             },
         }
         torrent = Torrent(data)
@@ -597,15 +589,15 @@ class TestTorrentPaddingFiles:
     def test_add_padding_file(self):
         """Should add padding file before target."""
         files = [
-            {"path": ["file1.txt"], "length": 10000},
-            {"path": ["file2.txt"], "length": 2048},
+            {b"path": [b"file1.txt"], b"length": 10000},
+            {b"path": [b"file2.txt"], b"length": 2048},
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)
@@ -614,20 +606,20 @@ class TestTorrentPaddingFiles:
         # Padding needed: 16384 - 10000 = 6384
         result = torrent.add_padding_file(1)
         assert result is not None
-        assert result["length"] == 6384
+        assert result[b"length"] == 6384
         assert torrent.file_count == 3
 
     def test_add_padding_file_no_padding_needed(self):
         """Should return None when no padding needed."""
         files = [
-            {"path": ["file1.txt"], "length": 16384},
+            {b"path": [b"file1.txt"], b"length": 16384},
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)
@@ -637,15 +629,15 @@ class TestTorrentPaddingFiles:
     def test_total_padding_bytes(self):
         """Should calculate total padding bytes."""
         files = [
-            {"path": [".pad", "6384"], "length": 6384, "attr": "p"},
-            {"path": ["file1.txt"], "length": 100},
+            {b"path": [b".pad", b"6384"], b"length": 6384, b"attr": b"p"},
+            {b"path": [b"file1.txt"], b"length": 100},
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)
@@ -654,15 +646,15 @@ class TestTorrentPaddingFiles:
     def test_is_padding_file(self):
         """Should identify padding files."""
         files = [
-            {"path": [".pad", "6384"], "length": 6384, "attr": "p"},
-            {"path": ["file.txt"], "length": 100},
+            {b"path": [b".pad", b"6384"], b"length": 6384, b"attr": b"p"},
+            {b"path": [b"file.txt"], b"length": 100},
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)
@@ -672,14 +664,14 @@ class TestTorrentPaddingFiles:
     def test_get_padding_length(self):
         """Should get padding file length."""
         files = [
-            {"path": [".pad", "6384"], "length": 6384, "attr": "p"},
+            {b"path": [b".pad", b"6384"], b"length": 6384, b"attr": b"p"},
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)
@@ -693,19 +685,19 @@ class TestTorrentSymlinks:
         """Should identify symlink files."""
         files = [
             {
-                "path": ["link"],
-                "length": 0,
-                "attr": "l",
-                "symlink path": ["target.txt"],
+                b"path": [b"link"],
+                b"length": 0,
+                b"attr": b"l",
+                b"symlink path": [b"target.txt"],
             },
-            {"path": ["file.txt"], "length": 100},
+            {b"path": [b"file.txt"], b"length": 100},
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)
@@ -716,47 +708,47 @@ class TestTorrentSymlinks:
         """Should get symlink path."""
         files = [
             {
-                "path": ["link"],
-                "length": 0,
-                "attr": "l",
-                "symlink path": ["dir", "target.txt"],
+                b"path": [b"link"],
+                b"length": 0,
+                b"attr": b"l",
+                b"symlink path": [b"dir", b"target.txt"],
             },
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)
         path = torrent.get_symlink_path(0)
-        assert path == ["dir", "target.txt"]
+        assert path == [b"dir", b"target.txt"]
 
     def test_symlink_count(self):
         """Should count symlinks."""
         files = [
             {
-                "path": ["link1"],
-                "length": 0,
-                "attr": "l",
-                "symlink path": ["target1"],
+                b"path": [b"link1"],
+                b"length": 0,
+                b"attr": b"l",
+                b"symlink path": [b"target1"],
             },
-            {"path": ["file.txt"], "length": 100},
+            {b"path": [b"file.txt"], b"length": 100},
             {
-                "path": ["link2"],
-                "length": 0,
-                "attr": "l",
-                "symlink path": ["target2"],
+                b"path": [b"link2"],
+                b"length": 0,
+                b"attr": b"l",
+                b"symlink path": [b"target2"],
             },
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)
@@ -769,14 +761,14 @@ class TestTorrentSHA1:
     def test_set_file_sha1(self):
         """Should set SHA1 on file."""
         files = [
-            {"path": ["file.txt"], "length": 100},
+            {b"path": [b"file.txt"], b"length": 100},
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)
@@ -788,14 +780,14 @@ class TestTorrentSHA1:
     def test_compute_file_sha1(self):
         """Should compute and store SHA1."""
         files = [
-            {"path": ["file.txt"], "length": 100},
+            {b"path": [b"file.txt"], b"length": 100},
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)
@@ -807,14 +799,14 @@ class TestTorrentSHA1:
     def test_get_file_sha1_missing(self):
         """Should return None when SHA1 not set."""
         files = [
-            {"path": ["file.txt"], "length": 100},
+            {b"path": [b"file.txt"], b"length": 100},
         ]
         data = {
-            "info": {
-                "name": b"test",
-                "piece length": 16384,
-                "pieces": b"\x00" * 20,
-                "files": files,
+            b"info": {
+                b"name": b"test",
+                b"piece length": 16384,
+                b"pieces": b"\x00" * 20,
+                b"files": files,
             },
         }
         torrent = Torrent(data)

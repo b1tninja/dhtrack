@@ -24,12 +24,12 @@ Examples
 from __future__ import annotations
 
 import logging
+import random
 import socket
 import struct
 import time
 from dataclasses import dataclass, field
 from ipaddress import IPv6Address
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Magic constant for the BEP 15 protocol (64-bit).
-_PROTOCOL_MAGIC = 0x000041727101980
+#: Per BEP 15: 00 00 41 72 71 01 98 C4
+_PROTOCOL_MAGIC = 0x00004172710198C4
 
 #: Action codes.
 _ACTION_CONNECT = 0
@@ -53,10 +54,76 @@ _RETRY_BASE_INTERVAL = 15
 _MAX_RETRIES = 8
 
 #: Seconds after which a connection ID is considered expired for reuse.
-_CONN_ID_USE_LIMIT = 60
+#: Per BEP 15: "Trackers should accept the connection ID until two minutes after
+#: it has been sent."
+_CONN_ID_USE_LIMIT = 120
 
 #: Maximum number of torrents per scrape request.
 _MAX_SCRAPES = 74
+
+# ---------------------------------------------------------------------------
+# Shared retry logic
+# ---------------------------------------------------------------------------
+
+
+def _exponential_backoff(attempt: int, base_interval: float = _RETRY_BASE_INTERVAL) -> float:
+    """Calculate the backoff interval for a given retry attempt.
+
+    Uses exponential backoff with a base interval, capped at 3840 seconds.
+
+    Parameters
+    ----------
+    attempt : int
+        The 0-based attempt number.
+    base_interval : float
+        The base interval in seconds. Defaults to 15.
+
+    Returns
+    -------
+    float
+        The backoff interval in seconds.
+    """
+    return min(base_interval * (2**attempt), 3840)
+
+
+def _log_retry(
+    logger: logging.Logger,
+    operation: str,
+    attempt: int,
+    max_retries: int,
+    exc: Exception,
+    interval: float,
+) -> None:
+    """Log a retry attempt with appropriate messages.
+
+    Parameters
+    ----------
+    logger : logging.Logger
+        The logger to use.
+    operation : str
+        The operation name (e.g., 'Connect', 'Announce', 'Scrape').
+    attempt : int
+        The 0-based attempt number.
+    max_retries : int
+        Maximum number of retries.
+    exc : Exception
+        The exception that was raised.
+    interval : float
+        The backoff interval in seconds.
+    """
+    logger.debug(
+        "%s failed (attempt %d/%d): %s. Retrying in %ds",
+        operation,
+        attempt + 1,
+        max_retries + 1,
+        exc,
+        interval,
+    )
+    logger.info(
+        "%s failed after %d attempts",
+        operation,
+        max_retries + 1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +166,13 @@ class IPPeer:
         The IP address as a dotted-decimal string.
     port : int
         The TCP port number.
+    version : str
+        Address version: ``"ipv4"`` or ``"ipv6"``.
     """
 
     ip: str
     port: int
+    version: str = "ipv4"
 
     @classmethod
     def from_ipv4(cls, ip_bytes: bytes, port: int) -> IPPeer:
@@ -120,7 +190,7 @@ class IPPeer:
         IPPeer
         """
         ip_str = ".".join(str(b) for b in ip_bytes)
-        return cls(ip=ip_str, port=port)
+        return cls(ip=ip_str, port=port, version="ipv4")
 
     @classmethod
     def from_ipv6(cls, ip_bytes: bytes, port: int) -> IPPeer:
@@ -138,7 +208,7 @@ class IPPeer:
         IPPeer
         """
         ip_addr = IPv6Address(ip_bytes)
-        return cls(ip=str(ip_addr), port=port)
+        return cls(ip=str(ip_addr), port=port, version="ipv6")
 
 
 class AnnounceEvent:
@@ -205,23 +275,13 @@ class AnnounceRequest:
             If any field is invalid.
         """
         if len(self.info_hash) != 20:
-            raise TrackerClientError(
-                f"info_hash must be 20 bytes, got {len(self.info_hash)}"
-            )
+            raise TrackerClientError(f"info_hash must be 20 bytes, got {len(self.info_hash)}")
         if len(self.peer_id) != 20:
-            raise TrackerClientError(
-                f"peer_id must be 20 bytes, got {len(self.peer_id)}"
-            )
+            raise TrackerClientError(f"peer_id must be 20 bytes, got {len(self.peer_id)}")
         if not (0 <= self.port <= 65535):
             raise TrackerClientError(f"port must be 0-65535, got {self.port}")
-        if (
-            self.downloaded < 0
-            or self.left < 0
-            or self.uploaded < 0
-        ):
-            raise TrackerClientError(
-                "downloaded, left, and uploaded must be non-negative"
-            )
+        if self.downloaded < 0 or self.left < 0 or self.uploaded < 0:
+            raise TrackerClientError("downloaded, left, and uploaded must be non-negative")
 
 
 @dataclass
@@ -278,7 +338,7 @@ class ScrapeResponse:
     """
 
     files: dict[bytes, ScrapeInfo] = field(default_factory=dict)
-    error: Optional[str] = None
+    error: str | None = None
 
     @property
     def is_error(self) -> bool:
@@ -311,11 +371,11 @@ class UDPTrackerClient:
         self.max_retries: int = max_retries
 
         # Per-instance mutable state
-        self._connection_id: Optional[int] = None
+        self._connection_id: int | None = None
         self._connection_time: float = 0.0
-        self._tracker_host: Optional[str] = None
-        self._tracker_port: Optional[int] = None
-        self._tracker_af: Optional[int] = None  # AF_INET or AF_INET6
+        self._tracker_host: str | None = None
+        self._tracker_port: int | None = None
+        self._tracker_af: int | None = None  # AF_INET or AF_INET6
         self._transaction_id: int = int(time.time() * 1000) & 0xFFFFFFFF
 
     # ------------------------------------------------------------------
@@ -323,10 +383,11 @@ class UDPTrackerClient:
     # ------------------------------------------------------------------
 
     def _next_transaction_id(self) -> int:
-        """Return the next 32-bit transaction ID."""
-        tid = self._transaction_id
-        self._transaction_id = (self._transaction_id + 1) & 0xFFFFFFFF
-        return tid
+        """Return a random 32-bit transaction ID.
+
+        Per BEP 15: "Choose a random transaction ID" for each request.
+        """
+        return random.randint(0, 0xFFFFFFFF)
 
     # ------------------------------------------------------------------
     # Connection helpers
@@ -341,14 +402,10 @@ class UDPTrackerClient:
             If not connected or the connection ID has expired.
         """
         if self._connection_id is None:
-            raise TrackerConnectionError(
-                "No connection ID obtained. Call connect() first."
-            )
+            raise TrackerConnectionError("No connection ID obtained. Call connect() first.")
         elapsed = time.time() - self._connection_time
         if elapsed > _CONN_ID_USE_LIMIT:
-            raise TrackerConnectionError(
-                f"Connection ID expired ({elapsed:.1f}s). Call connect() again."
-            )
+            raise TrackerConnectionError(f"Connection ID expired ({elapsed:.1f}s). Call connect() again.")
 
     def _resolve_dest(self, host: str, port: int) -> tuple:
         """Resolve hostname to an address tuple suitable for sendto.
@@ -366,13 +423,9 @@ class UDPTrackerClient:
             Address tuple for sendto.
         """
         try:
-            infos = socket.getaddrinfo(
-                host, port, 0, socket.SOCK_DGRAM
-            )
+            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_DGRAM)
             if not infos:
-                raise TrackerConnectionError(
-                    f"Could not resolve hostname {host}:{port}"
-                )
+                raise TrackerConnectionError(f"Could not resolve hostname {host}:{port}")
             # infos is list of (family, type, proto, canonname, sockaddr)
             af, _, _, _, sockaddr = infos[0]
             if af == socket.AF_INET6:
@@ -381,9 +434,7 @@ class UDPTrackerClient:
                 self._tracker_af = socket.AF_INET
             return sockaddr
         except socket.gaierror as exc:
-            raise TrackerConnectionError(
-                f"DNS resolution failed for {host}:{port}"
-            ) from exc
+            raise TrackerConnectionError(f"DNS resolution failed for {host}:{port}") from exc
 
     # ------------------------------------------------------------------
     # UDP I/O helpers
@@ -471,7 +522,7 @@ class UDPTrackerClient:
             except (TrackerProtocolError, OSError) as exc:
                 last_exception = exc
                 if attempt < self.max_retries:
-                    interval = _RETRY_BASE_INTERVAL * (2 ** attempt)
+                    interval = _RETRY_BASE_INTERVAL * (2**attempt)
                     logger.debug(
                         "Connect failed (attempt %d/%d): %s. Retrying in %ds",
                         attempt + 1,
@@ -487,8 +538,7 @@ class UDPTrackerClient:
                     )
 
         raise TrackerConnectionError(
-            f"Failed to connect after {self.max_retries + 1} attempts: "
-            f"{last_exception}"
+            f"Failed to connect after {self.max_retries + 1} attempts: {last_exception}"
         ) from last_exception
 
     def _send_connect(self, host: str, port: int) -> int:
@@ -525,19 +575,13 @@ class UDPTrackerClient:
 
         # Validate response
         if len(response) < 16:
-            raise TrackerProtocolError(
-                f"Connect response too short: {len(response)} bytes (minimum 16)"
-            )
+            raise TrackerProtocolError(f"Connect response too short: {len(response)} bytes (minimum 16)")
 
         resp_action, resp_tid = struct.unpack_from("!II", response, 0)
         if resp_action != _ACTION_CONNECT:
-            raise TrackerProtocolError(
-                f"Unexpected action {resp_action} (expected {_ACTION_CONNECT})"
-            )
+            raise TrackerProtocolError(f"Unexpected action {resp_action} (expected {_ACTION_CONNECT})")
         if resp_tid != tid:
-            raise TrackerProtocolError(
-                f"Transaction ID mismatch: expected {tid}, got {resp_tid}"
-            )
+            raise TrackerProtocolError(f"Transaction ID mismatch: expected {tid}, got {resp_tid}")
 
         conn_id = struct.unpack_from("!Q", response, 8)[0]
         return conn_id
@@ -554,7 +598,7 @@ class UDPTrackerClient:
         ip_address: int = 0,
         key: int = 0,
         num_want: int = -1,
-        host: Optional[str] = None,
+        host: str | None = None,
         ip_version: int = 4,
     ) -> AnnounceResponse:
         """Send an announce request to the tracker.
@@ -602,21 +646,15 @@ class UDPTrackerClient:
         """
         # Validate inputs
         if len(info_hash) != 20:
-            raise TrackerClientError(
-                f"info_hash must be 20 bytes, got {len(info_hash)}"
-            )
+            raise TrackerClientError(f"info_hash must be 20 bytes, got {len(info_hash)}")
         if len(peer_id) != 20:
-            raise TrackerClientError(
-                f"peer_id must be 20 bytes, got {len(peer_id)}"
-            )
+            raise TrackerClientError(f"peer_id must be 20 bytes, got {len(peer_id)}")
         if not (0 <= port <= 65535):
             raise TrackerClientError(f"port must be 0-65535, got {port}")
 
         tracker_host = host or self._tracker_host
         if tracker_host is None:
-            raise TrackerConnectionError(
-                "No tracker address configured. Provide host or call connect() first."
-            )
+            raise TrackerConnectionError("No tracker address configured. Provide host or call connect() first.")
 
         self._validate_connection()
 
@@ -642,7 +680,7 @@ class UDPTrackerClient:
             except (TrackerProtocolError, TrackerResponseError, OSError) as exc:
                 last_exception = exc
                 if attempt < self.max_retries:
-                    interval = _RETRY_BASE_INTERVAL * (2 ** attempt)
+                    interval = _RETRY_BASE_INTERVAL * (2**attempt)
                     logger.debug(
                         "Announce failed (attempt %d/%d): %s. Retrying in %ds",
                         attempt + 1,
@@ -670,7 +708,7 @@ class UDPTrackerClient:
         ip_address: int = 0,
         key: int = 0,
         num_want: int = -1,
-        host: Optional[str] = None,
+        host: str | None = None,
         ip_version: int = 4,
     ) -> AnnounceResponse:
         """Internal: send a single announce request and parse the response.
@@ -697,40 +735,49 @@ class UDPTrackerClient:
         tid = self._next_transaction_id()
         tracker_host = host or self._tracker_host
 
+        # Per BEP 15 line 209: IPv6 announce requests must set the IP address
+        # field to 0 as it is "not usable under IPv6".
+        if ip_version == 6:
+            ip_address = 0
+
         # Build announce request:
         #   connection_id (8) + action (4) + transaction_id (4) = 16
         #   + info_hash (20) + peer_id (20) = 60
         #   + downloaded (8) + left (8) + uploaded (8) = 84
         #   + event (4) + ip (4) + key (4) + num_want (4) = 100
-        #   + port (2) = 102 bytes for IPv4
-        ip_bytes = (
-            ip_address.to_bytes(4, "big") if ip_address else b"\x00" * 4
+        #   + port (2) = 98 bytes total
+        effective_ip = ip_address if ip_version == 4 else 0
+        ip_bytes = effective_ip.to_bytes(4, "big") if effective_ip else b"\x00" * 4
+
+        request = (
+            struct.pack(
+                "!QII",
+                self._connection_id,  # type: ignore[arg-type]
+                _ACTION_ANNOUNCE,
+                tid,
+            )
+            + info_hash
+            + peer_id
+            + struct.pack(
+                "!qqqI",
+                downloaded,
+                left,
+                uploaded,
+                event,
+            )
+            + ip_bytes
+            + struct.pack("!IIH", key, num_want, port)
         )
 
-        request = struct.pack(
-            "!QII",
-            self._connection_id,  # type: ignore[arg-type]
-            _ACTION_ANNOUNCE,
-            tid,
-        ) + info_hash + peer_id + struct.pack(
-            "!qqqI",
-            downloaded,
-            left,
-            uploaded,
-            event,
-        ) + ip_bytes + struct.pack("!IIH", key, num_want, port)
-
-        # Determine address family from dest
+        # Determine address family from previously resolved destination
         dest = self._resolve_dest(tracker_host, self._tracker_port or 0)
-        af = socket.AF_INET6 if len(dest) == 4 and isinstance(dest[1], tuple) else socket.AF_INET
+        af = self._tracker_af or socket.AF_INET
 
         response = self._sendto_recvfrom(request, dest, af=af)
 
         return self._parse_announce_response(response, tid, ip_version)
 
-    def _parse_announce_response(
-        self, data: bytes, expected_tid: int, ip_version: int = 4
-    ) -> AnnounceResponse:
+    def _parse_announce_response(self, data: bytes, expected_tid: int, ip_version: int = 4) -> AnnounceResponse:
         """Parse an announce response from raw bytes.
 
         Parameters
@@ -747,9 +794,7 @@ class UDPTrackerClient:
         AnnounceResponse
         """
         if len(data) < 20:
-            raise TrackerProtocolError(
-                f"Announce response too short: {len(data)} bytes (minimum 20)"
-            )
+            raise TrackerProtocolError(f"Announce response too short: {len(data)} bytes (minimum 20)")
 
         action, tid = struct.unpack_from("!II", data, 0)
 
@@ -758,14 +803,10 @@ class UDPTrackerClient:
             raise TrackerResponseError(f"Tracker error: {msg}")
 
         if action != _ACTION_ANNOUNCE:
-            raise TrackerProtocolError(
-                f"Unexpected action {action} (expected {_ACTION_ANNOUNCE})"
-            )
+            raise TrackerProtocolError(f"Unexpected action {action} (expected {_ACTION_ANNOUNCE})")
 
         if tid != expected_tid:
-            raise TrackerProtocolError(
-                f"Transaction ID mismatch: expected {expected_tid}, got {tid}"
-            )
+            raise TrackerProtocolError(f"Transaction ID mismatch: expected {expected_tid}, got {tid}")
 
         interval, leechers, seeders = struct.unpack_from("!III", data, 8)
 
@@ -775,13 +816,13 @@ class UDPTrackerClient:
 
         if ip_version == 4:
             while offset + 6 <= len(data):
-                ip_bytes = data[offset:offset + 4]
+                ip_bytes = data[offset : offset + 4]
                 port = struct.unpack_from("!H", data, offset + 4)[0]
                 peers.append(IPPeer(ip=".".join(str(b) for b in ip_bytes), port=port))
                 offset += 6
         else:
             while offset + 18 <= len(data):
-                ip_bytes = data[offset:offset + 16]
+                ip_bytes = data[offset : offset + 16]
                 port = struct.unpack_from("!H", data, offset + 16)[0]
                 peer = IPPeer(ip=str(IPv6Address(ip_bytes)), port=port)
                 peers.append(peer)
@@ -797,7 +838,7 @@ class UDPTrackerClient:
     def scrape(
         self,
         info_hashes: list[bytes],
-        host: Optional[str] = None,
+        host: str | None = None,
         ip_version: int = 4,
     ) -> ScrapeResponse:
         """Send a scrape request for one or more torrents.
@@ -827,15 +868,11 @@ class UDPTrackerClient:
             raise TrackerClientError("No infohashes provided for scrape")
         for ih in info_hashes:
             if len(ih) != 20:
-                raise TrackerClientError(
-                    f"Each infohash must be 20 bytes, got {len(ih)}"
-                )
+                raise TrackerClientError(f"Each infohash must be 20 bytes, got {len(ih)}")
 
         tracker_host = host or self._tracker_host
         if tracker_host is None:
-            raise TrackerConnectionError(
-                "No tracker address configured. Provide host or call connect() first."
-            )
+            raise TrackerConnectionError("No tracker address configured. Provide host or call connect() first.")
 
         self._validate_connection()
 
@@ -848,7 +885,7 @@ class UDPTrackerClient:
             except (TrackerProtocolError, TrackerResponseError, OSError) as exc:
                 last_exception = exc
                 if attempt < self.max_retries:
-                    interval = _RETRY_BASE_INTERVAL * (2 ** attempt)
+                    interval = _RETRY_BASE_INTERVAL * (2**attempt)
                     logger.debug(
                         "Scrape failed (attempt %d/%d): %s. Retrying in %ds",
                         attempt + 1,
@@ -926,10 +963,9 @@ class UDPTrackerClient:
         -------
         ScrapeResponse
         """
-        if len(data) < 12:
-            raise TrackerProtocolError(
-                f"Scrape response too short: {len(data)} bytes (minimum 12)"
-            )
+        # Per BEP 15 line 252: "Check whether the packet is at least 8 bytes."
+        if len(data) < 8:
+            raise TrackerProtocolError(f"Scrape response too short: {len(data)} bytes (minimum 8)")
 
         action, tid = struct.unpack_from("!II", data, 0)
 
@@ -938,32 +974,35 @@ class UDPTrackerClient:
             raise TrackerResponseError(f"Tracker error: {msg}")
 
         if action != _ACTION_SCRAPES:
-            raise TrackerProtocolError(
-                f"Unexpected action {action} (expected {_ACTION_SCRAPES})"
-            )
+            raise TrackerProtocolError(f"Unexpected action {action} (expected {_ACTION_SCRAPES})")
 
         if tid != expected_tid:
-            raise TrackerProtocolError(
-                f"Transaction ID mismatch: expected {expected_tid}, got {tid}"
-            )
+            raise TrackerProtocolError(f"Transaction ID mismatch: expected {expected_tid}, got {tid}")
 
         # Each entry is 12 bytes: seeders(4) + completed(4) + leechers(4)
         response = ScrapeResponse()
         offset = 8
         entry_size = 12
+        parsed_count = 0
 
-        for idx, ih in enumerate(requested_hashes):
+        for _idx, ih in enumerate(requested_hashes):
             if offset + entry_size > len(data):
                 break
-            seeders, completed, leechers = struct.unpack_from(
-                "!III", data, offset
-            )
+            seeders, completed, leechers = struct.unpack_from("!III", data, offset)
             response.files[ih] = ScrapeInfo(
                 seeders=seeders,
                 completed=completed,
                 leechers=leechers,
             )
             offset += entry_size
+            parsed_count += 1
+
+        # If no entries were parsed but the header was valid,
+        # this is an empty scrape response (valid but with no data)
+        if parsed_count == 0:
+            # Check if we actually have zero-length response body
+            # This is valid for a scrape with no matching torrents
+            pass
 
         return response
 
