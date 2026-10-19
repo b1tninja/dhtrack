@@ -479,6 +479,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _parse_scrape_args(scrape_help_parser)
 
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Run the experimental MCP stdio server (draft; requires the mcp extra)",
+    )
+    serve_parser.add_argument(
+        "--transport",
+        choices=("stdio",),
+        default="stdio",
+        help="MCP transport (default: stdio)",
+    )
+
     return parser
 
 
@@ -510,6 +521,10 @@ def main(argv: list[str] | None = None) -> int:
         return _resolve_command(args)
     elif args.command == "scrape":
         return _scrape_command(args)
+    elif args.command == "serve":
+        from dhtrack.experimental.mcp.__main__ import main as serve_main
+
+        return serve_main(["--transport", args.transport])
     else:
         parser.print_help()
         return 1
