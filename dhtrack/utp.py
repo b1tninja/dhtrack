@@ -171,6 +171,60 @@ class UTPTimestampError(UTPError):
     """Raised when timestamp handling errors occur."""
 
 
+def _seq_before(a: int, b: int) -> bool:
+    """True when 16-bit serial ``a`` is strictly before ``b`` (half the space)."""
+    return ((a - b) & 0xFFFF) > 0x8000
+
+
+def _seq_leq(a: int, b: int) -> bool:
+    """True when 16-bit serial ``a`` is before or equal to ``b``."""
+    aa = a & 0xFFFF
+    bb = b & 0xFFFF
+    return aa == bb or _seq_before(aa, bb)
+
+
+def _split_utp_extensions(data: bytes) -> tuple[bytes, SelectiveAck | None]:
+    """Return ``(payload, selective_ack)`` from a full uTP datagram.
+
+    BEP 29 puts the current extension type in header byte 1 and then, at
+    offset 20, ``next_type (u8) | length (u8) | body``. ``SelectiveAck.to_bytes``
+    historically wrote ``type | length | body`` with no next-type byte; both
+    layouts are accepted so local packets and real peers decode.
+    """
+    if len(data) < 20:
+        return b"", None
+    ext = data[1]
+    offset = 20
+    sack: SelectiveAck | None = None
+    # Bound the walk: a hostile length must not spin.
+    for _ in range(8):
+        if ext == 0 or offset + 2 > len(data):
+            break
+        first = data[offset]
+        length = data[offset + 1]
+        if length > SELECTIVE_ACK_MAX_BYTES or offset + 2 + length > len(data):
+            break
+        body = data[offset + 2 : offset + 2 + length]
+        if ext == EXT_TYPE_SELECTIVE_ACK and first == 0:
+            # Standard layout: first byte is the next extension type.
+            if length % 4 == 0 and length >= SELECTIVE_ACK_MIN_BITS // 8:
+                sack = SelectiveAck(bits=length * 8, bitmask=bytearray(body))
+            ext = first
+            offset += 2 + length
+            continue
+        if first == EXT_TYPE_SELECTIVE_ACK or first == ext:
+            try:
+                sack = SelectiveAck.parse(data[offset:])
+            except UTPPacketError:
+                break
+            offset += 2 + length
+            break
+        # Unknown extension: skip using the standard next/len/body layout.
+        ext = first
+        offset += 2 + length
+    return data[offset:], sack
+
+
 # ---------------------------------------------------------------------------
 # PacketHeader (BEP 29 Section: "header format")
 # ---------------------------------------------------------------------------
@@ -846,6 +900,9 @@ class UTPConnection:
 
         # Receive buffer: out-of-order packets
         self.receive_buffer: dict[int, tuple[bytes, float]] = {}  # seq_nr -> (data, recv_time)
+        # Next sequence number to hand to the application. Independent of ack_nr,
+        # which is the last remote seq we have acknowledged.
+        self._deliver_seq: int | None = None
 
         # Data buffer: contiguous received data
         self.receive_data: bytearray = bytearray()
@@ -904,8 +961,7 @@ class UTPConnection:
         self.packets_sent += 1
         self.last_activity = time.time()
 
-        if self.seq_nr < 0xFFFF:
-            self.seq_nr += 1
+        self._bump_seq()
 
         self.state = ConnectionState.SYN_SENT
         logger.debug("Sent ST_SYN: conn_id=%d, seq=%d", self.connection_id, header.seq_nr)
@@ -994,8 +1050,7 @@ class UTPConnection:
             seq_nr=self.seq_nr,
         )
 
-        if self.seq_nr < 0xFFFF:
-            self.seq_nr += 1
+        self._bump_seq()
 
         return response
 
@@ -1048,33 +1103,25 @@ class UTPConnection:
         bytes | None
             ACK packet.
         """
-        self.ack_nr = header.seq_nr
-
         # Update RTT if we have a timestamp difference
         if header.timestamp_difference_microseconds > 0:
             rtt_us = header.timestamp_difference_microseconds
             self.congestion_control.update_rtt(rtt_us // 1000)
             self.congestion_control.record_delay(rtt_us)
 
-        # Extract payload
-        payload = data[20:]  # Skip 20-byte header
-        len(data)
+        # Payload starts after the base header and any extension blocks.
+        # A pure ACK is ST_STATE with an empty body; echoing the peer's
+        # payload as ST_DATA retransmits their bytes and feeds a loop.
+        # Only DATA/FIN advance ack_nr. A STATE packet's seq_nr is not data.
+        payload, sack = _split_utp_extensions(data)
 
         if header.packet_type == ST_DATA:
+            self.ack_nr = header.seq_nr & 0xFFFF
             # Store packet in receive buffer
-            self.receive_buffer[header.seq_nr] = (payload, time.time())
+            self.receive_buffer[self.ack_nr] = (payload, time.time())
             self.congestion_control.outstanding_bytes = max(0, self.congestion_control.outstanding_bytes)
 
-            # Check for selective ACK
-            sack = None
-            if header.extension == EXT_TYPE_SELECTIVE_ACK and len(data) > 20:
-                try:
-                    sack_data = data[20:]
-                    sack = SelectiveAck.parse(sack_data)
-                except UTPPacketError:
-                    logger.debug("Failed to parse selective ACK")
-
-            # Process ACK
+            # Process ACK of *our* sends (header.ack_nr), not their seq_nr.
             self._process_ack(header, sack)
 
             # Check for missing packets (packet loss detection)
@@ -1083,27 +1130,25 @@ class UTPConnection:
                 self.congestion_control.on_packet_loss()
                 self.packets_lost += 1
 
-            # Build ACK response
             ack_response = self._build_packet(
-                packet_type=ST_STATE if not payload else ST_DATA,
+                packet_type=ST_STATE,
                 ack_nr=self.ack_nr,
                 seq_nr=self.seq_nr,
                 wnd_size=self.congestion_control.get_window_size(),
                 timestamp_diff_us=header.timestamp_difference_microseconds,
-                payload=payload if payload else b"",
-                selective_ack=sack if sack else None,
             )
 
-            if self.seq_nr < 0xFFFF:
-                self.seq_nr += 1
+            self._bump_seq()
 
             return ack_response
 
         elif header.packet_type == ST_FIN:
+            self.ack_nr = header.seq_nr & 0xFFFF
             # Handle connection close
-            self.receive_buffer[header.seq_nr] = (payload, time.time())
-            self.eof_pkt = header.seq_nr
+            self.receive_buffer[self.ack_nr] = (payload, time.time())
+            self.eof_pkt = self.ack_nr
             self.state = ConnectionState.CLOSING
+            self._process_ack(header, sack)
 
             # Send final ACK
             response = self._build_packet(
@@ -1112,14 +1157,13 @@ class UTPConnection:
                 seq_nr=self.seq_nr,
             )
 
-            if self.seq_nr < 0xFFFF:
-                self.seq_nr += 1
+            self._bump_seq()
 
             return response
 
         elif header.packet_type == ST_STATE:
-            # Just an ACK with no data
-            self._process_ack(header, None)
+            # Just an ACK with no data. Do not move ack_nr to their seq.
+            self._process_ack(header, sack)
             return None
 
         return None
@@ -1134,15 +1178,12 @@ class UTPConnection:
         sack : SelectiveAck | None
             Optional selective ACK bitmask.
         """
-        # Update ack_nr
-        self.ack_nr = header.seq_nr
-
+        # header.ack_nr acknowledges our transmissions. header.seq_nr is the
+        # peer's send sequence and must not be treated as a cumulative ACK.
         if sack is not None:
-            # Process selective ACK
-            self._process_selective_ack(sack)
+            self._process_selective_ack(sack, header.ack_nr)
         else:
-            # Cumulative ACK: remove all packets up to ack_nr
-            self._process_cumulative_ack(header.seq_nr)
+            self._process_cumulative_ack(header.ack_nr)
 
         # Record the ACK time for timeout calculation
         self.congestion_control.last_ack_time = time.time()
@@ -1155,14 +1196,10 @@ class UTPConnection:
         ack_nr : int
             The acknowledged sequence number.
         """
+        ack = ack_nr & 0xFFFF
         to_remove = []
         for pkt in self.send_buffer:
-            if pkt.seq_nr < ack_nr:
-                pkt.acked = True
-                to_remove.append(pkt)
-                rtt_ms = max(0, int((time.time() - pkt.sent_time) * 1000))
-                self.congestion_control.register_acked(len(pkt.data), rtt_ms)
-            elif pkt.seq_nr == ack_nr:
+            if _seq_leq(pkt.seq_nr, ack):
                 pkt.acked = True
                 to_remove.append(pkt)
                 rtt_ms = max(0, int((time.time() - pkt.sent_time) * 1000))
@@ -1171,19 +1208,22 @@ class UTPConnection:
         for pkt in to_remove:
             self.send_buffer.remove(pkt)
 
-    def _process_selective_ack(self, sack: SelectiveAck) -> None:
+    def _process_selective_ack(self, sack: SelectiveAck, ack_nr: int) -> None:
         """Process a selective ACK by marking only the acknowledged packets.
 
         Parameters
         ----------
         sack : SelectiveAck
             The selective ACK bitmask.
+        ack_nr : int
+            The cumulative acknowledgement the bitmask is relative to.
         """
         acked_seqs = set()
+        base = ack_nr & 0xFFFF
         for i in range(sack.bits):
             if sack.get_bit(i):
                 # Bit i corresponds to ack_nr + 1 + i
-                acked_seq = self.ack_nr + 1 + i
+                acked_seq = (base + 1 + i) & 0xFFFF
                 acked_seqs.add(acked_seq)
 
         for pkt in list(self.send_buffer):
@@ -1289,7 +1329,7 @@ class UTPConnection:
                 ack_nr=self.ack_nr,
                 seq_nr=self.seq_nr,
             )
-            self.seq_nr += 1
+            self._bump_seq()
             self.packets_sent += 1
             sock.sendto(packet, address)
             return packet
@@ -1302,7 +1342,8 @@ class UTPConnection:
             payload=data,
         )
 
-        self.seq_nr += 1
+        sent_seq = self.seq_nr & 0xFFFF
+        self._bump_seq()
         self.packets_sent += 1
         self.bytes_sent += len(packet)
         self.last_activity = time.time()
@@ -1310,7 +1351,7 @@ class UTPConnection:
         # Track in send buffer if there's data
         if data:
             pkt = PendingPacket(
-                seq_nr=self.seq_nr - 1,
+                seq_nr=sent_seq,
                 data=data,
             )
             self.send_buffer.append(pkt)
@@ -1398,22 +1439,46 @@ class UTPConnection:
         """
         return self.state in (ConnectionState.CLOSED, ConnectionState.ERROR)
 
+    def _bump_seq(self) -> None:
+        """Advance the send sequence number, wrapping at 16 bits."""
+        self.seq_nr = (self.seq_nr + 1) & 0xFFFF
+
     def get_receive_data(self) -> bytes:
         """Get contiguous received data from the receive buffer.
+
+        ``_handle_data`` stores an accepted DATA/FIN payload under its
+        sequence number and sets ``ack_nr`` to that sequence, so the bytes
+        just acked live at ``ack_nr``. Callers that fill the buffer by hand
+        still use the older contract: ``ack_nr`` is the last consumed
+        sequence and the next block is ``ack_nr + 1``. Start at whichever of
+        those keys is present, preferring ``ack_nr`` when both are, then walk
+        forward through adjacent sequence numbers (16-bit wrap). A gap stops
+        the walk and leaves the later packet buffered.
 
         Returns
         -------
         bytes
-            Contiguous data starting from the expected sequence number.
+            Contiguous data starting from the next undelivered sequence number.
         """
         data = bytearray()
-        seq = self.ack_nr + 1  # Next expected sequence number
+        if self._deliver_seq is None:
+            ack = self.ack_nr & 0xFFFF
+            nxt = (ack + 1) & 0xFFFF
+            if ack in self.receive_buffer:
+                self._deliver_seq = ack
+            elif nxt in self.receive_buffer:
+                self._deliver_seq = nxt
+            else:
+                return b""
 
-        while seq in self.receive_buffer:
-            pkt_data, recv_time = self.receive_buffer.pop(seq)
+        seq = self._deliver_seq
+        for _ in range(65536):
+            if seq not in self.receive_buffer:
+                break
+            pkt_data, _recv_time = self.receive_buffer.pop(seq)
             data.extend(pkt_data)
-            seq += 1
-
+            seq = (seq + 1) & 0xFFFF
+        self._deliver_seq = seq
         return bytes(data)
 
     def check_timeout(self) -> bool:
@@ -1528,7 +1593,9 @@ class UTPSocket:
         if self.connection is not None:
             raise UTPError("Already connected")
 
-        conn_id = struct.unpack("!I", os.urandom(3))[0] & 0xFFFFFF
+        # Connection ids are 16-bit (header field). unpack("!I") needs 4 bytes;
+        # urandom(3) raised struct.error and made connect() unusable.
+        conn_id = int.from_bytes(os.urandom(2), "big")
         self.connection = UTPConnection(
             connection_id=conn_id,
             is_initiator=True,
@@ -1549,7 +1616,7 @@ class UTPSocket:
             Optional node ID for this connection.
         """
         self.is_server = True
-        conn_id = struct.unpack("!I", os.urandom(3))[0] & 0xFFFFFF
+        conn_id = int.from_bytes(os.urandom(2), "big")
         self.connection = UTPConnection(
             connection_id=conn_id,
             is_initiator=False,
@@ -1605,8 +1672,14 @@ class UTPSocket:
         if self.connection is None or self._address is None:
             raise UTPError("Not connected")
 
-        self.connection.send(data)
-        self.connection.send_packet(self.sock, self._address, data)
+        # connection.send() only queues. send_packet() transmits and records
+        # the same bytes again, so calling both charged the congestion window
+        # twice and left a ghost packet in the send buffer.
+        if self.connection.state != ConnectionState.CONNECTED:
+            raise UTPConnectionError(f"Cannot send data in state: {self.connection.state}")
+        sent = self.connection.send_packet(self.sock, self._address, data)
+        if not sent:
+            raise UTPError("utp send failed")
         return len(data)
 
     def recv(self, maxlen: int = 65536) -> bytes:

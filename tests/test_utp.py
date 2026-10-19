@@ -542,6 +542,58 @@ class TestUTPConnection(unittest.TestCase):
         with self.assertRaises(UTPConnectionError):
             conn.send(b"hello")
 
+    def test_seq_nr_wraps_at_16_bits(self):
+        conn = UTPConnection(connection_id=1, is_initiator=True)
+        conn.seq_nr = 0xFFFF
+        conn._bump_seq()
+        self.assertEqual(conn.seq_nr, 0)
+
+    def test_cumulative_ack_uses_ack_nr_not_seq_nr(self):
+        conn = UTPConnection(connection_id=1, is_initiator=True)
+        conn.state = ConnectionState.CONNECTED
+        conn.send_buffer.append(PendingPacket(seq_nr=4, data=b"abcd"))
+        header = PacketHeader(packet_type=ST_STATE, seq_nr=1, ack_nr=4)
+        conn._process_ack(header, None)
+        self.assertEqual(conn.send_buffer, [])
+
+    def test_data_is_acked_without_echo_and_is_delivered(self):
+        conn = UTPConnection(connection_id=7, is_initiator=True)
+        conn.state = ConnectionState.CONNECTED
+        conn.seq_nr = 3
+        header = PacketHeader(packet_type=ST_DATA, seq_nr=1, ack_nr=0)
+        raw = header.serialize() + b"hello"
+        resp = conn.handle_packet(raw, header, ("192.0.2.1", 1))
+        self.assertIsNotNone(resp)
+        assert resp is not None
+        parsed = PacketHeader.parse(resp)
+        self.assertEqual(parsed.packet_type, ST_STATE)
+        self.assertEqual(len(resp), 20)
+        self.assertEqual(conn.get_receive_data(), b"hello")
+        self.assertEqual(conn.seq_nr, 4)
+
+    def test_socket_connect_allocates_16bit_id(self):
+        sock = UTPSocket()
+        try:
+            sock.sock.close()
+
+            class _FakeSock:
+                def sendto(self, _data: bytes, _addr: tuple) -> None:
+                    return None
+
+                def close(self) -> None:
+                    return None
+
+            sock.sock = _FakeSock()  # type: ignore[assignment]
+            sock.connect(("192.0.2.1", 1))
+            assert sock.connection is not None
+            self.assertGreaterEqual(sock.connection.connection_id, 0)
+            self.assertLessEqual(sock.connection.connection_id, 0xFFFF)
+            self.assertEqual(sock.connection.state, ConnectionState.SYN_SENT)
+        finally:
+            sock._closed = True
+            if sock.connection is not None:
+                sock.connection.state = ConnectionState.CLOSED
+
     def test_is_closed(self):
         """Test is_closed detection."""
         conn = UTPConnection(connection_id=0x1234)
