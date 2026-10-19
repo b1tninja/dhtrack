@@ -98,6 +98,25 @@ def test_bep47_padding_no_disk_file_zeros_in_layout(tmp_path: Path) -> None:
     st.close()
 
 
+def test_storage_rejects_path_escape(tmp_path: Path) -> None:
+    piece = b"\x00" * 20
+    info = {
+        b"name": b"folder",
+        b"piece length": 16,
+        b"pieces": piece,
+        b"files": [
+            {b"length": 4, b"path": [b"..", b"outside.bin"]},
+        ],
+    }
+    torrent = _torrent_from_info(info)
+    try:
+        TorrentStorage(torrent, tmp_path)
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "unsafe" in str(exc).lower()
+    assert not (tmp_path.parent / "outside.bin").exists()
+
+
 def test_storage_close_prevents_writes(tmp_path: Path) -> None:
     payload = b"q" * 2000
     piece_len = 1024

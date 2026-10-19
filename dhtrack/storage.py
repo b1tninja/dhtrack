@@ -39,6 +39,36 @@ def _normalize_file_entry_for_bep47(entry: dict) -> dict[bytes, Any]:
     return out
 
 
+def _safe_relative(parts: list[str]) -> Path:
+    """Join torrent path components and refuse anything that escapes the download dir.
+
+    Metainfo is untrusted (DHT metadata, web, magnet). A ``path`` or ``name`` of
+    ``..`` or an absolute path would otherwise write outside ``base_dir``.
+    """
+    if not parts:
+        raise ValueError("empty torrent path")
+    clean: list[str] = []
+    for part in parts:
+        if not part or part in (".", "..") or "\x00" in part or "/" in part or "\\" in part:
+            raise ValueError(f"unsafe torrent path component: {part!r}")
+        if Path(part).name != part:
+            raise ValueError(f"unsafe torrent path component: {part!r}")
+        clean.append(part)
+    rel = Path(*clean)
+    if rel.is_absolute() or any(p == ".." for p in rel.parts):
+        raise ValueError(f"unsafe torrent path: {rel}")
+    return rel
+
+
+def _contained(base: Path, dest: Path) -> Path:
+    """Return ``dest`` when it resolves inside ``base``."""
+    base_r = base.resolve()
+    dest_r = dest.resolve()
+    if os.path.commonpath([str(base_r), str(dest_r)]) != str(base_r):
+        raise ValueError(f"torrent path escapes download directory: {dest}")
+    return dest
+
+
 def _torrent_files(t: Torrent) -> list[tuple[Path, int]]:
     """Return list of (relative_path, length) for single or multi-file torrents."""
     info = t.info
@@ -61,7 +91,7 @@ def _torrent_files(t: Torrent) -> list[tuple[Path, int]]:
                     parts.append(p.decode("utf-8", "replace"))
                 else:
                     parts.append(str(p))
-            out.append((Path(*parts), int(length)))
+            out.append((_safe_relative(parts), int(length)))
         return out
 
     # single-file
@@ -73,7 +103,7 @@ def _torrent_files(t: Torrent) -> list[tuple[Path, int]]:
     length = info.get("length", info.get(b"length", 0))
     if not isinstance(length, int) or length < 0:
         raise ValueError("invalid torrent length")
-    return [(Path(name_s), int(length))]
+    return [(_safe_relative([name_s]), int(length))]
 
 
 def total_length(t: Torrent) -> int:
@@ -141,12 +171,12 @@ class TorrentStorage:
                         parts.append(p.decode("utf-8", "replace"))
                     else:
                         parts.append(str(p))
-                rel = Path(*parts)
+                rel = _safe_relative(parts)
                 ne = _normalize_file_entry_for_bep47(entry)
                 if bep47.is_padding_file(ne):
                     disk_path: Path | None = None
                 else:
-                    disk_path = self.base_dir / rel
+                    disk_path = _contained(self.base_dir, self.base_dir / rel)
                 spans.append(StorageSpan(path=disk_path, offset=torrent_offset, length=int(length)))
                 torrent_offset += int(length)
             return spans
@@ -160,8 +190,9 @@ class TorrentStorage:
         length = info.get("length", info.get(b"length", 0))
         if not isinstance(length, int) or length < 0:
             raise ValueError("invalid torrent length")
+        rel = _safe_relative([name_s])
         spans.append(
-            StorageSpan(path=self.base_dir / Path(name_s), offset=0, length=int(length)),
+            StorageSpan(path=_contained(self.base_dir, self.base_dir / rel), offset=0, length=int(length)),
         )
         return spans
 
