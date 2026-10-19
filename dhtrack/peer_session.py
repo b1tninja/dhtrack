@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from dhtrack.peer import (
+    MAX_PEER_WIRE_MESSAGE,
     MSG_BITFIELD,
     MSG_CHOKE,
     MSG_HAVE,
@@ -89,6 +90,8 @@ def read_peer_message(sock: _StreamSocket, deadline: float) -> tuple[int, bytes]
     msg_len = struct.unpack("!I", lb)[0]
     if msg_len == 0:
         return (-1, b"")
+    if msg_len > MAX_PEER_WIRE_MESSAGE:
+        raise ExtensionError(f"peer wire message too large: {msg_len}")
     rest = _read_exact(sock, msg_len, deadline)
     if rest is None:
         return None

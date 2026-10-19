@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 _steps = logging.getLogger(__name__ + ".steps")
 _steps.setLevel(logging.WARNING)
 
+# Untrusted torrent/DHT payloads are attacker-controlled. Cap nesting so a
+# deeply nested list/dict raises DecodeError instead of RecursionError, and
+# cap integer width so a multi-megabyte digit run cannot build a giant int.
+MAX_BENCODE_NESTING = 64
+MAX_BENCODE_INT_DIGITS = 64
+
 
 class BEncodeError(Exception):
     """Base exception for BEncode errors."""
@@ -93,7 +99,7 @@ def decode(buffer: bytes | bytearray) -> BEncodeValue:
 
     logger.debug("Decoding %d bytes of bencode data", len(buffer))
     buf = _decode_buffer(buffer)
-    parsed, _ = _decode_item(buf, 0)
+    parsed, _ = _decode_item(buf, 0, 0)
     logger.debug("Decoded value type: %s", type(parsed).__name__)
     return parsed
 
@@ -117,7 +123,7 @@ def decode_item(buffer: bytes | bytearray, offset: int = 0) -> tuple[BEncodeValu
         raise DecodeError(f"Buffer exhausted at offset {offset}")
 
     buf = _decode_buffer(buffer)
-    parsed, new_offset = _decode_item(buf, offset)
+    parsed, new_offset = _decode_item(buf, offset, 0)
     return parsed, new_offset
 
 
@@ -145,7 +151,27 @@ def encode(value: BEncodeValue) -> bytes:
         raise EncodeError(f"Cannot encode value: {type(value).__name__}") from exc
 
 
-def _decode_item(buffer: bytes, offset: int) -> tuple[BEncodeValue, int]:
+def _canonical_int(token: bytes, offset: int, *, signed: bool = True) -> int:
+    """Parse a bencode integer or string-length token.
+
+    BEP 3 forbids leading zeros (``i03e``, ``i-0e``, ``03:foo``) and an empty
+    digit run. Digit length is capped so a hostile buffer cannot allocate an
+    arbitrary-precision integer. String lengths pass ``signed=False``.
+    """
+    negative = signed and token[:1] == b"-"
+    body = token[1:] if negative else token
+    if not body or not body.isdigit():
+        raise DecodeError(f"Invalid integer at offset {offset}")
+    if len(body) > MAX_BENCODE_INT_DIGITS:
+        raise DecodeError(f"Integer too wide at offset {offset}")
+    if len(body) > 1 and body[:1] == b"0":
+        raise DecodeError(f"Leading zero in integer at offset {offset}")
+    if negative and body[:1] == b"0":
+        raise DecodeError(f"Negative zero at offset {offset}")
+    return int(token)
+
+
+def _decode_item(buffer: bytes, offset: int, depth: int) -> tuple[BEncodeValue, int]:
     """Internal: decode a single BEncode item from buffer at offset.
 
     Parameters
@@ -154,12 +180,16 @@ def _decode_item(buffer: bytes, offset: int) -> tuple[BEncodeValue, int]:
         The raw BEncode buffer (callers normalize via :func:`_decode_buffer`).
     offset : int
         The byte offset to start parsing from.
+    depth : int
+        Current container nesting depth. The outermost value is depth 0.
 
     Returns
     -------
     tuple[BEncodeValue, int]
         (decoded_value, new_offset)
     """
+    if depth > MAX_BENCODE_NESTING:
+        raise DecodeError(f"bencode nesting exceeds {MAX_BENCODE_NESTING}")
     if offset >= len(buffer):
         raise DecodeError("Buffer exhausted")
 
@@ -175,11 +205,11 @@ def _decode_item(buffer: bytes, offset: int) -> tuple[BEncodeValue, int]:
 
     # Dictionary: d<items>e
     if byte == ord(b"d"):
-        return _decode_dict(buffer, offset)
+        return _decode_dict(buffer, offset, depth)
 
     # List: l<items>e
     if byte == ord(b"l"):
-        return _decode_list(buffer, offset)
+        return _decode_list(buffer, offset, depth)
 
     raise DecodeError(f"Unexpected byte 0x{byte:02x} at offset {offset}")
 
@@ -196,15 +226,16 @@ def _decode_integer(buffer: bytes, offset: int) -> tuple[BEncodeInt, int]:
         logger.debug("Unterminated integer at offset %d: no closing 'e'", offset)
         raise DecodeError(f"Unterminated integer at offset {offset}") from None
 
+    token = buffer[start:end]
     try:
-        value = int(buffer[start:end])
-    except ValueError:
-        logger.debug("Invalid integer at offset %d: %r", offset, buffer[start:end])
-        raise DecodeError(f"Invalid integer at offset {offset}") from None
+        value = _canonical_int(token, offset)
+    except DecodeError:
+        logger.debug("Invalid integer at offset %d: %r", offset, token)
+        raise
 
     _steps.debug(
         "Decoded integer i%sie at offset %d: %d",
-        buffer[start:end].decode("ascii"),
+        token.decode("ascii"),
         offset,
         value,
     )
@@ -222,15 +253,12 @@ def _decode_string(buffer: bytes, offset: int) -> tuple[BEncodeBytes, int]:
         logger.debug("Unterminated string at offset %d: no colon found", offset)
         raise DecodeError(f"Unterminated string at offset {offset}") from None
 
+    length_token = buffer[offset:colon]
     try:
-        length = int(buffer[offset:colon])
-    except ValueError:
-        logger.debug("Invalid string length at offset %d: %r", offset, buffer[offset:colon])
+        length = _canonical_int(length_token, offset, signed=False)
+    except DecodeError:
+        logger.debug("Invalid string length at offset %d: %r", offset, length_token)
         raise DecodeError(f"Invalid string length at offset {offset}") from None
-
-    if length < 0:
-        logger.debug("Negative string length at offset %d: %d", offset, length)
-        raise DecodeError(f"Negative string length at offset {offset}")
 
     start = colon + 1
     end = start + length
@@ -248,12 +276,13 @@ def _decode_string(buffer: bytes, offset: int) -> tuple[BEncodeBytes, int]:
     return buffer[start:end], end
 
 
-def _decode_dict(buffer: bytes, offset: int) -> tuple[BEncodeDict, int]:
+def _decode_dict(buffer: bytes, offset: int, depth: int) -> tuple[BEncodeDict, int]:
     """Decode a dictionary from BEncode format.
 
     Format: d<key><value><key><value>...e
     Keys are raw byte strings (bencoded as length-prefixed bytes).
-    Keys are stored as bytes in the decoded dict, sorted by raw bytes.
+    Duplicate keys are rejected: last-key-wins and first-key-wins parsers
+    disagree, which is a classic bencode differential.
     """
     start = offset + 1  # skip 'd'
     result: dict[bytes, Any] = {}
@@ -271,9 +300,11 @@ def _decode_dict(buffer: bytes, offset: int) -> tuple[BEncodeDict, int]:
 
         # Decode key (keys are bencoded byte strings)
         key, start = _decode_string(buffer, start)
+        if key in result:
+            raise DecodeError(f"Duplicate dictionary key at offset {offset}")
 
         # Decode value
-        value, start = _decode_item(buffer, start)
+        value, start = _decode_item(buffer, start, depth + 1)
         result[key] = value
         item_count += 1
 
@@ -287,7 +318,7 @@ def _decode_dict(buffer: bytes, offset: int) -> tuple[BEncodeDict, int]:
     raise DecodeError("Unreachable")
 
 
-def _decode_list(buffer: bytes, offset: int) -> tuple[BEncodeList, int]:
+def _decode_list(buffer: bytes, offset: int, depth: int) -> tuple[BEncodeList, int]:
     """Decode a list from BEncode format.
 
     Format: l<items>e
@@ -305,7 +336,7 @@ def _decode_list(buffer: bytes, offset: int) -> tuple[BEncodeList, int]:
             _steps.debug("Decoded list with %d items at offset %d", item_count, offset)
             return result, start + 1
 
-        value, start = _decode_item(buffer, start)
+        value, start = _decode_item(buffer, start, depth + 1)
         result.append(value)
         item_count += 1
         _steps.debug(
@@ -333,6 +364,12 @@ def _encode_item(value: BEncodeValue) -> bytes:
     """
     if isinstance(value, bytes):
         return _encode_bytes(value)
+
+    # bool is a subclass of int. Torrent builders pass True/False for integer
+    # flags such as ``private``; encode those as i1e/i0e. The check stays
+    # before other non-int branches so a bool is never treated as a list.
+    if isinstance(value, bool):
+        return _encode_int(int(value))
 
     if isinstance(value, int):
         return _encode_int(value)

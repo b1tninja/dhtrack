@@ -181,7 +181,7 @@ def parse_peer_message(data: bytes) -> PeerMessage:
         # Keepalive
         return PeerMessage(msg_type=-1)  # -1 = keepalive
 
-    if msg_len < 1 or msg_len > 0xFFFF:
+    if msg_len < 1 or msg_len > MAX_PEER_WIRE_MESSAGE:
         raise ExtensionError(f"Invalid message length: {msg_len}")
 
     if len(data) < 4 + msg_len:
@@ -192,15 +192,22 @@ def parse_peer_message(data: bytes) -> PeerMessage:
 
     msg = PeerMessage(msg_type=msg_type, payload=payload)
 
-    # Decode type-specific fields
-    if msg_type == MSG_REQUEST or msg_type == MSG_PIECE or msg_type == MSG_CANCEL:
+    # Decode type-specific fields.
+    # request/cancel: index(4) + begin(4) + length(4)
+    # piece:          index(4) + begin(4) + block  (no length field; BEP 3)
+    if msg_type == MSG_PIECE:
+        if len(payload) >= 8:
+            idx, begin = struct.unpack("!II", payload[:8])
+            msg.piece_index = idx
+            msg.begin = begin
+            msg.piece_data = payload[8:]
+            msg.length = len(msg.piece_data)
+    elif msg_type == MSG_REQUEST or msg_type == MSG_CANCEL:
         if len(payload) >= 12:
             idx, begin, length = struct.unpack("!III", payload[:12])
             msg.piece_index = idx
             msg.begin = begin
             msg.length = length
-        if msg_type == MSG_PIECE and len(payload) > 12:
-            msg.piece_data = payload[12:]
 
     elif msg_type == MSG_HAVE:
         if len(payload) >= 4:
@@ -326,6 +333,10 @@ UT_METADATA_REJECT = 2
 
 # Maximum metadata size: 10 MB (DoS protection)
 MAX_METADATA_SIZE = 10 * 1024 * 1024
+
+# Peer-wire length prefix is 4 bytes and is attacker-controlled. 16 MiB covers
+# a full large piece block plus headers; it rejects a 4 GiB allocation.
+MAX_PEER_WIRE_MESSAGE = 16 * 1024 * 1024
 
 # Default block size: 16 KiB as specified in BEP 9
 METADATA_BLOCK_SIZE = 16384
