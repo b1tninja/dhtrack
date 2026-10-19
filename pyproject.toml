@@ -45,6 +45,7 @@ dev = [
 
 [project.scripts]
 dhtrack = "dhtrack.cli:main"
+dhtrack-experimental = "dhtrack.experimental.cli:main"
 dhtrack-gui = "dhtrack.gui.__main__:main"
 
 [project.gui-scripts]
