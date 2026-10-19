@@ -235,11 +235,19 @@ def default_peers_file() -> str:
 
 
 def resolved_peers_file(settings: GuiSettings) -> str:
-    """Absolute-or-as-given peers file. Blank settings use :func:`default_peers_file`."""
+    """Absolute-or-as-given peers file. Blank settings use :func:`default_peers_file`.
+
+    Settings files written before the XDG move saved the old default, a bare
+    ``peers.dat`` relative to the working directory. That exact value is
+    treated as blank so upgraded installs move to the config directory.
+    """
     raw = (settings.peers_file or "").strip()
-    if raw:
+    if raw and raw != _LEGACY_DEFAULT_PEERS_FILE:
         return raw
     return default_peers_file()
+
+
+_LEGACY_DEFAULT_PEERS_FILE = "peers.dat"
 
 
 def default_torrent_library_directory() -> Path:
@@ -331,6 +339,28 @@ def _apply_dht_on_node(settings: GuiSettings, node: Any) -> None:
         node.apply_runtime_settings(settings)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Failed to apply runtime settings on node: %s", exc)
+
+
+def _apply_dht_module_globals(settings: GuiSettings) -> None:
+    """Push the DHT knobs that have no per-node field into ``dhtrack.dht``.
+
+    Lookup, timeout, pending-cap, scrape and bootstrap settings live on the
+    node (:meth:`DHTNode.apply_runtime_settings`). Token and secret timing
+    are read from module constants by ``TokenSecret``, so they are still set
+    here, along with the remaining preferences-dialog knobs.
+    """
+    g = [
+        ("WARMUP_PING_QPS", settings.dht_warmup_ping_qps),
+        ("WARMUP_PING_LIMIT", settings.dht_warmup_ping_limit),
+        ("MTU", settings.dht_mtu),
+        ("REPLACEMENT_TIMEOUT", settings.dht_replacement_timeout),
+        ("CONTACT_REFRESH_INTERVAL", settings.dht_contact_refresh_interval),
+        ("SECRET_ROTATION_INTERVAL", settings.dht_secret_rotation_interval),
+        ("TOKEN_MAX_AGE", settings.dht_token_max_age),
+        ("BOOTSTRAP_MAX_PEERS_FILE_TARGETS", settings.bootstrap_max_peers_file_targets),
+    ]
+    for name, value in g:
+        _set_module_attr("dhtrack.dht", name, value)
 
 
 def _apply_metadata_globals(settings: GuiSettings) -> None:
@@ -480,6 +510,7 @@ def apply_to_runtime(
     so that the *next* node construction picks them up.
     """
     _apply_log_levels(settings)
+    _apply_dht_module_globals(settings)
     _apply_metadata_globals(settings)
     _apply_peer_globals(settings)
     _apply_downloader_globals(settings)

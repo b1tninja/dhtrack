@@ -108,3 +108,47 @@ def test_default_peers_file_is_beside_config() -> None:
     path = default_peers_file()
     assert path.endswith("peers.dat")
     assert "dhtrack" in path
+
+
+def test_legacy_relative_peers_file_moves_to_config_dir() -> None:
+    from dhtrack.settings import resolved_peers_file
+
+    assert resolved_peers_file(GuiSettings(peers_file="peers.dat")) == default_peers_file()
+    assert resolved_peers_file(GuiSettings(peers_file="/srv/dht/peers.dat")) == "/srv/dht/peers.dat"
+
+
+def test_token_timing_settings_still_apply(monkeypatch) -> None:
+    import dhtrack.dht as dht_module
+    from dhtrack.settings import apply_to_runtime
+
+    monkeypatch.setattr(dht_module, "TOKEN_MAX_AGE", dht_module.TOKEN_MAX_AGE)
+    monkeypatch.setattr(dht_module, "SECRET_ROTATION_INTERVAL", dht_module.SECRET_ROTATION_INTERVAL)
+    apply_to_runtime(GuiSettings(dht_token_max_age=1234, dht_secret_rotation_interval=77))
+    assert dht_module.TOKEN_MAX_AGE == 1234
+    assert dht_module.SECRET_ROTATION_INTERVAL == 77
+
+
+def test_save_peers_creates_config_dir(tmp_path) -> None:
+    target = tmp_path / "missing" / "dir" / "peers.dat"
+    node = DHTNode(
+        node_id=b"\x01" * 20, bind_addr=("127.0.0.1", 0), peers_file=str(target), persist_node_identity=False
+    )
+    try:
+        node.add_peer(b"\x22" * 20, "192.0.2.80", 6881)
+        node.save_peers()
+        assert target.exists()
+    finally:
+        node.close()
+
+
+def test_send_does_not_count_as_heard_from() -> None:
+    node = DHTNode(node_id=b"\x01" * 20, bind_addr=("127.0.0.1", 0), persist_node_identity=False)
+    try:
+        node.send_datagram = lambda _endpoint, _payload: None  # type: ignore[method-assign]
+        peer = node.add_peer(None, "192.0.2.81", 6881)
+        assert peer is not None
+        peer.last_seen = 5.0
+        peer.write(b"d1:y1:qe")
+        assert peer.last_seen == 5.0
+    finally:
+        node.close()

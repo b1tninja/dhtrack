@@ -84,6 +84,7 @@ class MainWorkspaceShell(QWidget):
                 stack_index += 1
             self.sidebar.addItem(item)
 
+        self._last_row = first_selectable
         if first_selectable >= 0:
             mapped = self._row_to_stack[first_selectable]
             self.sidebar.setCurrentRow(first_selectable)
@@ -97,9 +98,16 @@ class MainWorkspaceShell(QWidget):
             return
         mapped = self._row_to_stack[row]
         if mapped is None:
-            for nxt in range(row + 1, len(self._row_to_stack)):
+            # A section header is not a page: skip it in the direction the
+            # selection moved, so Up can still reach the previous section.
+            if row < self._last_row:
+                order = list(range(row - 1, -1, -1)) + list(range(row + 1, len(self._row_to_stack)))
+            else:
+                order = list(range(row + 1, len(self._row_to_stack))) + list(range(row - 1, -1, -1))
+            for nxt in order:
                 if self._row_to_stack[nxt] is not None:
                     self.sidebar.setCurrentRow(nxt)
                     return
             return
+        self._last_row = row
         self.stack.setCurrentIndex(mapped)

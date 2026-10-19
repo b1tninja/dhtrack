@@ -791,9 +791,17 @@ def _load_node_identity(path: str) -> bytes | None:
         return None
 
 
+def _ensure_parent_dir(path: str) -> None:
+    """Create the directory holding ``path`` (the default lives under ~/.config)."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def _save_node_identity(path: str, node_id: bytes) -> None:
     if len(node_id) != 20:
         raise ValueError("node_id must be 20 bytes")
+    _ensure_parent_dir(path)
     tmp_path = path + ".tmp"
     payload = NODE_STATE_MAGIC + bytes([NODE_STATE_VER]) + b"\x00\x00\x00" + node_id
     with open(tmp_path, "wb") as fh:
@@ -1395,7 +1403,8 @@ class DHTPeer:
         nid_e = binascii.b2a_hex(self.node_id).decode("ascii") if self.node_id else "unknown"
         logger.debug("Sending %d bytes to peer %s (node_id=%s)", len(data), addr, nid_e)
 
-        self.last_seen = time.time()
+        # last_seen means "last heard from" (eviction rank, peers.dat); it is
+        # updated on receive, not here.
         pending = self._last_outgoing_pending
         self._last_outgoing_pending = None
 
@@ -2135,6 +2144,13 @@ class DHTPeer:
             if isinstance(rid, str):
                 rid = rid.encode("latin-1")
             if isinstance(rid, bytes) and len(rid) == 20:
+                ep = self.endpoint
+                if not self.node_id and self.dht_node.peers.get((ep.ip, ep.port)) is self:
+                    # First time we learn this contact's id (bootstrap router,
+                    # unsolicited sender). add_peer attaches it and files the
+                    # contact in the routing table, node-id index, or lookup
+                    # overflow so lookups can find it.
+                    self.dht_node.add_peer(rid, ep.ip, ep.port, is_ipv6=ep.is_ipv6)
                 self.node_id = rid
                 self.last_seen = time.time()
                 self.dht_node._mark_node_good(self)
@@ -3213,7 +3229,12 @@ class DHTNode:
             )
             self.node_id = new_id
             self.routing_table = DualStackRoutingTable(self.node_id)
+            self._apply_bucket_size()
             self.peers.clear()
+            # The node-id index and lookup overflow point at the contacts just
+            # dropped; stale entries would route queries through dead peers.
+            self._peers_by_node_id.clear()
+            self._lookup_overflow.clear()
             self._observed_ip_votes_v4.clear()
             self._observed_ip_votes_v6.clear()
             self.observed_external_v4 = None
@@ -4210,6 +4231,10 @@ class DHTNode:
         per_ih = getattr(settings, "peerstore_max_peers_per_infohash", None)
         if per_ih is not None and hasattr(self, "peer_store"):
             self.peer_store._max_peers_per_infohash = max(1, int(per_ih))
+        self._apply_bucket_size()
+
+    def _apply_bucket_size(self) -> None:
+        """Set the configured K (``self.k``) on both routing tables and their buckets."""
         for table in (self.routing_table.v4, self.routing_table.v6):
             table.bucket_size = self.k
             for bucket in table.buckets:
@@ -4807,6 +4832,7 @@ class DHTNode:
 
         tmp_path = path + ".tmp"
         try:
+            _ensure_parent_dir(path)
             with open(tmp_path, "wb") as fh:
                 fh.write(PEERS_FILE_MAGIC_V2)
                 fh.write(struct.pack("!I", len(sorted_nodes)))

@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from dhtrack.dht import MAX_PEER_TABLE, DHTNode
+from dhtrack.dht import MAX_PEER_TABLE, BucketNode, DHTNode, Endpoint
 
 
 def _node(tmp_path) -> DHTNode:
@@ -92,5 +92,45 @@ def test_closest_k_uses_buckets_not_every_contact(tmp_path) -> None:
         ids = [c.node_id for c in node.iter_query_candidates(b"\x00" * 20, 8)]
         assert close not in ids
         assert far in ids
+    finally:
+        node.close()
+
+
+def _plain_node() -> DHTNode:
+    return DHTNode(node_id=b"\x01" * 20, bind_addr=("127.0.0.1", 0), persist_node_identity=False)
+
+
+def test_id_learned_from_response_becomes_lookup_candidate() -> None:
+    node = _plain_node()
+    try:
+        node.send_datagram = lambda _endpoint, _payload: None  # type: ignore[method-assign]
+        peer = node.add_peer(None, "192.0.2.70", 6881)
+        assert peer is not None
+        rid = b"\x55" * 20
+        peer._process_response("ping", {}, {b"r": {b"id": rid}})
+        assert peer.node_id == rid
+        assert node.peer_for_bucket_node(BucketNode(node_id=rid, endpoint=Endpoint("203.0.113.1", 1))) is peer
+        ids = [n.node_id for n in node.iter_query_candidates(rid, 8)]
+        assert rid in ids
+    finally:
+        node.close()
+
+
+def test_bep42_rotation_resets_indexes_and_keeps_k() -> None:
+    node = _plain_node()
+    try:
+        node.save_node_state = lambda: None  # type: ignore[method-assign]
+        node.bootstrap = lambda *a, **k: 0  # type: ignore[method-assign]
+        node.k = 4
+        node.add_peer(b"\x66" * 20, "192.0.2.71", 6881)
+        assert node._peers_by_node_id
+        node.auto_align_bep42_node_id = True
+        node.observed_external_v4 = Endpoint("124.31.75.21", 6881)
+        with node._peers_lock:
+            node._maybe_align_bep42_node_id_unlocked()
+        assert node.peers == {}
+        assert node._peers_by_node_id == {}
+        assert not node._lookup_overflow
+        assert all(b.bucket_size == 4 for b in node.routing_table.v4.buckets)
     finally:
         node.close()
