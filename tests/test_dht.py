@@ -2362,15 +2362,24 @@ class TestBEP33ScrapeBloomFilters:
     """Tests for bloom filter generation in scrape responses."""
 
     def test_seed_bloom_filter_generation(self):
-        """Seed bloom filter should be generated from stored peers."""
+        """BFsd covers seeds only; a leecher must not set bits in it."""
         store = PeerStore()
         info_hash = b"\x01" * 20
-        store.add_peer(info_hash, "192.168.1.1", 6881)
-        store.add_peer(info_hash, "192.168.1.2", 6882)
+        store.add_peer(info_hash, "192.168.1.1", 6881, is_seed=True)
+        store.add_peer(info_hash, "192.168.1.2", 6882, is_seed=False)
 
         bf = store.get_seed_bloom_filter(info_hash)
         assert bf is not None
         assert len(bf.to_bytes()) == 256
+        from dhtrack.bloom_filter import BloomFilter
+
+        seed_only = BloomFilter()
+        seed_only.insert_ip("192.168.1.1")
+        assert bf.to_bytes() == seed_only.to_bytes()
+
+        leech_only = PeerStore()
+        leech_only.add_peer(info_hash, "192.168.1.2", 6882, is_seed=False)
+        assert leech_only.get_seed_bloom_filter(info_hash) is None
 
     def test_peer_bloom_filter_generation(self):
         """Peer bloom filter should be generated from stored peers."""
@@ -2742,5 +2751,192 @@ class TestIterQueryCandidates:
             assert p is not None
             assert p.endpoint.ip == "192.0.2.20"
             assert p.endpoint.port == 2222
+        finally:
+            node.close()
+
+
+class TestRoutingTableRanges:
+    """Bucket membership is a lexicographic ID range, not an XOR-distance window."""
+
+    def test_mark_good_finds_node_after_split(self) -> None:
+        rt = RoutingTable(b"\x10" * 20)
+        left, right = rt.buckets[0].split()
+        high_id = b"\x90" * 20
+        high = BucketNode(
+            node_id=high_id,
+            endpoint=Endpoint("192.0.2.1", 6881),
+            status=NodeStatus.QUESTIONABLE,
+        )
+        # 0x90 belongs in the high half. XOR-distance range checks used to
+        # report it as inside the low bucket, so mark_good was a silent no-op.
+        assert high_id <= right.max_id
+        assert high_id >= right.min_id
+        right.nodes.append(high)
+        rt.buckets = [left, right]
+        rt.mark_good(high_id)
+        assert high.status == NodeStatus.GOOD
+
+    def test_split_assigns_by_id_order(self) -> None:
+        bucket = KBucket(b"\x00" * 20, b"\xff" * 20)
+        low = BucketNode(node_id=b"\x10" * 20, endpoint=Endpoint("192.0.2.1", 1))
+        high = BucketNode(node_id=b"\x90" * 20, endpoint=Endpoint("192.0.2.2", 1))
+        bucket.nodes = [low, high]
+        left, right = bucket.split()
+        assert low in left.nodes
+        assert high in right.nodes
+        assert high not in left.nodes
+
+
+class TestPeerStoreLimits:
+    def test_trim_allows_readd(self) -> None:
+        store = PeerStore(max_peers_per_infohash=1)
+        info_hash = b"\x11" * 20
+        store.add_peer(info_hash, "192.0.2.1", 1)
+        store.add_peer(info_hash, "192.0.2.2", 2)
+        assert [p.ip for p in store.get_peers(info_hash)] == ["192.0.2.2"]
+        store.add_peer(info_hash, "192.0.2.1", 1)
+        assert {p.ip for p in store.get_peers(info_hash)} == {"192.0.2.1"}
+
+    def test_global_cap_evicts_oldest(self) -> None:
+        store = PeerStore(max_entries=2, max_peers_per_infohash=10)
+        info_hash = b"\x22" * 20
+        store.add_peer(info_hash, "192.0.2.1", 1)
+        store._store[info_hash][0].last_seen = 1.0
+        store.add_peer(info_hash, "192.0.2.2", 2)
+        store._store[info_hash][1].last_seen = 2.0
+        store.add_peer(info_hash, "192.0.2.3", 3)
+        ips = {p.ip for p in store.get_peers(info_hash)}
+        assert ips == {"192.0.2.2", "192.0.2.3"}
+        assert len(store.get_peers(info_hash)) == 2
+
+    def test_is_seed_is_stored_and_upgraded(self) -> None:
+        store = PeerStore()
+        info_hash = b"\x33" * 20
+        store.add_peer(info_hash, "192.0.2.1", 1, is_seed=False)
+        assert store.get_peers(info_hash)[0].is_seed is False
+        store.add_peer(info_hash, "192.0.2.1", 1, is_seed=True)
+        assert store.get_peers(info_hash)[0].is_seed is True
+        assert store.get_seed_bloom_filter(info_hash) is not None
+        assert store.get_peer_bloom_filter(info_hash) is None
+
+
+class TestKrpcQueryHardening:
+    def _peer(self) -> tuple[DHTPeer, dict]:
+        node = MagicMock()
+        node.node_id = b"\x01" * 20
+        node.routing_table = MagicMock()
+        node.routing_table.v4.get_closest_nodes.return_value = []
+        node.routing_table.v6.get_closest_nodes.return_value = []
+        node.peer_store = PeerStore()
+        node.token_secret = MagicMock()
+        node.token_secret.generate_token.return_value = b"\x03" * 20
+        node.token_secret.validate_token.return_value = True
+        node.routing_table.increment_rpc_counter = MagicMock()
+        endpoint = Endpoint("192.0.2.10", 6881)
+        peer = DHTPeer(dht_node=node, endpoint=endpoint, node_id=b"\x04" * 20)
+        captured: dict = {}
+        peer.write = lambda data: captured.update({"data": data})  # type: ignore[method-assign]
+        return peer, captured
+
+    def test_integer_scrape_includes_peer_bloom_and_values(self) -> None:
+        peer, captured = self._peer()
+        info_hash = b"\x44" * 20
+        peer.dht_node.peer_store.add_peer(info_hash, "192.0.2.1", 1, is_seed=False)
+        args = {b"id": b"\x04" * 20, b"info_hash": info_hash, b"scrape": 1}
+        parsed = bencode_module.decode(_encode_dht_query("get_peers", args, b"ab"))
+        peer._handle_query(parsed)
+        response = bencode_module.decode(captured["data"])
+        body = response[b"r"]
+        assert b"values" in body
+        assert b"BFpe" in body
+        assert b"BFsd" not in body
+        assert b"nodes" not in body or isinstance(body.get(b"nodes"), bytes)
+
+    def test_integer_seed_announce_records_announcer_id(self) -> None:
+        peer, captured = self._peer()
+        info_hash = b"\x55" * 20
+        announcer = b"\x04" * 20
+        args = {
+            b"id": announcer,
+            b"info_hash": info_hash,
+            b"port": 7000,
+            b"token": b"\x03" * 20,
+            b"seed": 1,
+        }
+        parsed = bencode_module.decode(_encode_dht_query("announce_peer", args, b"cd"))
+        peer._handle_query(parsed)
+        stored = peer.dht_node.peer_store.get_peers(info_hash)
+        assert len(stored) == 1
+        assert stored[0].is_seed is True
+        assert stored[0].port == 7000
+        assert stored[0].node_id == announcer
+        assert stored[0].node_id != peer.dht_node.node_id
+
+    def test_invalid_port_is_protocol_error(self) -> None:
+        peer, captured = self._peer()
+        args = {
+            b"id": b"\x04" * 20,
+            b"info_hash": b"\x66" * 20,
+            b"port": 99999,
+            b"token": b"\x03" * 20,
+        }
+        parsed = bencode_module.decode(_encode_dht_query("announce_peer", args, b"ef"))
+        peer._handle_query(parsed)
+        response = bencode_module.decode(captured["data"])
+        assert response[b"y"] == b"e"
+        assert peer.dht_node.peer_store.get_peers(b"\x66" * 20) == []
+
+    def test_oversized_txid_is_not_echoed(self) -> None:
+        peer, captured = self._peer()
+        args = {b"id": b"\x04" * 20}
+        parsed = {
+            b"t": b"x" * 64,
+            b"y": b"q",
+            b"q": b"ping",
+            b"a": args,
+        }
+        peer._handle_query(parsed)
+        assert captured.get("data") is None
+
+
+class TestDatagramAdmission:
+    def test_first_query_from_unknown_is_processed(self) -> None:
+        node = DHTNode(node_id=b"\x01" * 20, bind_addr=("127.0.0.1", 0), persist_node_identity=False)
+        sent: list[bytes] = []
+        try:
+            node.send_datagram = lambda _endpoint, payload: sent.append(payload)  # type: ignore[method-assign]
+            tid = b"\x0a\x0b"
+            query = _encode_dht_query("ping", {b"id": b"\x09" * 20}, tid)
+            node._handle_datagram(query, ("192.0.2.50", 6881))
+            assert ("192.0.2.50", 6881) in node.peers
+            assert sent, "the first KRPC query must be answered"
+            response = bencode_module.decode(sent[0])
+            assert response[b"y"] == b"r"
+            assert response[b"t"] == tid
+        finally:
+            node.close()
+
+    def test_garbage_from_unknown_is_dropped(self) -> None:
+        node = DHTNode(node_id=b"\x01" * 20, bind_addr=("127.0.0.1", 0), persist_node_identity=False)
+        sent: list[bytes] = []
+        try:
+            node.send_datagram = lambda _endpoint, payload: sent.append(payload)  # type: ignore[method-assign]
+            node._handle_datagram(b"this is not bencode", ("192.0.2.51", 1))
+            assert ("192.0.2.51", 1) not in node.peers
+            assert sent == []
+        finally:
+            node.close()
+
+    def test_peer_table_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import dhtrack.dht as dht_module
+
+        monkeypatch.setattr(dht_module, "MAX_PEER_TABLE", 2)
+        node = DHTNode(node_id=b"\x01" * 20, bind_addr=("127.0.0.1", 0), persist_node_identity=False)
+        try:
+            assert node.add_peer(b"\x11" * 20, "192.0.2.1", 1) is not None
+            assert node.add_peer(None, "192.0.2.2", 2) is not None
+            assert node.add_peer(b"\x13" * 20, "192.0.2.3", 3) is not None
+            assert len(node.peers) == 2
+            assert ("192.0.2.2", 2) not in node.peers
         finally:
             node.close()
