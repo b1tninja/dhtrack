@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import time
 from pathlib import Path
+
+import pytest
 
 from dhtrack import bencode
 from dhtrack.downloader import BLOCK_LEN
-from dhtrack.peer import MSG_PIECE, MSG_REQUEST, serialize_peer_message
+from dhtrack.peer import (
+    MAX_PEER_WIRE_MESSAGE,
+    MSG_PIECE,
+    MSG_REQUEST,
+    ExtensionError,
+    parse_peer_message,
+    serialize_peer_message,
+)
 from dhtrack.storage import TorrentStorage, piece_hashes, total_length
 from dhtrack.torrent import Torrent
 
@@ -33,6 +43,42 @@ def test_serialize_request_message() -> None:
     assert msg[:4] == struct.pack("!I", 1 + len(payload))
     assert msg[4] == MSG_REQUEST
     assert msg[5:] == payload
+
+
+def test_parse_piece_does_not_treat_block_as_length() -> None:
+    block = b"abcdefghij"
+    payload = struct.pack("!II", 2, 16384) + block
+    raw = serialize_peer_message(MSG_PIECE, payload)
+    msg = parse_peer_message(raw)
+    assert msg.piece_index == 2
+    assert msg.begin == 16384
+    assert msg.piece_data == block
+    assert msg.length == len(block)
+
+
+def test_parse_rejects_hostile_length_prefix() -> None:
+    raw = struct.pack("!I", MAX_PEER_WIRE_MESSAGE + 1) + b"\x07"
+    with pytest.raises(ExtensionError, match="Invalid message length"):
+        parse_peer_message(raw)
+
+
+def test_read_peer_message_rejects_hostile_length() -> None:
+    from dhtrack.peer_session import read_peer_message
+
+    class _Sock:
+        def __init__(self) -> None:
+            self.buf = struct.pack("!I", MAX_PEER_WIRE_MESSAGE + 1)
+
+        def settimeout(self, _value: float) -> None:
+            return None
+
+        def recv(self, n: int) -> bytes:
+            chunk = self.buf[:n]
+            self.buf = self.buf[n:]
+            return chunk
+
+    with pytest.raises(ExtensionError, match="too large"):
+        read_peer_message(_Sock(), deadline=time.monotonic() + 5)
 
 
 def test_serialize_piece_message() -> None:
