@@ -1,22 +1,24 @@
 """
 DHT Monitor widget for the DHT Network Inspector.
 
-Provides a comprehensive dashboard for spying on the DHT network, including:
-- BEP 33 DHT Scrape visualization (seed/peer counts)
-- BEP 42 Security monitoring (failed authentications, suspicious nodes)
-- BEP 43 Read-only node detection (nodes that don't send queries)
-- BEP 46 Mutable item tracking (DHT-published data)
-- BEP 50 Pub/sub topic monitoring (active topics and participants)
+Shows traffic the node actually understands:
+
+- get_peers activity (this is not a BEP 33 scrape implementation)
+- KRPC error replies (this is not BEP 42 node-id enforcement)
+
+BEP 44 mutable items, BEP 46 forwarding, and BEP 50 pub/sub are not
+implemented. Their cards stay visible and read ``n/a`` so the window does
+not invent counters for them. BEP 43 read-only detection is also not implemented.
 """
 
 from __future__ import annotations
 
-import binascii
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
@@ -85,11 +87,11 @@ class DHTMonitorWidget(QWidget):
         cards_layout = QGridLayout()
         cards_layout.setSpacing(6)
 
-        self.scrape_count_card = StatCard("BEP 33 Scrape Requests", "0")
-        self.security_alert_card = StatCard("BEP 42 Security Alerts", "0")
-        self.readonly_node_card = StatCard("BEP 43 Read-Only Nodes", "0")
-        self.mutable_item_card = StatCard("BEP 46 Mutable Items", "0")
-        self.pubsub_topic_card = StatCard("BEP 50 Pub/Sub Topics", "0")
+        self.scrape_count_card = StatCard("get_peers seen (not BEP 33)", "0")
+        self.security_alert_card = StatCard("KRPC errors (not BEP 42)", "0")
+        self.readonly_node_card = StatCard("BEP 43 — not implemented", "n/a")
+        self.mutable_item_card = StatCard("BEP 46 — not implemented", "n/a")
+        self.pubsub_topic_card = StatCard("BEP 50 — not implemented", "n/a")
 
         cards_layout.addWidget(self.scrape_count_card, 0, 0)
         cards_layout.addWidget(self.security_alert_card, 0, 1)
@@ -107,7 +109,7 @@ class DHTMonitorWidget(QWidget):
             "QTextEdit { background-color: #0f0f1a; color: #a6adc8; "
             "font-family: monospace; border: 1px solid #313244; }"
         )
-        self.scrape_log.setPlaceholderText("BEP 33 Scrape requests and responses will appear here...")
+        self.scrape_log.setPlaceholderText("get_peers queries seen on the wire (not a BEP 33 scrape)...")
         main_layout.addWidget(self.scrape_log)
 
         # Security events log
@@ -118,7 +120,7 @@ class DHTMonitorWidget(QWidget):
             "QTextEdit { background-color: #0f0f1a; color: #a6adc8; "
             "font-family: monospace; border: 1px solid #313244; }"
         )
-        self.security_log.setPlaceholderText("BEP 42 Security events will appear here...")
+        self.security_log.setPlaceholderText("KRPC error replies (not BEP 42 security checks)...")
         main_layout.addWidget(self.security_log)
 
         # Read-only nodes log
@@ -129,7 +131,7 @@ class DHTMonitorWidget(QWidget):
             "QTextEdit { background-color: #0f0f1a; color: #a6adc8; "
             "font-family: monospace; border: 1px solid #313244; }"
         )
-        self.readonly_log.setPlaceholderText("BEP 43 Read-only nodes will appear here...")
+        self.readonly_log.setPlaceholderText("BEP 43 read-only detection is not implemented.")
         main_layout.addWidget(self.readonly_log)
 
         # Mutable items log
@@ -140,7 +142,7 @@ class DHTMonitorWidget(QWidget):
             "QTextEdit { background-color: #0f0f1a; color: #a6adc8; "
             "font-family: monospace; border: 1px solid #313244; }"
         )
-        self.mutable_log.setPlaceholderText("BEP 46 Mutable items will appear here...")
+        self.mutable_log.setPlaceholderText("BEP 44/46 mutable DHT items are not implemented.")
         main_layout.addWidget(self.mutable_log)
 
         # Pub/sub topics log
@@ -151,7 +153,7 @@ class DHTMonitorWidget(QWidget):
             "QTextEdit { background-color: #0f0f1a; color: #a6adc8; "
             "font-family: monospace; border: 1px solid #313244; }"
         )
-        self.pubsub_log.setPlaceholderText("BEP 50 Pub/sub topics will appear here...")
+        self.pubsub_log.setPlaceholderText("BEP 50 pub/sub is not implemented.")
         main_layout.addWidget(self.pubsub_log)
 
         # Control buttons
@@ -198,20 +200,11 @@ class DHTMonitorWidget(QWidget):
         else:
             f"{elapsed / 3600:.2f}h"
 
-        # Update scrape count
-        self.scrape_count_card.update_value(str(len(self._scrape_requests) + len(self._scrape_responses)))
-
-        # Update security alerts
+        self.scrape_count_card.update_value(str(sum(self._scrape_requests.values())))
         self.security_alert_card.update_value(str(self._security_counter), "#f38ba8")
-
-        # Update read-only nodes
-        self.readonly_node_card.update_value(str(len(self._queried_nodes) - len(self._responded_nodes)))
-
-        # Update mutable items
-        self.mutable_item_card.update_value(str(len(self._mutable_items)))
-
-        # Update pub/sub topics
-        self.pubsub_topic_card.update_value(str(len(self._pubsub_topics)))
+        self.readonly_node_card.update_value("n/a")
+        self.mutable_item_card.update_value("n/a")
+        self.pubsub_topic_card.update_value("n/a")
 
     def _on_refresh(self) -> None:
         """Force immediate refresh."""
@@ -277,46 +270,44 @@ class DHTMonitorWidget(QWidget):
         msg_type = msg_info.get("msg_type", "unknown")
         status = msg_info.get("status", "")
         payload = msg_info.get("payload_snippet", "")
+        info_hash_hex = msg_info.get("info_hash_hex") or ""
 
-        # Track queried nodes (nodes that send queries)
-        if direction == "outgoing":
-            self._queried_nodes.add((ip, port))
-        else:
-            self._responded_nodes.add((ip, port))
+        # get_peers activity only. BEP 44/46/50 messages are not collected:
+        # those protocols are not implemented, and counting them would be fiction.
+        if msg_type == "get_peers":
+            key = info_hash_hex or f"{ip}:{port}"
+            self._scrape_requests[key] += 1
+            timestamp = time.strftime("%H:%M:%S")
+            where = "to" if direction == "outgoing" else "from"
+            label = info_hash_hex[:12] if info_hash_hex else "no infohash"
+            self._append_capped(
+                self.scrape_log,
+                f"[{timestamp}] get_peers {where} {ip}:{port} ih={label}",
+            )
 
-        # BEP 33 Scrape tracking
-        if msg_type == "get_peers" or msg_type == "scrape":
-            if direction == "outgoing":
-                # Extract infohash from payload
-                self._scrape_requests[binascii.b2a_hex(ip.encode()).decode()] += 1
-                timestamp = time.strftime("%H:%M:%S")
-                self.scrape_log.append(f"[{timestamp}] Scrape request to {ip}:{port}")
-            elif status == "response":
-                self._scrape_responses[binascii.b2a_hex(ip.encode()).decode()] = {
-                    "seeds": 0,
-                    "peers": 0,
-                }
-                timestamp = time.strftime("%H:%M:%S")
-                self.scrape_log.append(f"[{timestamp}] Scrape response from {ip}:{port}")
-
-        # BEP 42 Security tracking
-        if status == "error" or "security" in payload.lower():
+        if status == "error":
             self._security_counter += 1
             timestamp = time.strftime("%H:%M:%S")
-            self.security_log.append(f"[{timestamp}] Security event: {msg_type} from {ip}:{port}")
-            self._security_events.append(f"[{timestamp}] {msg_type} from {ip}:{port}: {payload}")
+            line = f"[{timestamp}] KRPC error: {msg_type} from {ip}:{port}: {payload}"
+            self._append_capped(self.security_log, line)
+            self._security_events.append(line)
+            if len(self._security_events) > 200:
+                del self._security_events[:-200]
 
-        # BEP 46 Mutable item tracking
-        if msg_type == "get_data" or msg_type == "put_data":
-            if direction == "incoming" and status == "response":
-                timestamp = time.strftime("%H:%M:%S")
-                self.mutable_log.append(f"[{timestamp}] Mutable item from {ip}:{port}")
-
-        # BEP 50 Pub/sub topic tracking
-        if "pubsub" in payload.lower() or "topic" in payload.lower():
-            self._pubsub_topics[binascii.b2a_hex(ip.encode()).decode()] += 1
-            timestamp = time.strftime("%H:%M:%S")
-            self.pubsub_log.append(f"[{timestamp}] Pub/sub message from {ip}:{port}")
+    @staticmethod
+    def _append_capped(edit: QTextEdit, text: str, limit: int = 200) -> None:
+        """Append one line and drop the oldest blocks past ``limit``."""
+        edit.append(text)
+        doc = edit.document()
+        extra = doc.blockCount() - limit
+        if extra <= 0:
+            return
+        cursor = edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        for _ in range(extra):
+            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
 
     def on_query_sent(self, msg_type: str, target_id: bytes, ip: str, port: int, is_ipv6: bool) -> None:
         """Called when a query is sent to a node.

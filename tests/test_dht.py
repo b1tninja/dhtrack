@@ -2971,9 +2971,8 @@ class TestReviewFollowups:
             node.peers[("192.0.2.1", 1)].last_seen = 1.0
             node.peers[("192.0.2.2", 2)].last_seen = 2.0
             node.routing_table.remove_node_all_families(not_in_rt)
-            node.routing_table.add_node(
-                BucketNode(node_id=in_rt, endpoint=node.peers[("192.0.2.1", 1)].endpoint, status=NodeStatus.GOOD)
-            )
+            node.peers[("192.0.2.2", 2)].in_routing_table = False
+            assert node.peers[("192.0.2.1", 1)].in_routing_table
             assert node.add_peer(b"\x13" * 20, "192.0.2.3", 3) is not None
             # The older contact is in the routing table, so the other one goes.
             assert ("192.0.2.1", 1) in node.peers
