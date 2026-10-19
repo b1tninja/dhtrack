@@ -49,7 +49,7 @@ The report reuses `dhtrack.bep42` and `dhtrack.peerid` instead of a second node-
 ## Limitations
 
 - This is not a Sybil detector. One household NAT, a university /24, or a VPN exit will light up prefix concentration. The note list says which term fired so a reviewer can throw the score out.
-- BEP 42 exemption follows `is_address_exempt_from_bep42` (loopback, link-local, RFC 1918, ULA). CGNAT and documentation ranges are checked, because the library checks them. A full bogon list is not included.
+- BEP 42 exemption follows `is_address_exempt_from_bep42` (loopback, link-local, RFC 1918, ULA). Public IPv6 is checked, and IPv4-mapped addresses are checked against the IPv4 rule. CGNAT and documentation ranges are checked, because the library checks them. A full bogon list is not included.
 - No RTT, clock skew, infohash-distance, or routing-table anomaly features. Those need the live node.
 - Client labels are only as good as `PeerIdParser`, and peer IDs are optional on a DHT peer list (they show up on the wire handshake, not in compact peer lists).
 - Geo labels are only as good as the callable the operator passes in.

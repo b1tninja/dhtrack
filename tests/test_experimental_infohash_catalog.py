@@ -117,3 +117,13 @@ def test_corrupt_catalog_version_is_rejected(tmp_path) -> None:
     path.write_text('{"version": 99, "kind": "dhtrack.experimental.infohash_catalog"}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="version"):
         CatalogState.load(path)
+
+
+def test_schedule_drops_expired_endpoints() -> None:
+    state = CatalogState()
+    replies = {("192.0.2.1", 6881): SampleReply(samples=b"\x01" * 20, interval=60)}
+    run_sample_round(state.catalog, state.schedule, [("192.0.2.1", 6881)], MapTransport(replies), now=0.0)
+    assert state.schedule.next_at(("192.0.2.1", 6881)) == 60.0
+    run_sample_round(state.catalog, state.schedule, [("192.0.2.2", 6881)], MapTransport({}), now=100.0)
+    assert state.schedule.next_at(("192.0.2.1", 6881)) is None
+    assert state.schedule.next_at(("192.0.2.2", 6881)) is not None

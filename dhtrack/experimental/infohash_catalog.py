@@ -16,12 +16,11 @@ transport for each reply, and updates the catalog.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dhtrack.experimental.persist import dump_json, expect_int, expect_number, expect_str, load_json
+from dhtrack.experimental.persist import dump_json, expect_endpoint, expect_int, expect_number, expect_str, load_json
 
 CATALOG_KIND = "dhtrack.experimental.infohash_catalog"
 CATALOG_VERSION = 1
@@ -272,6 +271,18 @@ class SampleSchedule:
         gap = self.default_interval if interval is None or interval <= 0 else float(interval)
         self._next_at[endpoint] = now + gap
 
+    def prune(self, now: float) -> int:
+        """Drop entries whose next-allowed time has passed. Returns how many.
+
+        An expired entry behaves exactly like a missing one in :meth:`due`,
+        so this changes nothing but the size of the schedule. Without it,
+        every endpoint ever sampled stays in the state file.
+        """
+        expired = [endpoint for endpoint, at in self._next_at.items() if at <= now]
+        for endpoint in expired:
+            del self._next_at[endpoint]
+        return len(expired)
+
     def next_at(self, endpoint: tuple[str, int]) -> float | None:
         """Return the stored next-allowed time, if any."""
         return self._next_at.get(endpoint)
@@ -350,11 +361,12 @@ def run_sample_round(
     retried on every pass. Times are compared only with each other; use one
     clock for the lifetime of a schedule file.
     """
+    schedule.prune(now)
     due = schedule.due(now, endpoints)
     answered = 0
     missed = 0
     observations = 0
-    seen: set[bytes] = set()
+    seen: set[str] = set()
     for ip, port in due:
         reply = transport.sample(ip, port)
         if reply is None:
@@ -364,21 +376,12 @@ def run_sample_round(
         answered += 1
         interval = reply.interval if reply.interval is not None and reply.interval > 0 else None
         num = reply.num if reply.num is not None and reply.num >= 0 else None
-        via = f"{ip}|{port}"
-        for info_hash in parse_bep51_samples(reply.samples):
-            seen.add(info_hash)
-            catalog.ingest(
-                InfohashObservation(
-                    info_hash=info_hash,
-                    observed_at=now,
-                    source=SOURCE_BEP51,
-                    via=via,
-                    num=num,
-                    interval=interval,
-                )
-            )
-            observations += 1
-        schedule.record((ip, port), now=now, interval=float(interval) if interval is not None else None)
+        touched = catalog.ingest_bep51(
+            reply.samples, via=endpoint_key(ip, port), observed_at=now, num=num, interval=interval
+        )
+        seen.update(record.info_hash_hex for record in touched)
+        observations += len(touched)
+        schedule.record((ip, port), now=now, interval=interval)
     return SampleRoundResult(
         queried=len(due),
         answered=answered,
@@ -480,20 +483,8 @@ def _split_endpoint_key(key: str) -> tuple[str, int]:
     if "|" not in key:
         raise ValueError(f"reply key {key!r} must be ip|port")
     ip, _, port_text = key.rpartition("|")
-    if not ip:
-        raise ValueError(f"reply key {key!r} is missing an address")
     try:
         port = int(port_text)
     except ValueError as exc:
         raise ValueError(f"reply key {key!r} has a non-integer port") from exc
-    if port < 0 or port > 65535:
-        raise ValueError(f"reply key {key!r} port out of range")
-    return ip, port
-
-
-def snapshot_records(catalog: InfohashCatalog) -> str:
-    """Serialize the catalog as JSONL text, one aggregate row per line."""
-    rows = [json.dumps(row.to_dict(), sort_keys=True, separators=(",", ":")) for row in catalog.records()]
-    if not rows:
-        return ""
-    return "\n".join(rows) + "\n"
+    return expect_endpoint(ip, port, f"reply key {key!r}")

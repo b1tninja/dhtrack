@@ -195,3 +195,19 @@ class TestBEP42EnforcementFlag:
         node = DHTNode()
         node.enforce_bep42 = True
         assert node.enforce_bep42 is True
+
+
+class TestBep42Ipv6Exemption:
+    @pytest.mark.parametrize("ip", ["2a00:1450:4001::1", "2001:4860::8888"])
+    def test_public_ipv6_is_not_exempt(self, ip):
+        assert _is_exempt_ip(ip) is False
+
+    def test_ipv4_mapped_follows_ipv4_rules(self):
+        assert _is_exempt_ip("::ffff:10.0.0.1") is True
+        assert _is_exempt_ip("::ffff:124.31.75.21") is False
+
+    def test_ipv4_mapped_node_id_is_checked_as_ipv4(self):
+        # BEP 42 test vector: 124.31.75.21 with rand 1.
+        node_id = bytes.fromhex("5fbfbff10c5d6a4ec8a88e4c6ab4c28b95eee401")
+        assert is_valid_node_id(node_id, "124.31.75.21") is True
+        assert is_valid_node_id(node_id, "::ffff:124.31.75.21") is True

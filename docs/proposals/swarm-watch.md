@@ -44,7 +44,7 @@ python -m dhtrack.experimental watch-observe \
 
 `SwarmManager` stays the in-memory registry for the inspector. The watcher does not register swarms, download pieces, or scrape trackers. A GUI timer or a headless loop that already calls `async_get_peers` and `TrackerClient.scrape` would hand those results in. Prefixes come from the same helper the analytics report uses, so "one /24" means the same thing in both places.
 
-State saved by the CLI is only the latest snapshot per infohash. Health and alerts append to JSONL, which is the log a dashboard would tail. In-process history is capped at 256 snapshots and 1000 alerts.
+State saved by the CLI is the latest snapshot per infohash plus the alert kinds currently firing. A threshold alert is emitted when it starts and stays quiet while the condition lasts, so a cron job does not repeat it every run; `peer_spike` is a one-shot comparison and fires on each crossing. Peers are counted once per `(ip, port)`. Health and alerts append to JSONL, which is the log a dashboard would tail. In-process history is capped at 256 snapshots and 1000 alerts.
 
 ## Limitations
 

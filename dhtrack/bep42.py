@@ -146,6 +146,9 @@ def is_valid_node_id(node_id: bytes, ip: str) -> bool:
     if len(node_id) != 20:
         return False
 
+    # ::ffff:a.b.c.d is an IPv4 peer and is checked against the IPv4 rule.
+    ip = _unmap_ipv4(ip)
+
     # Do not enforce constraint for private / loopback / link-local addresses
     if _is_exempt_ip(ip):
         return True
@@ -188,6 +191,17 @@ def is_address_exempt_from_bep42(ip: str) -> bool:
     return _is_exempt_ip(ip)
 
 
+def _unmap_ipv4(ip: str) -> str:
+    """Return the dotted IPv4 form of an IPv4-mapped IPv6 address, else ``ip``."""
+    try:
+        packed6 = socket.inet_pton(socket.AF_INET6, ip)
+    except OSError:
+        return ip
+    if packed6[:12] == b"\x00" * 10 + b"\xff\xff":
+        return socket.inet_ntoa(packed6[12:])
+    return ip
+
+
 def _is_exempt_ip(ip: str) -> bool:
     """Return True for IPs that are exempt from BEP 42 enforcement.
 
@@ -226,6 +240,11 @@ def _is_exempt_ip(ip: str) -> bool:
         # Link-local fe80::/10
         if packed6[0] == 0xFE and (packed6[1] & 0xC0) == 0x80:
             return True
+        # IPv4-mapped ::ffff:a.b.c.d follows the IPv4 rules.
+        if _unmap_ipv4(ip) != ip:
+            return _is_exempt_ip(_unmap_ipv4(ip))
+        # Any other parseable IPv6 address is public and must be checked.
+        return False
     except OSError:
         pass
 

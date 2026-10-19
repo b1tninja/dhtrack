@@ -119,3 +119,15 @@ def test_geo_lookup_counts_labels_and_survives_errors() -> None:
     assert any("geo lookup failed for 1" in note for note in report.notes)
     assert FINDING_FIELDS[0] == "ip"
     assert report.finding_rows()[1]["bep42_ok"] == ""
+
+
+def test_public_ipv6_is_checked_for_bep42() -> None:
+    ip = "2a00:1450:4001::1"
+    report = analyze_peers(
+        [
+            PeerRecord(ip=ip, port=6881, node_id=generate_node_id(ip)),
+            PeerRecord(ip="2a00:1450:4002::1", port=6881, node_id=b"\x00" * 20),
+        ]
+    )
+    assert report.bep42_checked == 2
+    assert report.bep42_mismatch == 1

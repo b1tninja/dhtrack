@@ -145,3 +145,13 @@ def test_bad_inputs_return_one(tmp_path, capsys) -> None:
     with pytest.raises(SystemExit) as caught:
         main(["watch-observe", "--infohash", "zz", "--state", str(tmp_path / "w.json")])
     assert caught.value.code == 2
+
+
+def test_dump_json_replaces_atomically(tmp_path) -> None:
+    from dhtrack.experimental.persist import dump_json, load_json
+
+    target = tmp_path / "state.json"
+    dump_json(target, {"a": 1})
+    dump_json(target, {"a": 2})
+    assert load_json(target) == {"a": 2}
+    assert [p.name for p in tmp_path.iterdir()] == ["state.json"]

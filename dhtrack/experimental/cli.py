@@ -25,7 +25,14 @@ from dhtrack.experimental.infohash_catalog import (
 )
 from dhtrack.experimental.peer_analytics import FINDING_FIELDS, GeoLookup, PeerRecord, analyze_peers
 from dhtrack.experimental.peers import PeerTableRow, parse_peer_table
-from dhtrack.experimental.persist import append_jsonl, dump_json, load_json, write_csv, write_snapshot_jsonl
+from dhtrack.experimental.persist import (
+    append_jsonl,
+    dump_json,
+    expect_endpoint,
+    load_json,
+    write_csv,
+    write_snapshot_jsonl,
+)
 from dhtrack.experimental.swarm_watch import (
     PeerSighting,
     SwarmObservation,
@@ -97,7 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--infohash", required=True, type=_infohash, help="40 hex characters")
     watch.add_argument("--peers", type=Path, help="JSON peer table (default: no DHT peers)")
     watch.add_argument("--name", default=None, help="Display name stored on the snapshot")
-    watch.add_argument("--tracker", default="", help="Tracker label stored on the snapshot")
+    watch.add_argument(
+        "--tracker",
+        default="",
+        help="Tracker label stored with the scrape counters (needs --tracker-complete and --tracker-incomplete)",
+    )
     watch.add_argument("--tracker-complete", type=int, default=None)
     watch.add_argument("--tracker-incomplete", type=int, default=None)
     watch.add_argument("--tracker-downloaded", type=int, default=None)
@@ -193,13 +204,7 @@ def load_json_endpoints(payload: object) -> list[tuple[str, int]]:
     for index, item in enumerate(payload):
         if not isinstance(item, dict):
             raise ValueError(f"endpoint[{index}] must be an object")
-        ip = item.get("ip")
-        port = item.get("port")
-        if not isinstance(ip, str) or not ip:
-            raise ValueError(f"endpoint[{index}].ip must be a string")
-        if isinstance(port, bool) or not isinstance(port, int) or port < 0 or port > 65535:
-            raise ValueError(f"endpoint[{index}].port out of range")
-        endpoints.append((ip, port))
+        endpoints.append(expect_endpoint(item.get("ip"), item.get("port"), f"endpoint[{index}]"))
     return endpoints
 
 

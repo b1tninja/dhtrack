@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from dhtrack.experimental.persist import expect_int, expect_str
+from dhtrack.experimental.persist import expect_endpoint, expect_str
 
 
 @dataclass(frozen=True)
@@ -66,10 +66,7 @@ def _parse_row(index: int, item: object) -> PeerTableRow:
     label = f"peer[{index}]"
     if not isinstance(item, dict):
         raise ValueError(f"{label} must be an object")
-    ip = expect_str(item.get("ip"), f"{label}.ip")
-    port = expect_int(item.get("port"), f"{label}.port")
-    if port < 0 or port > 65535:
-        raise ValueError(f"{label}.port out of range")
+    ip, port = expect_endpoint(item.get("ip"), item.get("port"), label, allow_port_zero=True)
     return PeerTableRow(
         ip=ip,
         port=port,

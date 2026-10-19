@@ -12,7 +12,7 @@ Callers today have to invoke `DHTNode.sample_infohashes` themselves. That method
 
 - `parse_bep51_samples` / `sample_reply_from_krpc` split a `samples` blob the same way the node does: 20-byte chunks, trailing partial hash dropped, non-positive `interval` ignored.
 - `InfohashCatalog` aggregates sightings by infohash: `first_seen`, `last_seen`, `hit_count`, per-source counts, a capped via list, and the newest population estimate (`num`) and interval.
-- `SampleSchedule` is the missing poll loop's memory. An endpoint is due when `now` has passed its next-allowed time. A miss is pushed out by the default 3600s, matching the node's fallback, so a dead peer is not retried every pass.
+- `SampleSchedule` is the missing poll loop's memory. An endpoint is due when `now` has passed its next-allowed time. A miss is pushed out by the default 3600s, matching the node's fallback, so a dead peer is not retried every pass. Entries whose time has passed are pruned at the start of each round, so the state file only holds endpoints still in their back-off.
 - `run_sample_round` asks a `SampleTransport` for each due endpoint and ingests the replies. `MapTransport` replays a JSON file. A live adapter would call `DHTPeer.sample_infohashes` and return the decoded body once the node exposes it.
 - `CatalogState` persists the catalog and the schedule as one JSON document. `catalog-round` is the headless entry point.
 

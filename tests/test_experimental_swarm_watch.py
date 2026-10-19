@@ -127,3 +127,27 @@ def test_observation_from_swarm_and_scrape() -> None:
 def test_thresholds_reject_inverted_spike_ratio() -> None:
     with pytest.raises(ValueError):
         WatchThresholds(spike_ratio=1.0)
+
+
+def test_duplicate_rows_count_once() -> None:
+    peers = tuple(PeerSighting(ip="1.2.3.4", port=1) for _ in range(10))
+    snapshot, alerts = SwarmWatch().observe(_observation(peers))
+    assert snapshot.peer_count == 1
+    assert "prefix_concentration" not in [alert.kind for alert in alerts]
+
+
+def test_persisting_alert_fires_once_across_restarts(tmp_path) -> None:
+    state = tmp_path / "watch.json"
+    watch = SwarmWatch()
+    _, first = watch.observe(_observation((), observed_at=1.0))
+    assert [alert.kind for alert in first] == ["swarm_empty"]
+    _, again = watch.observe(_observation((), observed_at=2.0))
+    assert again == []
+    watch.save(state)
+    restored = SwarmWatch()
+    restored.load_latest(state)
+    _, after_restart = restored.observe(_observation((), observed_at=3.0))
+    assert after_restart == []
+    restored.observe(_observation(_spread(8), observed_at=4.0))
+    _, relapse = restored.observe(_observation((), observed_at=5.0))
+    assert [alert.kind for alert in relapse] == ["swarm_empty"]

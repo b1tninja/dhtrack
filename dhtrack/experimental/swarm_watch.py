@@ -26,6 +26,9 @@ WATCH_KIND = "dhtrack.experimental.swarm_watch"
 WATCH_VERSION = 1
 _HISTORY_LIMIT = 256
 _ALERT_LIMIT = 1000
+# One-shot comparisons against the previous snapshot. These fire on every
+# crossing; every other kind fires only when it starts, not while it lasts.
+_EDGE_ALERTS = frozenset({"peer_spike"})
 
 
 @dataclass(frozen=True)
@@ -248,6 +251,10 @@ def _sighting_from_mapping(raw: Mapping[str, object]) -> PeerSighting:
 class SwarmWatch:
     """Score observations and remember the previous snapshot for spike detection.
 
+    A threshold alert is emitted when it starts firing and stays quiet while
+    the condition persists, so a cron job does not repeat it every run. The
+    set of firing kinds per infohash is saved with the state file.
+
     Not thread-safe. History and alerts are capped so a long-running process
     does not grow without bound; the JSONL files written by the CLI are the
     durable log.
@@ -258,12 +265,16 @@ class SwarmWatch:
     _latest: dict[str, HealthSnapshot] = field(default_factory=dict)
     _history: dict[str, list[HealthSnapshot]] = field(default_factory=dict)
     _alerts: list[Alert] = field(default_factory=list)
+    _active: dict[str, set[str]] = field(default_factory=dict)
 
     def observe(self, observation: SwarmObservation) -> tuple[HealthSnapshot, list[Alert]]:
-        """Score ``observation``. Returns the snapshot and the new alerts."""
+        """Score ``observation``. Returns the snapshot and the newly started alerts."""
         snapshot = score_observation(observation)
-        alerts = self._alerts_for(snapshot, observation)
         key = snapshot.info_hash_hex
+        firing = self._alerts_for(snapshot, observation)
+        previously = self._active.get(key, set())
+        alerts = [a for a in firing if a.kind in _EDGE_ALERTS or a.kind not in previously]
+        self._active[key] = {a.kind for a in firing if a.kind not in _EDGE_ALERTS}
         self._latest[key] = snapshot
         history = self._history.setdefault(key, [])
         history.append(snapshot)
@@ -387,9 +398,10 @@ class SwarmWatch:
         return alerts
 
     def to_dict(self) -> dict[str, object]:
-        """Persist the latest snapshot per infohash. History stays in JSONL."""
+        """Persist the latest snapshot and firing alerts per infohash. History stays in JSONL."""
         latest = {key: snap.to_dict() for key, snap in sorted(self._latest.items())}
-        return {"version": WATCH_VERSION, "kind": WATCH_KIND, "latest": latest}
+        active = {key: sorted(kinds) for key, kinds in sorted(self._active.items()) if kinds}
+        return {"version": WATCH_VERSION, "kind": WATCH_KIND, "latest": latest, "active_alerts": active}
 
     def save(self, path: Path) -> None:
         """Write the latest-snapshot state."""
@@ -413,24 +425,43 @@ class SwarmWatch:
         for key, value in latest.items():
             snapshot = HealthSnapshot.from_dict(value)
             restored[expect_str(key, "infohash").lower()] = snapshot
+        # Older state files have no active_alerts; every alert is then new.
+        active_raw = raw.get("active_alerts", {})
+        if not isinstance(active_raw, dict):
+            raise ValueError("watch active_alerts must be an object")
+        active: dict[str, set[str]] = {}
+        for key, kinds in active_raw.items():
+            if not isinstance(kinds, list):
+                raise ValueError("watch active_alerts entries must be lists")
+            active[expect_str(key, "infohash").lower()] = {expect_str(k, "alert kind") for k in kinds}
         self._latest = restored
+        self._active = active
 
 
 def score_observation(observation: SwarmObservation) -> HealthSnapshot:
-    """Derive health counters from one observation. Does not emit alerts."""
+    """Derive health counters from one observation. Does not emit alerts.
+
+    Peers are counted once per ``(ip, port)``; a repeated row (for example
+    from merged lookups) does not inflate the counts. A peer is a seeder if
+    any of its rows says so.
+    """
+    unique: dict[tuple[str, int], bool | None] = {}
+    for peer in observation.peers:
+        endpoint = (peer.ip, peer.port)
+        unique[endpoint] = _merge_seeder(unique.get(endpoint), peer.is_seeder)
     prefixes: dict[str, int] = {}
     ips: set[str] = set()
     seeder_known = False
     seeder_count = 0
-    for peer in observation.peers:
-        ips.add(peer.ip)
-        prefix = address_prefix(peer.ip)
+    for (ip, _port), is_seeder in unique.items():
+        ips.add(ip)
+        prefix = address_prefix(ip)
         prefixes[prefix] = prefixes.get(prefix, 0) + 1
-        if peer.is_seeder is not None:
+        if is_seeder is not None:
             seeder_known = True
-            if peer.is_seeder:
+            if is_seeder:
                 seeder_count += 1
-    peer_count = len(observation.peers)
+    peer_count = len(unique)
     top = max(prefixes.values()) if prefixes else 0
     tracker = observation.tracker
     return HealthSnapshot(
@@ -447,6 +478,13 @@ def score_observation(observation: SwarmObservation) -> HealthSnapshot:
         tracker_downloaded=None if tracker is None else tracker.downloaded,
         diversity=_ratio(len(prefixes), peer_count),
     )
+
+
+def _merge_seeder(a: bool | None, b: bool | None) -> bool | None:
+    """Combine two seeder flags: any True wins, then any known value."""
+    if a or b:
+        return True
+    return b if a is None else a
 
 
 def _ratio(part: int, total: int) -> float:
