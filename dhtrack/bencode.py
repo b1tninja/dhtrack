@@ -151,23 +151,22 @@ def encode(value: BEncodeValue) -> bytes:
         raise EncodeError(f"Cannot encode value: {type(value).__name__}") from exc
 
 
-def _canonical_int(token: bytes, offset: int) -> int:
+def _canonical_int(token: bytes, offset: int, *, signed: bool = True) -> int:
     """Parse a bencode integer or string-length token.
 
     BEP 3 forbids leading zeros (``i03e``, ``i-0e``, ``03:foo``) and an empty
     digit run. Digit length is capped so a hostile buffer cannot allocate an
-    arbitrary-precision integer.
+    arbitrary-precision integer. String lengths pass ``signed=False``.
     """
-    if not token:
-        raise DecodeError(f"Invalid integer at offset {offset}")
-    body = token[1:] if token[:1] == b"-" else token
-    if not body or not body.isdigit() or (token[:1] == b"-" and not token[1:]):
+    negative = signed and token[:1] == b"-"
+    body = token[1:] if negative else token
+    if not body or not body.isdigit():
         raise DecodeError(f"Invalid integer at offset {offset}")
     if len(body) > MAX_BENCODE_INT_DIGITS:
         raise DecodeError(f"Integer too wide at offset {offset}")
     if len(body) > 1 and body[:1] == b"0":
         raise DecodeError(f"Leading zero in integer at offset {offset}")
-    if token[:1] == b"-" and body[:1] == b"0":
+    if negative and body[:1] == b"0":
         raise DecodeError(f"Negative zero at offset {offset}")
     return int(token)
 
@@ -255,19 +254,11 @@ def _decode_string(buffer: bytes, offset: int) -> tuple[BEncodeBytes, int]:
         raise DecodeError(f"Unterminated string at offset {offset}") from None
 
     length_token = buffer[offset:colon]
-    # Lengths are unsigned; a leading '-' is not a digit so it never reaches
-    # here from ``_decode_item``, but dict-key parsing calls this directly.
-    if not length_token or length_token[:1] == b"-":
-        raise DecodeError(f"Invalid string length at offset {offset}")
     try:
-        length = _canonical_int(length_token, offset)
+        length = _canonical_int(length_token, offset, signed=False)
     except DecodeError:
         logger.debug("Invalid string length at offset %d: %r", offset, length_token)
         raise DecodeError(f"Invalid string length at offset {offset}") from None
-
-    if length < 0:
-        logger.debug("Negative string length at offset %d: %d", offset, length)
-        raise DecodeError(f"Negative string length at offset {offset}")
 
     start = colon + 1
     end = start + length

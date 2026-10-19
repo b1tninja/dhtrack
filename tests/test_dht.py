@@ -2940,3 +2940,70 @@ class TestDatagramAdmission:
             assert ("192.0.2.2", 2) not in node.peers
         finally:
             node.close()
+
+
+class TestReviewFollowups:
+    def test_known_peer_datagram_reaches_event_sink(self) -> None:
+        node = DHTNode(node_id=b"\x01" * 20, bind_addr=("127.0.0.1", 0), persist_node_identity=False)
+        try:
+            node.send_datagram = lambda _endpoint, _payload: None  # type: ignore[method-assign]
+            sink = MagicMock()
+            node.event_sink = sink
+            addr = ("192.0.2.60", 6881)
+            node._handle_datagram(_encode_dht_query("ping", {b"id": b"\x09" * 20}, b"aa"), addr)
+            node._handle_datagram(_encode_dht_query("ping", {b"id": b"\x09" * 20}, b"bb"), addr)
+            assert sink.on_incoming_message.call_count == 2
+            incoming = [c for c in sink.on_message_parsed.call_args_list if c.args[4].get("direction") == "incoming"]
+            assert len(incoming) == 2
+        finally:
+            node.close()
+
+    def test_peer_table_cap_keeps_routing_table_members(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import dhtrack.dht as dht_module
+
+        monkeypatch.setattr(dht_module, "MAX_PEER_TABLE", 2)
+        node = DHTNode(node_id=b"\x01" * 20, bind_addr=("127.0.0.1", 0), persist_node_identity=False)
+        try:
+            in_rt = b"\x11" * 20
+            not_in_rt = b"\x12" * 20
+            assert node.add_peer(in_rt, "192.0.2.1", 1) is not None
+            assert node.add_peer(not_in_rt, "192.0.2.2", 2) is not None
+            node.peers[("192.0.2.1", 1)].last_seen = 1.0
+            node.peers[("192.0.2.2", 2)].last_seen = 2.0
+            node.routing_table.remove_node_all_families(not_in_rt)
+            node.routing_table.add_node(
+                BucketNode(node_id=in_rt, endpoint=node.peers[("192.0.2.1", 1)].endpoint, status=NodeStatus.GOOD)
+            )
+            assert node.add_peer(b"\x13" * 20, "192.0.2.3", 3) is not None
+            # The older contact is in the routing table, so the other one goes.
+            assert ("192.0.2.1", 1) in node.peers
+            assert ("192.0.2.2", 2) not in node.peers
+        finally:
+            node.close()
+
+    def test_reannounce_refreshes_last_seen_for_global_cap(self) -> None:
+        store = PeerStore(max_entries=2, max_peers_per_infohash=10)
+        info_hash = b"\x44" * 20
+        store.add_peer(info_hash, "192.0.2.1", 1)
+        store._store[info_hash][0].last_seen = 1.0
+        store.add_peer(info_hash, "192.0.2.2", 2)
+        store._store[info_hash][1].last_seen = 2.0
+        store.add_peer(info_hash, "192.0.2.1", 1)  # re-announce
+        store.add_peer(info_hash, "192.0.2.3", 3)
+        assert {p.ip for p in store.get_peers(info_hash)} == {"192.0.2.1", "192.0.2.3"}
+
+    def test_noseed_falls_back_to_seeds(self) -> None:
+        info_hash = b"\x05" * 20
+        mock_node = MagicMock()
+        mock_node.node_id = b"\x01" * 20
+        mock_node.routing_table.get_closest_nodes.return_value = []
+        mock_node.peer_store = PeerStore()
+        mock_node.token_secret.generate_token.return_value = b"\x03" * 20
+        peer = DHTPeer(dht_node=mock_node, endpoint=Endpoint("127.0.0.1", 6881), node_id=b"\x04" * 20)
+        mock_node.peer_store.add_peer(info_hash, "192.0.2.9", 6881, is_seed=True)
+        captured: list[bytes] = []
+        peer.write = captured.append  # type: ignore[method-assign]
+        query = _encode_dht_query("get_peers", {b"id": b"\x04" * 20, b"info_hash": info_hash, b"noseed": 1}, b"tt")
+        peer._handle_query(bencode_module.decode(query))
+        response = bencode_module.decode(captured[0])
+        assert len(response[b"r"][b"values"]) == 1

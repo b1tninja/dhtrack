@@ -484,6 +484,8 @@ class PeerStore:
         self._seen: dict[bytes, set[tuple[str, int]]] = defaultdict(set)
         self._store: dict[bytes, list[StoredPeer]] = defaultdict(list)
         self._max_entries = max_entries
+        # Running count of stored contacts, so the global cap is O(1) to test.
+        self._total = 0
         self._max_peers_per_infohash = max(1, int(max_peers_per_infohash))
 
     def add_peer(
@@ -522,13 +524,18 @@ class PeerStore:
 
         # Enforce unique <info_hash, ip, port>. BEP 33 bloom filters key on IP;
         # distinct ports are still distinct peer-wire endpoints.
+        # Each per-infohash list is kept in refresh order (oldest first), so a
+        # re-announce moves the contact to the tail with a fresh last_seen.
         dedup_key = (ip, port)
         if dedup_key in self._seen[info_hash]:
-            if is_seed:
-                for existing in self._store.get(info_hash, []):
-                    if existing.ip == ip and existing.port == port:
+            peers = self._store.get(info_hash, [])
+            for i, existing in enumerate(peers):
+                if existing.ip == ip and existing.port == port:
+                    if is_seed:
                         existing.is_seed = True
-                        break
+                    existing.last_seen = time.time()
+                    peers.append(peers.pop(i))
+                    break
             return  # Already stored
 
         self._seen[info_hash].add(dedup_key)
@@ -541,6 +548,7 @@ class PeerStore:
             is_seed=bool(is_seed),
         )
         self._store[info_hash].append(peer)
+        self._total += 1
 
         # Limit stored peers per infohash. Dropped contacts must leave ``_seen``
         # or that IP:port can never be announced again.
@@ -550,6 +558,7 @@ class PeerStore:
             self._store[info_hash] = self._store[info_hash][-trim:]
             for old in dropped:
                 self._seen[info_hash].discard((old.ip, old.port))
+            self._total -= len(dropped)
         self._enforce_global_cap()
 
     def _enforce_global_cap(self) -> None:
@@ -558,23 +567,22 @@ class PeerStore:
         ``max_entries`` used to be stored and ignored, so announce_peer could
         grow the table without bound.
         """
-        while True:
-            total = sum(len(peers) for peers in self._store.values())
-            if total <= self._max_entries:
-                return
+        while self._total > self._max_entries:
+            # Lists are in refresh order, so the oldest contact overall is one
+            # of the list heads.
             oldest_ih: bytes | None = None
-            oldest_idx = 0
             oldest_ts: float | None = None
             for ih, peers in self._store.items():
-                for idx, peer in enumerate(peers):
-                    seen = float(peer.last_seen)
-                    if oldest_ts is None or seen < oldest_ts:
-                        oldest_ts = seen
-                        oldest_ih = ih
-                        oldest_idx = idx
+                if not peers:
+                    continue
+                seen = float(peers[0].last_seen)
+                if oldest_ts is None or seen < oldest_ts:
+                    oldest_ts = seen
+                    oldest_ih = ih
             if oldest_ih is None:
                 return
-            removed = self._store[oldest_ih].pop(oldest_idx)
+            removed = self._store[oldest_ih].pop(0)
+            self._total -= 1
             self._seen[oldest_ih].discard((removed.ip, removed.port))
             if not self._store[oldest_ih]:
                 del self._store[oldest_ih]
@@ -720,6 +728,7 @@ class PeerStore:
         for i, peer in enumerate(peers):
             if peer.ip == ip and peer.port == port:
                 peers.pop(i)
+                self._total -= 1
                 self._seen[info_hash].discard((ip, port))
                 return True
         return False
@@ -1767,7 +1776,9 @@ class DHTPeer:
 
         # noseed asks for downloaders only. Scrape bloom filters are independent
         # of that filter and are added alongside values or nodes (BEP 33).
-        listed = [peer for peer in peers if not (noseed and peer.is_seed)]
+        # BEP 33 makes noseed best effort, so a seed-only swarm still answers
+        # with its seeds rather than falling through to nodes.
+        listed = [peer for peer in peers if not (noseed and peer.is_seed)] or peers
         if listed:
             values = []
             for peer in listed:
@@ -3330,7 +3341,7 @@ class DHTNode:
         # Semaphore-like backpressure: don't amplify when KRPC pending queues are already high.
         # This avoids scrape bursts causing excessive pending-query churn.
         try:
-            total_pending = sum(len(p.queue) for p in self.peers.values())
+            total_pending = sum(len(p.queue) for p in list(self.peers.values()))
         except Exception:
             total_pending = 0
         if total_pending >= int(MAX_PENDING_GLOBAL * 0.75):
@@ -3597,7 +3608,7 @@ class DHTNode:
                 )
 
         # 3) Global cap: evict globally oldest sent_at
-        total_pending = sum(len(p.queue) for p in self.peers.values())
+        total_pending = sum(len(p.queue) for p in list(self.peers.values()))
         while total_pending > MAX_PENDING_GLOBAL:
             candidates: list[tuple[float, DHTPeer, bytes]] = []
             for p in list(self.peers.values()):
@@ -3719,6 +3730,14 @@ class DHTNode:
                     len(data),
                     from_quic,
                 )
+            except Exception:
+                logger.debug(
+                    "Error handling datagram from known peer %s:%d",
+                    ip,
+                    port,
+                    exc_info=True,
+                )
+            self._notify_incoming(ip, port, is_ipv6, data)
             return
 
         parsed = self._decode_krpc_dict(data)
@@ -3735,7 +3754,10 @@ class DHTNode:
         if peer is None:
             return
         peer._process_parsed_message(parsed)
+        self._notify_incoming(ip, port, is_ipv6, data)
 
+    def _notify_incoming(self, ip: str, port: int, is_ipv6: bool, data: bytes) -> None:
+        """Report one incoming datagram to the GUI event sink, if any."""
         # Notify GUI about incoming message with extracted message details
         if self.event_sink is not None:
             try:
@@ -4181,14 +4203,25 @@ class DHTNode:
         """Drop the least useful contact so ``self.peers`` stays bounded."""
         if len(self.peers) < MAX_PEER_TABLE:
             return
-        victim = min(
-            self.peers.values(),
-            key=lambda peer: (1 if peer.node_id else 0, float(peer.last_seen or 0.0)),
-        )
+        # Contacts without a node id go first, oldest insertion first. The
+        # dict keeps insertion order, so the common case stops early.
+        victim = next((p for p in self.peers.values() if not p.node_id), None)
+        if victim is None:
+            # Never evict a routing-table member: an unsolicited flood must
+            # not be able to drain the table. The routing table holds at most
+            # 2 * 256 * K entries, well under MAX_PEER_TABLE, so a candidate
+            # outside it always exists.
+            in_table: set[tuple[bytes, str, int]] = set()
+            for rt in (self.routing_table.v4, self.routing_table.v6):
+                for bucket in rt.buckets:
+                    for n in bucket.nodes:
+                        in_table.add((n.node_id, n.endpoint.ip, n.endpoint.port))
+            candidates = [p for p in self.peers.values() if (p.node_id, p.endpoint.ip, p.endpoint.port) not in in_table]
+            if not candidates:
+                return
+            victim = min(candidates, key=lambda peer: float(peer.last_seen or 0.0))
         key = (victim.endpoint.ip, victim.endpoint.port)
         self.peers.pop(key, None)
-        if victim.node_id:
-            self.routing_table.remove_node(node_id=victim.node_id, endpoint=victim.endpoint)
         self._peers_dirty = True
 
     def _add_peer_locked(
@@ -4325,7 +4358,7 @@ class DHTNode:
                 return p
         nid = getattr(node, "node_id", None)
         if isinstance(nid, (bytes, bytearray)) and len(nid) == 20:
-            for p in self.peers.values():
+            for p in list(self.peers.values()):
                 if p.node_id == nid:
                     return p
         return None
@@ -4379,7 +4412,7 @@ class DHTNode:
         for n in self.routing_table.v6.get_closest_nodes(target_id, scan_rt):
             _consider(n, True)
 
-        for p in self.peers.values():
+        for p in list(self.peers.values()):
             pid = p.node_id
             if not pid or len(pid) != 20:
                 continue
@@ -4480,7 +4513,7 @@ class DHTNode:
             scrape_states = len(self._get_peers_scrape)
             scrape_backlog_nodes = sum(len(st.q) for st in self._get_peers_scrape.values())
         try:
-            pending_krpc = sum(len(getattr(p, "queue", {})) for p in self.peers.values())
+            pending_krpc = sum(len(getattr(p, "queue", {})) for p in list(self.peers.values()))
         except Exception:
             pending_krpc = 0
         return {
@@ -4532,7 +4565,7 @@ class DHTNode:
             records = {}
 
         if not records:
-            for p in self.peers.values():
+            for p in list(self.peers.values()):
                 nid = p.node_id
                 if nid is None or len(nid) != 20:
                     continue
@@ -4741,7 +4774,7 @@ class DHTNode:
 
             closest_nodes = [n for n in closer if n.node_id not in queried] + closest_nodes
 
-        final_peers = [p for p in self.peers.values() if p.node_id]
+        final_peers = [p for p in list(self.peers.values()) if p.node_id]
         logger.debug(
             "Iterative find_node completed. Found %d peers with node IDs, queried %d nodes",
             len(final_peers),
@@ -4803,7 +4836,7 @@ class DHTNode:
 
             closest_nodes = [n for n in closer if n.node_id not in queried] + closest_nodes
 
-        final_peers = [p for p in self.peers.values() if p.node_id]
+        final_peers = [p for p in list(self.peers.values()) if p.node_id]
         logger.debug(
             "async_iterative_find_node completed: %d peers with ids, %d queries",
             len(final_peers),
@@ -5010,7 +5043,7 @@ class DHTNode:
             if not closest:
                 return []
             target_node = closest[0]
-            for p in self.peers.values():
+            for p in list(self.peers.values()):
                 if p.node_id == target_node.node_id:
                     target = p
                     break
@@ -5258,7 +5291,7 @@ class DHTNode:
         seen_ids: set[bytes] = set()
         count = 0
         # Check peers
-        for peer in self.peers.values():
+        for peer in list(self.peers.values()):
             if peer.node_id and peer.node_id == self.node_id and peer.node_id not in seen_ids:
                 count += 1
                 seen_ids.add(peer.node_id)
@@ -5453,7 +5486,7 @@ class DHTNode:
         wait_per_increment = 0.2
         for wi in range(wait_increments):
             await asyncio.sleep(wait_per_increment)
-            peers_with_ids = sum(1 for p in self.peers.values() if p.node_id is not None)
+            peers_with_ids = sum(1 for p in list(self.peers.values()) if p.node_id is not None)
             if peers_with_ids > 0:
                 logger.debug(
                     "bootstrap_recursive: %d peers have node_id after %.1fs",
@@ -5464,7 +5497,7 @@ class DHTNode:
         logger.debug(
             "bootstrap_recursive: Phase 1 wait done, %d peers total, %d with node_id",
             len(self.peers),
-            sum(1 for p in self.peers.values() if p.node_id is not None),
+            sum(1 for p in list(self.peers.values()) if p.node_id is not None),
         )
 
         # ========== Phase 2: Iterative find_node toward our node id ==========

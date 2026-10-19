@@ -840,5 +840,89 @@ class TestHeaderEdgeCases(unittest.TestCase):
             self.assertEqual(len(serialized), 20)
 
 
+class TestUTPReviewFollowups(unittest.TestCase):
+    """Receive ordering and ACK handling per BEP 29."""
+
+    @staticmethod
+    def _connected() -> UTPConnection:
+        conn = UTPConnection(connection_id=7, is_initiator=True)
+        conn.state = ConnectionState.CONNECTED
+        conn.ack_nr = 4
+        return conn
+
+    @staticmethod
+    def _data(conn: UTPConnection, seq: int, body: bytes) -> bytes | None:
+        header = PacketHeader(packet_type=ST_DATA, seq_nr=seq, ack_nr=0)
+        return conn.handle_packet(header.serialize() + body, header, ("192.0.2.1", 1))
+
+    def test_out_of_order_data_is_held_until_gap_fills(self):
+        conn = self._connected()
+        resp = self._data(conn, 6, b"world")
+        assert resp is not None
+        self.assertEqual(PacketHeader.parse(resp).ack_nr, 4)
+        self.assertEqual(conn.get_receive_data(), b"")
+        resp = self._data(conn, 5, b"hello")
+        assert resp is not None
+        self.assertEqual(PacketHeader.parse(resp).ack_nr, 6)
+        self.assertEqual(conn.get_receive_data(), b"helloworld")
+
+    def test_duplicate_data_does_not_move_ack_back(self):
+        conn = self._connected()
+        self._data(conn, 5, b"a")
+        self._data(conn, 6, b"b")
+        self._data(conn, 3, b"old")
+        self.assertEqual(conn.ack_nr, 6)
+        self.assertEqual(conn.get_receive_data(), b"ab")
+
+    def test_selective_ack_bit_zero_is_ack_nr_plus_two(self):
+        conn = self._connected()
+        for seq in (11, 12, 13):
+            conn.send_buffer.append(PendingPacket(seq_nr=seq, data=b"x"))
+        sack = SelectiveAck(bits=32, bitmask=bytearray(4))
+        sack.set_bit(0)
+        conn._process_ack(PacketHeader(packet_type=ST_STATE, seq_nr=1, ack_nr=10), sack)
+        self.assertEqual(sorted(p.seq_nr for p in conn.send_buffer), [11, 13])
+
+    def test_selective_ack_also_applies_cumulative_ack(self):
+        conn = self._connected()
+        for seq in (9, 10, 11, 12):
+            conn.send_buffer.append(PendingPacket(seq_nr=seq, data=b"x"))
+        sack = SelectiveAck(bits=32, bitmask=bytearray(4))
+        sack.set_bit(0)
+        conn._process_ack(PacketHeader(packet_type=ST_STATE, seq_nr=1, ack_nr=10), sack)
+        self.assertEqual([p.seq_nr for p in conn.send_buffer], [11])
+
+    def test_extension_chain_parses_sack_after_unknown_extension(self):
+        from dhtrack.utp import _split_utp_extensions
+
+        header = PacketHeader(packet_type=ST_STATE, seq_nr=1, ack_nr=10, extension=2)
+        raw = header.serialize() + bytes([1, 2, 0xAA, 0xBB]) + bytes([0, 4, 0x80, 0, 0, 0]) + b"payload"
+        payload, sack = _split_utp_extensions(raw)
+        self.assertEqual(payload, b"payload")
+        assert sack is not None
+        self.assertTrue(sack.get_bit(0))
+
+    def test_unknown_extension_with_next_sack_is_not_misread(self):
+        from dhtrack.utp import _split_utp_extensions
+
+        header = PacketHeader(packet_type=ST_STATE, seq_nr=1, ack_nr=10, extension=2)
+        raw = header.serialize() + bytes([0, 4, 0xFF, 0xFF, 0xFF, 0xFF])
+        payload, sack = _split_utp_extensions(raw)
+        self.assertIsNone(sack)
+        self.assertEqual(payload, b"")
+
+    def test_built_sack_uses_wire_layout(self):
+        from dhtrack.utp import _split_utp_extensions
+
+        conn = self._connected()
+        sack = SelectiveAck(bits=32, bitmask=bytearray(4))
+        sack.set_bit(3)
+        raw = conn._build_packet(ST_STATE, ack_nr=4, seq_nr=1, selective_ack=sack, payload=b"z")
+        payload, parsed = _split_utp_extensions(raw)
+        self.assertEqual(payload, b"z")
+        assert parsed is not None
+        self.assertTrue(parsed.get_bit(3))
+
+
 if __name__ == "__main__":
     unittest.main()
