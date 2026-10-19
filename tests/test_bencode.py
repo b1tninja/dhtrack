@@ -214,3 +214,39 @@ class TestBEncodeError:
 
     def test_encode_error_is_bencode_error(self):
         assert isinstance(EncodeError(), BEncodeError)
+
+
+class TestBencodeCanonicalAndLimits:
+    """BEP 3 canonical form and untrusted-input limits."""
+
+    def test_reject_leading_zero_integer(self) -> None:
+        with pytest.raises(DecodeError):
+            decode(b"i03e")
+        with pytest.raises(DecodeError):
+            decode(b"i-0e")
+        with pytest.raises(DecodeError):
+            decode(b"i-01e")
+
+    def test_reject_leading_zero_string_length(self) -> None:
+        with pytest.raises(DecodeError):
+            decode(b"01:a")
+
+    def test_reject_duplicate_dict_keys(self) -> None:
+        with pytest.raises(DecodeError, match="Duplicate"):
+            decode(b"d1:ai1e1:ai2ee")
+
+    def test_reject_excessive_nesting(self) -> None:
+        payload = b"l" * 80 + b"e" * 80
+        with pytest.raises(DecodeError, match="nesting"):
+            decode(payload)
+
+    def test_bool_encodes_as_integer(self) -> None:
+        # Python bool is an int subclass. Callers (torrent private flags)
+        # pass True/False and expect the BEP 3 integer form.
+        assert encode(True) == b"i1e"  # type: ignore[arg-type]
+        assert encode(False) == b"i0e"  # type: ignore[arg-type]
+
+    def test_zero_and_negative_still_roundtrip(self) -> None:
+        assert decode(b"i0e") == 0
+        assert decode(b"i-10e") == -10
+        assert decode(b"0:") == b""
