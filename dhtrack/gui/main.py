@@ -28,7 +28,6 @@ from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -40,9 +39,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from dhtrack.dht import DEFAULT_BOOTSTRAP_NODES, DHTNode
+from dhtrack.dht import DHTNode
 from dhtrack.dht_manager import DHTManager
 from dhtrack.gui import settings as gui_settings
+from dhtrack.gui.coalesce import GuiEventCoalescer
 from dhtrack.gui.inspector_session import InspectorSession
 from dhtrack.swarm import SwarmManager
 from dhtrack.torrent_track import TorrentManager
@@ -91,6 +91,32 @@ _WORKSPACE_PAGE_TITLES: tuple[str, ...] = (
     "Download manager",
     "Swarm inspector",
 )
+
+# Sidebar groups. A None widget in set_pages is a non-selectable header.
+_SIDEBAR_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Node", ("Overview", "Routing table", "Peer store")),
+    ("Traffic", ("kRPC console", "Peer scope", "Traffic monitor")),
+    ("Swarms", ("Swarm tracker", "Torrent manager", "Download manager", "Swarm inspector")),
+)
+
+
+def _with_sidebar_sections(pages: list[tuple[str, QWidget]]) -> list[tuple[str, QWidget | None]]:
+    """Insert section headers in front of the matching page titles."""
+    by_title = dict(pages)
+    grouped: list[tuple[str, QWidget | None]] = []
+    used: set[str] = set()
+    for header, titles in _SIDEBAR_SECTIONS:
+        present = [title for title in titles if title in by_title]
+        if not present:
+            continue
+        grouped.append((header, None))
+        for title in present:
+            grouped.append((title, by_title[title]))
+            used.add(title)
+    for title, widget in pages:
+        if title not in used:
+            grouped.append((title, widget))
+    return grouped
 
 
 class PlaceholderWidget(QWidget):
@@ -147,6 +173,7 @@ class DHTInspectorWindow(QMainWindow):
         self._shared_torrent_manager: TorrentManager | None = None
         self.workspace_shell: MainWorkspaceShell | None = None
         self.dht_monitor_tab: Any | None = None
+        self._event_coalescer = GuiEventCoalescer()
 
         self.setWindowTitle("dhtrack — DHT expert inspector")
         self.setMinimumSize(1024, 600)
@@ -171,6 +198,10 @@ class DHTInspectorWindow(QMainWindow):
         self._sig_manager_start_failed.connect(self._deliver_manager_start_failed)
         self._sig_hide_bootstrap_overlay.connect(self.hide_bootstrap_overlay)
         self._sig_status_label_text.connect(self.status_label.setText)
+
+        self._gui_flush_timer = QTimer(self)
+        self._gui_flush_timer.timeout.connect(self._flush_gui_events)
+        self._gui_flush_timer.start(200)
 
         # If a node was provided, attach to it
         if dht_node is not None:
@@ -270,45 +301,12 @@ class DHTInspectorWindow(QMainWindow):
         control_layout = QHBoxLayout(control_frame)
         control_layout.setSpacing(8)
 
-        # Node connection controls
-        connect_grp = QHBoxLayout()
-
-        self.host_input = QLineEdit()
-        self.host_input.setPlaceholderText("Bootstrap host (optional)")
-        self.host_input.setText("")
-        connect_grp.addWidget(self.host_input)
-
-        self.port_input = QLineEdit()
-        self.port_input.setPlaceholderText("Port")
-        self.port_input.setText("6881")
-        connect_grp.addWidget(self.port_input)
-
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self._on_connect)
-        connect_grp.addWidget(self.connect_btn)
-
-        self.disconnect_btn = QPushButton("Disconnect")
-        self.disconnect_btn.setEnabled(False)
-        self.disconnect_btn.clicked.connect(self._on_disconnect)
-        connect_grp.addWidget(self.disconnect_btn)
-
-        control_layout.addLayout(connect_grp)
-        control_layout.addSpacing(16)
-
-        # Bootstrap nodes
-        bootstrap_grp = QHBoxLayout()
-        bootstrap_grp.addWidget(QLabel("Bootstrap:"))
-        self.bootstrap_check = QComboBox()
-        self.bootstrap_check.addItems(["Default", "Custom"])
-        bootstrap_grp.addWidget(self.bootstrap_check)
-        control_layout.addLayout(bootstrap_grp)
-        control_layout.addSpacing(16)
-
-        # Bind port
+        # Start and Stop own the node lifecycle. Bootstrap routers come from
+        # Preferences (the shared settings object), not a separate connect box.
         bind_grp = QHBoxLayout()
         bind_grp.addWidget(QLabel("Bind Port:"))
         self.bind_port_input = QLineEdit()
-        self.bind_port_input.setText("0")
+        self.bind_port_input.setText(str(int(getattr(self._gui_settings, "bind_port", 0) or 0)))
         bind_grp.addWidget(self.bind_port_input)
         control_layout.addLayout(bind_grp)
         control_layout.addSpacing(16)
@@ -435,7 +433,7 @@ class DHTInspectorWindow(QMainWindow):
                 (title, PlaceholderWidget(f"{title}: start or attach a DHT node to use this workspace."))
                 for title in _WORKSPACE_PAGE_TITLES
             ]
-            shell.set_pages(pages)
+            shell.set_pages(_with_sidebar_sections(pages))
             self.dashboard_tab = None
             return
 
@@ -557,7 +555,7 @@ class DHTInspectorWindow(QMainWindow):
         pages.append(("Download manager", download_manager_page))
         pages.append(("Swarm inspector", swarm_inspector_page))
 
-        shell.set_pages(pages)
+        shell.set_pages(_with_sidebar_sections(pages))
 
         if self._radio_observe.isChecked():
             self._apply_dht_posture_observe(announce=False)
@@ -716,179 +714,15 @@ class DHTInspectorWindow(QMainWindow):
         self.status_label.setText("Attached to DHT node")
 
     def _wire_up_callbacks(self) -> None:
-        """Connect DHT node callbacks to GUI update methods.
-
-        The callbacks use lambda closures that capture self, so they can
-        dynamically look up self.console_tab and self.traffic_tab at call
-        time (when the tabs may have been created after this function runs).
-        """
+        """Queue DHT events. The GUI timer drains them off the I/O thread."""
         if self.dht_node is None:
             return
 
-        win = self
-
-        # Wire-level datagram callback - invokes a console method to display
-        # wire traces so they appear in the kRPC Console tab.
-        def on_wire_message(
-            direction: str,
-            addr: tuple,
-            size: int,
-            hex_str: str,
-            decode_status: str,
-            decode_repr: str,
-            txid_hex: str,
-            method: str,
-            note: str = "",
-        ) -> None:
-            try:
-                ip_addr, pt = addr[0], addr[1]
-                looks_v6 = ip_addr.count(":") > 1
-                console = getattr(win, "console_tab", None)
-                if console is not None and hasattr(console, "on_wire_message"):
-                    console.on_wire_message(
-                        direction,
-                        ip_addr,
-                        pt,
-                        looks_v6,
-                        size,
-                        hex_str,
-                        decode_status,
-                        decode_repr,
-                        txid_hex,
-                        method,
-                        note,
-                    )
-                peer_scope = getattr(win, "peer_scope_tab", None)
-                if peer_scope is not None and hasattr(peer_scope, "marshal_wire_tail"):
-                    from PyQt6.QtCore import QTimer
-
-                    QTimer.singleShot(
-                        0,
-                        lambda: peer_scope.marshal_wire_tail(
-                            direction=direction,
-                            ip=str(ip_addr),
-                            port=int(pt),
-                            is_ipv6=looks_v6,
-                            size=int(size),
-                            hex_str=hex_str,
-                            decode_status=decode_status,
-                            decode_repr=decode_repr,
-                            txid_hex=txid_hex,
-                            method=method,
-                            note=note,
-                        ),
-                    )
-            except Exception:
-                pass
-
-        # Bootstrap progress callback
-        def on_bootstrap_progress(
-            phase: str,
-            depth: int,
-            nodes_queried: int,
-            nodes_discovered: int,
-            min_xor_distance: int,
-            total_nodes: int,
-            elapsed: float,
-        ) -> None:
-            # Use QTimer to update GUI from background thread
-            try:
-                from PyQt6.QtCore import QTimer
-
-                QTimer.singleShot(
-                    0,
-                    win.update_bootstrap_progress,
-                    phase,
-                    depth,
-                    nodes_queried,
-                    nodes_discovered,
-                    min_xor_distance,
-                    total_nodes,
-                    elapsed,
-                )
-            except Exception:
-                pass
-
-        # Outgoing message callback - invoked from DHT background thread
-        def on_outgoing(msg_type: str, ip: str, port: int, is_ipv6: bool, size: int) -> None:
-            try:
-                # Update kRPC console
-                console = getattr(win, "console_tab", None)
-                if console is not None and hasattr(console, "on_outgoing_message"):
-                    console.on_outgoing_message(msg_type, ip, port, is_ipv6)
-                # Update traffic monitor
-                traffic = getattr(win, "traffic_tab", None)
-                if traffic is not None and hasattr(traffic, "on_outgoing_message"):
-                    traffic.on_outgoing_message(msg_type, size=size)
-                # Update query count
-                dashboard = getattr(win, "dashboard_tab", None)
-                if dashboard is not None and hasattr(dashboard, "_query_count"):
-                    dashboard._query_count += 1
-            except Exception:
-                pass
-
-        # Incoming message callback - invoked from DHT background thread
-        def on_incoming(
-            msg_type: str, ip: str, port: int, is_ipv6: bool, size: int, txid: str = "", status: str = ""
-        ) -> None:
-            try:
-                # Update kRPC console with full message details
-                console = getattr(win, "console_tab", None)
-                if console is not None and hasattr(console, "on_incoming_message"):
-                    console.on_incoming_message(msg_type, ip, port, is_ipv6, txid, status)
-                # Update traffic monitor
-                traffic = getattr(win, "traffic_tab", None)
-                if traffic is not None and hasattr(traffic, "on_incoming_message"):
-                    traffic.on_incoming_message(msg_type, size=size)
-                # Update response count
-                dashboard = getattr(win, "dashboard_tab", None)
-                if dashboard is not None and hasattr(dashboard, "_response_count"):
-                    dashboard._response_count += 1
-            except Exception:
-                pass
-
-        # Full message details callback for the console (includes full parsed info)
-        def on_message_parsed_cb(ip: str, port: int, is_ipv6: bool, size: int, msg_info: dict) -> None:
-            try:
-                console = getattr(win, "console_tab", None)
-                if console is not None and hasattr(console, "on_full_message"):
-                    console.on_full_message(ip, port, is_ipv6, size, msg_info)
-                peer_scope = getattr(win, "peer_scope_tab", None)
-                if peer_scope is not None and hasattr(peer_scope, "ingest_message_parsed"):
-                    direction = msg_info.get("direction", "")
-                    dup_ps = dict(msg_info)
-
-                    def _sink_ps() -> None:
-                        peer_scope.ingest_message_parsed(
-                            str(ip),
-                            int(port),
-                            bool(is_ipv6),
-                            dup_ps,
-                            direction=str(direction),
-                        )
-
-                    QTimer.singleShot(0, _sink_ps)
-
-                dup_mon = dict(msg_info)
-
-                def _sink_mon() -> None:
-                    mon = getattr(win, "dht_monitor_tab", None)
-                    if mon is not None and hasattr(mon, "on_message_parsed"):
-                        try:
-                            mon.on_message_parsed(ip, port, is_ipv6, size, dup_mon)
-                        except Exception:
-                            pass
-
-                QTimer.singleShot(0, _sink_mon)
-            except Exception:
-                pass
+        coalescer = self._event_coalescer
 
         class _GuiEventSink:
-            def __init__(self, outer: DHTInspectorWindow) -> None:
-                self._outer = outer
-
             def on_outgoing_message(self, msg_type: str, dst_ip: str, dst_port: int, is_ipv6: bool, size: int) -> None:
-                on_outgoing(msg_type, dst_ip, dst_port, is_ipv6, size)
+                coalescer.on_outgoing_message(msg_type, dst_ip, dst_port, is_ipv6, size)
 
             def on_incoming_message(
                 self,
@@ -901,7 +735,7 @@ class DHTInspectorWindow(QMainWindow):
                 txid: str = "",
                 status: str = "",
             ) -> None:
-                on_incoming(msg_type, src_ip, src_port, is_ipv6, size, txid, status)
+                coalescer.on_incoming_message(msg_type, src_ip, src_port, is_ipv6, size, txid=txid, status=status)
 
             def on_status_update(
                 self,
@@ -915,7 +749,7 @@ class DHTInspectorWindow(QMainWindow):
                 return
 
             def on_message_parsed(self, ip: str, port: int, is_ipv6: bool, size: int, msg_info: dict) -> None:
-                on_message_parsed_cb(ip, port, is_ipv6, size, msg_info)
+                coalescer.on_message_parsed(ip, port, is_ipv6, size, msg_info)
 
             def on_bootstrap_progress(
                 self,
@@ -928,14 +762,14 @@ class DHTInspectorWindow(QMainWindow):
                 total_nodes: int,
                 elapsed: float,
             ) -> None:
-                on_bootstrap_progress(
-                    phase,
-                    depth,
-                    nodes_queried,
-                    nodes_discovered,
-                    min_xor_distance,
-                    total_nodes,
-                    elapsed,
+                coalescer.on_bootstrap_progress(
+                    phase=phase,
+                    depth=depth,
+                    nodes_queried=nodes_queried,
+                    nodes_discovered=nodes_discovered,
+                    min_xor_distance=min_xor_distance,
+                    total_nodes=total_nodes,
+                    elapsed=elapsed,
                 )
 
             def on_observed_external_ip(self, *, family: str, ip: str, port: int) -> None:
@@ -954,9 +788,142 @@ class DHTInspectorWindow(QMainWindow):
                 method: str,
                 note: str,
             ) -> None:
-                on_wire_message(direction, addr, size, hex_str, decode_status, decode_repr, txid_hex, method, note)
+                coalescer.on_wire_message(
+                    direction=direction,
+                    addr=addr,
+                    size=size,
+                    hex_str=hex_str,
+                    decode_status=decode_status,
+                    decode_repr=decode_repr,
+                    txid_hex=txid_hex,
+                    method=method,
+                    note=note,
+                )
 
-        self.dht_node.event_sink = _GuiEventSink(self)  # type: ignore[assignment]
+        self.dht_node.event_sink = _GuiEventSink()  # type: ignore[assignment]
+
+    def _flush_gui_events(self) -> None:
+        """Apply one coalesced batch on the GUI thread (timer is 200 ms)."""
+        batch = self._event_coalescer.drain()
+        if not (
+            batch["incoming"]
+            or batch["outgoing"]
+            or batch["parsed"]
+            or batch["wire"]
+            or batch["bootstrap"]
+            or batch["query_delta"]
+            or batch["response_delta"]
+        ):
+            return
+
+        traffic = getattr(self, "traffic_tab", None)
+        dashboard = getattr(self, "dashboard_tab", None)
+        console = getattr(self, "console_tab", None)
+        peer_scope = getattr(self, "peer_scope_tab", None)
+        monitor = getattr(self, "dht_monitor_tab", None)
+
+        for msg_type, _ip, _port, _is_ipv6, size in batch["outgoing"]:
+            if traffic is not None and hasattr(traffic, "on_outgoing_message"):
+                try:
+                    traffic.on_outgoing_message(msg_type, size=size)
+                except Exception:
+                    logger.debug("traffic outgoing flush failed", exc_info=True)
+        if dashboard is not None and hasattr(dashboard, "_query_count"):
+            dashboard._query_count += int(batch["query_delta"])
+
+        for msg_type, _ip, _port, _is_ipv6, size, _txid, _status in batch["incoming"]:
+            if traffic is not None and hasattr(traffic, "on_incoming_message"):
+                try:
+                    traffic.on_incoming_message(msg_type, size=size)
+                except Exception:
+                    logger.debug("traffic incoming flush failed", exc_info=True)
+        if dashboard is not None and hasattr(dashboard, "_response_count"):
+            dashboard._response_count += int(batch["response_delta"])
+
+        # Parsed rows are the console's source of truth (one row per datagram).
+        # Incoming/outgoing batches only feed traffic counters, so the table
+        # is not filled twice for the same packet.
+        if console is not None and hasattr(console, "begin_table_batch"):
+            console.begin_table_batch()
+        try:
+            for ip, port, is_ipv6, size, msg_info in batch["parsed"]:
+                if console is not None and hasattr(console, "on_full_message"):
+                    try:
+                        console.on_full_message(ip, port, is_ipv6, size, msg_info)
+                    except Exception:
+                        logger.debug("console flush failed", exc_info=True)
+                if peer_scope is not None and hasattr(peer_scope, "ingest_message_parsed"):
+                    try:
+                        peer_scope.ingest_message_parsed(
+                            str(ip),
+                            int(port),
+                            bool(is_ipv6),
+                            dict(msg_info),
+                            direction=str(msg_info.get("direction", "")),
+                        )
+                    except Exception:
+                        logger.debug("peer scope flush failed", exc_info=True)
+                if monitor is not None and hasattr(monitor, "on_message_parsed"):
+                    try:
+                        monitor.on_message_parsed(ip, port, is_ipv6, size, msg_info)
+                    except Exception:
+                        logger.debug("monitor flush failed", exc_info=True)
+        finally:
+            if console is not None and hasattr(console, "end_table_batch"):
+                console.end_table_batch()
+
+        for direction, addr, size, hex_str, decode_status, decode_repr, txid_hex, method, note in batch["wire"]:
+            ip_addr, pt = addr[0], addr[1]
+            looks_v6 = str(ip_addr).count(":") > 1
+            if console is not None and hasattr(console, "on_wire_message"):
+                try:
+                    console.on_wire_message(
+                        direction,
+                        ip_addr,
+                        pt,
+                        looks_v6,
+                        size,
+                        hex_str,
+                        decode_status,
+                        decode_repr,
+                        txid_hex,
+                        method,
+                        note,
+                    )
+                except Exception:
+                    logger.debug("wire flush failed", exc_info=True)
+            if peer_scope is not None and hasattr(peer_scope, "marshal_wire_tail"):
+                try:
+                    peer_scope.marshal_wire_tail(
+                        direction=direction,
+                        ip=str(ip_addr),
+                        port=int(pt),
+                        is_ipv6=looks_v6,
+                        size=int(size),
+                        hex_str=hex_str,
+                        decode_status=decode_status,
+                        decode_repr=decode_repr,
+                        txid_hex=txid_hex,
+                        method=method,
+                        note=note,
+                    )
+                except Exception:
+                    logger.debug("peer scope wire flush failed", exc_info=True)
+
+        progress = batch["bootstrap"]
+        if progress:
+            try:
+                self.update_bootstrap_progress(
+                    progress.get("phase", ""),
+                    int(progress.get("depth", 0)),
+                    int(progress.get("nodes_queried", 0)),
+                    int(progress.get("nodes_discovered", 0)),
+                    int(progress.get("min_xor_distance", 0)),
+                    int(progress.get("total_nodes", 0)),
+                    float(progress.get("elapsed", 0.0)),
+                )
+            except Exception:
+                logger.debug("bootstrap flush failed", exc_info=True)
 
     def _teardown_partial_start(self) -> None:
         """Release node/manager after a failed GUI startup."""
@@ -979,70 +946,6 @@ class DHTInspectorWindow(QMainWindow):
         self._node_running = False
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.connect_btn.setEnabled(False)
-        self.disconnect_btn.setEnabled(False)
-
-    def _on_connect(self) -> None:
-        """Connect to a bootstrap node."""
-        host = self.host_input.text()
-        port_str = self.port_input.text()
-
-        if not host or not port_str:
-            self.status_label.setText("Enter host and port")
-            return
-
-        try:
-            port = int(port_str)
-        except ValueError:
-            self.status_label.setText("Invalid port number")
-            return
-
-        bootstrap_nodes = [(host, port)]
-
-        # Check if custom bootstrap
-        if self.bootstrap_check.currentText() == "Custom":
-            # Allow multiple custom nodes
-            pass
-
-        self.status_label.setText(f"Connecting to {host}:{port}...")
-
-        if self.dht_node:
-            if self._dht_manager is None:
-                mgr = DHTManager(
-                    node=self.dht_node,
-                    peers_file=getattr(self.dht_node, "peers_file", "peers.dat"),
-                )
-                self._dht_manager = mgr
-
-                def _connect_after_start() -> None:
-                    try:
-                        count = self.dht_node.bootstrap(bootstrap_nodes)
-                        self.status_label.setText(f"Connected! {count} nodes contacted")
-                    except Exception as e:
-                        self.status_label.setText(f"Connection failed: {e}")
-
-                def _connect_start_failed(exc: BaseException) -> None:
-                    self.status_label.setText(f"Connection failed: {exc}")
-                    logger.exception("DHTManager.start failed (connect path)")
-                    try:
-                        mgr.stop()
-                    except Exception:
-                        pass
-                    self._dht_manager = None
-
-                self.schedule_blocking_manager_start(mgr, _connect_after_start, _connect_start_failed)
-            else:
-                try:
-                    count = self.dht_node.bootstrap(bootstrap_nodes)
-                    self.status_label.setText(f"Connected! {count} nodes contacted")
-                except Exception as e:
-                    self.status_label.setText(f"Connection failed: {e}")
-        else:
-            self.status_label.setText("No DHT node attached")
-
-    def _on_disconnect(self) -> None:
-        """Disconnect from bootstrap nodes."""
-        self.status_label.setText("Disconnected")
 
     def _on_start_node(self) -> None:
         """Start a new DHT node.
@@ -1060,19 +963,24 @@ class DHTInspectorWindow(QMainWindow):
             self.status_label.setText("Invalid bind port")
             return
 
-        # Push current settings into module globals before constructing the
-        # DHTNode so that path/identity-time settings take effect.
+        peers_path = gui_settings.resolved_peers_file(self._gui_settings)
         try:
             gui_settings.apply_to_runtime(self._gui_settings)
         except Exception as exc:
             logger.warning("Failed to apply settings before node start: %s", exc)
 
         # Create DHT node and manager; blocking :meth:`DHTManager.start` runs off the GUI thread.
+        # Runtime DHT knobs, including bootstrap routers, are applied on the
+        # node before start so the first bootstrap uses them.
         try:
-            self.dht_node = DHTNode(bind_addr=("0.0.0.0", bind_port))
+            self.dht_node = DHTNode(bind_addr=("0.0.0.0", bind_port), peers_file=peers_path)
+            try:
+                gui_settings.apply_to_runtime(self._gui_settings, node=self.dht_node)
+            except Exception as exc:
+                logger.warning("Failed to apply settings to new node: %s", exc)
             self._dht_manager = DHTManager(
                 node=self.dht_node,
-                peers_file=getattr(self.dht_node, "peers_file", "peers.dat"),
+                peers_file=peers_path,
             )
 
             self.show_bootstrap_overlay()
@@ -1096,7 +1004,9 @@ class DHTInspectorWindow(QMainWindow):
                     self.status_label.setText("DHT node up — deepening routing table…")
                     self.attach_to_node(self.dht_node)
 
-                    bootstrap_nodes = DEFAULT_BOOTSTRAP_NODES
+                    bootstrap_nodes = list(
+                        getattr(self.dht_node, "bootstrap_nodes", None) or self._gui_settings.bootstrap_nodes
+                    )
                     async_coro = self.dht_node.bootstrap_recursive(
                         bootstrap_nodes=bootstrap_nodes,
                         total_timeout=float(getattr(self._gui_settings, "bootstrap_total_timeout", 30.0)),
@@ -1118,8 +1028,6 @@ class DHTInspectorWindow(QMainWindow):
                     self._node_running = True
                     self.start_btn.setEnabled(False)
                     self.stop_btn.setEnabled(True)
-                    self.connect_btn.setEnabled(False)
-                    self.disconnect_btn.setEnabled(True)
                     self.status_label.setText("DHT node started with recursive bootstrap")
                 except Exception as e:
                     self.status_label.setText(f"Failed to start: {e}")
@@ -1157,8 +1065,6 @@ class DHTInspectorWindow(QMainWindow):
 
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
-            self.connect_btn.setEnabled(False)
-            self.disconnect_btn.setEnabled(False)
 
             # Reset debug logging to OFF when node stops
             self._debug_logging_enabled = False
@@ -1210,10 +1116,11 @@ class DHTInspectorWindow(QMainWindow):
             self.status_label.setText(f"Pinged {count} nodes")
 
     def _on_bootstrap(self) -> None:
-        """Bootstrap with default nodes."""
+        """Bootstrap with the routers from the shared settings object."""
         if self.dht_node:
             try:
-                count = self.dht_node.bootstrap()
+                nodes = list(getattr(self.dht_node, "bootstrap_nodes", None) or self._gui_settings.bootstrap_nodes)
+                count = self.dht_node.bootstrap(nodes)
                 self.status_label.setText(f"Bootstrapped: {count} nodes contacted")
             except Exception as e:
                 self.status_label.setText(f"Bootstrap failed: {e}")
@@ -1388,23 +1295,26 @@ def run_gui() -> None:
     window.show()
     QApplication.processEvents()
 
-    manager = DHTManager(peers_file=persisted.peers_file or "peers.dat")
+    peers_path = gui_settings.resolved_peers_file(persisted)
+    manager = DHTManager(peers_file=peers_path)
+    try:
+        gui_settings.apply_to_runtime(persisted, node=manager.node, manager=manager)
+    except Exception as exc:
+        logger.warning("Failed to apply settings before startup: %s", exc)
 
     def _on_startup_ready() -> None:
         try:
             window._start_time = time.time()
             window._node_running = True
             window._dht_manager = manager
-            try:
-                gui_settings.apply_to_runtime(persisted, node=manager.node, manager=manager)
-            except Exception as exc:
-                logger.warning("Failed to apply settings to live node: %s", exc)
+            window.start_btn.setEnabled(False)
+            window.stop_btn.setEnabled(True)
 
             window.show_bootstrap_overlay()
             window.status_label.setText("DHT node started — deepening routing table…")
             window.attach_to_node(manager.node)
 
-            bootstrap_nodes = DEFAULT_BOOTSTRAP_NODES
+            bootstrap_nodes = list(getattr(manager.node, "bootstrap_nodes", None) or persisted.bootstrap_nodes)
             fut = manager.run_coroutine(
                 window.dht_node.bootstrap_recursive(
                     bootstrap_nodes=bootstrap_nodes,
@@ -1431,6 +1341,8 @@ def run_gui() -> None:
             window.hide_bootstrap_overlay()
             window._dht_manager = None
             window._node_running = False
+            window.start_btn.setEnabled(True)
+            window.stop_btn.setEnabled(False)
 
     def _on_startup_failed(exc: BaseException) -> None:
         window.status_label.setText(f"Failed to start: {exc}")
@@ -1442,6 +1354,8 @@ def run_gui() -> None:
             pass
         window._dht_manager = None
         window._node_running = False
+        window.start_btn.setEnabled(True)
+        window.stop_btn.setEnabled(False)
 
     window.status_label.setText("Starting DHT (loading peers and bootstrap)…")
     window.show_bootstrap_overlay()

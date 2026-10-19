@@ -72,7 +72,8 @@ class DHTManager:
     node : DHTNode, optional
         A pre-configured DHTNode. A new node is created if not provided.
     peers_file : str, optional
-        Path to persist known peers.
+        Path to persist known peers. Blank uses the XDG config directory
+        (``~/.config/dhtrack/peers.dat`` or ``$XDG_CONFIG_HOME``).
     state_file : str | None, optional
         Path to persist this node's stable ``node_id`` (default sibling of ``peers_file``).
     persist_node_identity : bool, optional
@@ -86,13 +87,17 @@ class DHTManager:
     def __init__(
         self,
         node: DHTNode | None = None,
-        peers_file: str = "peers.dat",
+        peers_file: str | None = None,
         state_file: str | None = None,
         persist_node_identity: bool = True,
         auto_align_bep42_node_id: bool = True,
         observed_ip_min_distinct_responders: int = OBSERVED_IP_MIN_DISTINCT_RESPONDERS_DEFAULT,
         peerstore_max_peers_per_infohash: int = 2500,
     ) -> None:
+        if not peers_file:
+            from dhtrack.settings import default_peers_file
+
+            peers_file = default_peers_file()
         self._node = node or DHTNode(
             peers_file=peers_file,
             state_file=state_file,
@@ -141,15 +146,26 @@ class DHTManager:
     # Lifecycle
     # -----------------------------------------------------------------------
 
-    def start(self) -> None:
-        """Start the DHT node (bootstrap + load peers)."""
+    def start(self, *, bootstrap_nodes: list[tuple[str, int]] | None = None) -> None:
+        """Start the DHT node (bootstrap + load peers).
+
+        Parameters
+        ----------
+        bootstrap_nodes : list of (host, port), optional
+            Routers to contact. When omitted, uses ``node.bootstrap_nodes``
+            if :meth:`DHTNode.apply_runtime_settings` stored one, otherwise
+            the built-in router list.
+        """
         logger.info("Starting DHTManager...")
+        if bootstrap_nodes is not None:
+            self._node.bootstrap_nodes = [(str(host), int(port)) for host, port in bootstrap_nodes]
         if self._loop_thread is None:
             self._start_loop_thread()
             assert self._loop is not None
             asyncio.run_coroutine_threadsafe(self._node.start(), self._loop).result(timeout=5)
         self._node.load_peers()
-        self.bootstrap()
+        chosen = bootstrap_nodes if bootstrap_nodes is not None else getattr(self._node, "bootstrap_nodes", None)
+        self.bootstrap(chosen)
 
     def stop(self) -> None:
         """Stop the DHT node and save peers."""
