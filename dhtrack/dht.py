@@ -4418,39 +4418,45 @@ class DHTNode:
             )
 
     def _evict_peer_for_cap_locked(self) -> None:
-        """Drop the least useful contact so ``self.peers`` stays at ``MAX_PEER_TABLE``.
+        """Drop a non-routing contact so ``self.peers`` stays at ``MAX_PEER_TABLE``.
 
-        Prefer contacts that are not in a K-bucket, then ones with an empty
-        RPC queue, then ones with no node id, then the oldest ``last_seen``.
-        The cap itself is the one introduced with KRPC admission (8192); this
-        does not add a second limit.
+        Routing-table members are never removed. Membership is the live
+        K-bucket endpoint, not the ``in_routing_table`` flag (that flag can
+        stay set after ``remove_node``). If every contact is in a bucket, the
+        insert may exceed the cap. Among the rest, prefer an empty RPC queue,
+        then no node id, then the oldest ``last_seen``.
         """
         if len(self.peers) < MAX_PEER_TABLE:
             return
 
-        def _rank(peer: DHTPeer) -> tuple:
-            return (
-                0 if not getattr(peer, "in_routing_table", False) else 1,
-                0 if not getattr(peer, "queue", None) else 1,
-                0 if not peer.node_id else 1,
-                float(getattr(peer, "last_seen", 0.0) or 0.0),
-            )
-
-        # Fast path: an idle, unrouted contact with no node id is in the best
-        # rank class. Insertion order approximates age, so a flood of
-        # unsolicited senders evicts its own entries without a full scan.
+        # Fast path: a contact with no node id cannot be in a K-bucket, and an
+        # idle one is in the best rank class. Insertion order approximates
+        # age, so a flood of unsolicited senders evicts its own entries
+        # without rebuilding the membership set on every datagram.
         victim = next(
-            (
-                p
-                for p in self.peers.values()
-                if not getattr(p, "in_routing_table", False) and not getattr(p, "queue", None) and not p.node_id
-            ),
+            (p for p in self.peers.values() if not p.node_id and not getattr(p, "queue", None)),
             None,
         )
         if victim is None:
-            victim = min(self.peers.values(), key=_rank)
-        if victim.node_id and getattr(victim, "in_routing_table", False):
-            self.routing_table.remove_node(node_id=victim.node_id, endpoint=victim.endpoint)
+            in_table: set[tuple[str, int]] = set()
+            for rt in (self.routing_table.v4, self.routing_table.v6):
+                for bucket in rt.buckets:
+                    for n in bucket.nodes:
+                        ep = n.endpoint
+                        if ep is not None:
+                            in_table.add((ep.ip, ep.port))
+            candidates = [p for p in self.peers.values() if (p.endpoint.ip, p.endpoint.port) not in in_table]
+            if not candidates:
+                return
+
+            def _rank(peer: DHTPeer) -> tuple:
+                return (
+                    0 if not getattr(peer, "queue", None) else 1,
+                    0 if not peer.node_id else 1,
+                    float(getattr(peer, "last_seen", 0.0) or 0.0),
+                )
+
+            victim = min(candidates, key=_rank)
         self._drop_active_peer(victim)
         self._peers_dirty = True
 
