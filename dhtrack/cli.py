@@ -26,7 +26,7 @@ import sys
 import time
 
 from dhtrack.bep53 import magnet_peer_strings_to_triplets, parse_magnet_uri
-from dhtrack.dht import DEFAULT_BOOTSTRAP_NODES, DEFAULT_PEERS_FILE, DHTNode
+from dhtrack.dht import DHTNode
 from dhtrack.dht_manager import DHTManager
 from dhtrack.tracker import TrackerClient
 
@@ -38,16 +38,29 @@ def setup_logging(verbose: bool = False) -> None:
     ----------
     verbose : bool
         If True, set log level to DEBUG. Otherwise INFO.
+
+    The ``dhtrack`` logger itself is set to that level and any handler it
+    owns is removed so records propagate once. A logger left at WARNING
+    (or given its own handler at import time) would hide ``-v`` and print
+    INFO lines twice.
     """
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    else:
+        root.setLevel(level)
+    pkg = logging.getLogger("dhtrack")
+    pkg.setLevel(level)
+    pkg.propagate = True
+    for handler in pkg.handlers[:]:
+        pkg.removeHandler(handler)
     if level == logging.DEBUG:
-        logger = logging.getLogger("dhtrack")
-        logger.debug("Debug logging enabled")
+        pkg.debug("Debug logging enabled")
 
 
 # ---------------------------------------------------------------------------
@@ -81,8 +94,8 @@ def _parse_resolve_args(subparser: argparse.ArgumentParser) -> None:
     )
     subparser.add_argument(
         "--peers-file",
-        default=DEFAULT_PEERS_FILE,
-        help="Path to the file for persisting known peers (default: %(default)s)",
+        default=None,
+        help="Path to the file for persisting known peers (default: XDG config dir/peers.dat)",
     )
     subparser.add_argument(
         "--max-peers",
@@ -150,7 +163,7 @@ def _resolve_command(args: argparse.Namespace) -> int:
 
     timeout = args.timeout
     max_peers = args.max_peers
-    peers_file = getattr(args, "peers_file", DEFAULT_PEERS_FILE)
+    _settings, peers_file = _cli_settings_and_peers(args)
 
     print("Resolve Request")
     print("=" * 60)
@@ -165,6 +178,7 @@ def _resolve_command(args: argparse.Namespace) -> int:
     print()
 
     manager = DHTManager(peers_file=peers_file)
+    manager.node.apply_runtime_settings(_settings)
 
     try:
         manager.start()
@@ -312,6 +326,28 @@ def _scrape_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_settings_and_peers(args: argparse.Namespace):
+    """Load the shared settings object and resolve the peers file.
+
+    An explicit ``--peers-file`` wins. Otherwise the path is the settings
+    value, or the XDG default when that value is blank.
+    """
+    from dhtrack.settings import GuiSettings, load, resolved_peers_file
+
+    settings: GuiSettings = load()
+    explicit = getattr(args, "peers_file", None)
+    peers_file = explicit if explicit else resolved_peers_file(settings)
+    return settings, peers_file
+
+
+def _cli_bootstrap(args: argparse.Namespace) -> list[tuple[str, int]] | None:
+    """``--bootstrap HOST PORT`` pairs, or None when the flag was omitted."""
+    raw = getattr(args, "bootstrap", None)
+    if not raw:
+        return None
+    return [(str(host), int(port)) for host, port in raw]
+
+
 def _parse_dht_args(args: argparse.Namespace) -> dict:
     """Extract DHT node arguments.
 
@@ -325,8 +361,9 @@ def _parse_dht_args(args: argparse.Namespace) -> dict:
     dict
         Keyword arguments for DHTNode construction.
     """
+    _settings, peers_file = _cli_settings_and_peers(args)
     return {
-        "peers_file": getattr(args, "peers_file", DEFAULT_PEERS_FILE),
+        "peers_file": peers_file,
         "bind_addr": ("0.0.0.0", getattr(args, "bind_port", 0)),
     }
 
@@ -344,20 +381,24 @@ def _dht_command(args: argparse.Namespace) -> int:
     int
         Exit code (0 for success, 1 for error).
     """
-    getattr(args, "bootstrap", None) or DEFAULT_BOOTSTRAP_NODES
+    settings, peers_file = _cli_settings_and_peers(args)
+    bootstrap_nodes = _cli_bootstrap(args)
 
     try:
         node = DHTNode(
             bind_addr=("0.0.0.0", getattr(args, "bind_port", 0)),
-            peers_file=getattr(args, "peers_file", DEFAULT_PEERS_FILE),
+            peers_file=peers_file,
         )
-        manager = DHTManager(node=node, peers_file=getattr(args, "peers_file", DEFAULT_PEERS_FILE))
-        manager.start()
+        node.apply_runtime_settings(settings)
+        if bootstrap_nodes:
+            node.bootstrap_nodes = list(bootstrap_nodes)
+        manager = DHTManager(node=node, peers_file=peers_file)
+        manager.start(bootstrap_nodes=bootstrap_nodes)
 
         node_id_hex = manager.node.node_id.hex() if manager.node.node_id else "unknown"
         print(f"DHT Node ID: {node_id_hex}")
         print(f"Peers discovered: {len(manager.node.peers)}")
-        print(f"Peers file: {os.path.abspath(getattr(args, 'peers_file', DEFAULT_PEERS_FILE))}")
+        print(f"Peers file: {os.path.abspath(peers_file)}")
         print()
 
         # Run the DHT loop
@@ -436,8 +477,8 @@ def build_parser() -> argparse.ArgumentParser:
     dht_parser = subparsers.add_parser("dht", help="Run a DHT node (default)")
     dht_parser.add_argument(
         "--peers-file",
-        default=DEFAULT_PEERS_FILE,
-        help="Path to the file for persisting known peers (default: %(default)s)",
+        default=None,
+        help="Path to the file for persisting known peers (default: XDG config dir/peers.dat)",
     )
     dht_parser.add_argument(
         "--bootstrap",

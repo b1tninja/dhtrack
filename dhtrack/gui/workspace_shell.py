@@ -46,26 +46,60 @@ class MainWorkspaceShell(QWidget):
         lay.addWidget(split)
 
         self._pages: list[tuple[str, QWidget]] = []
+        self._row_to_stack: list[int | None] = []
 
-    def set_pages(self, pages: list[tuple[str, QWidget]]) -> None:
-        """Rebuild sidebar entries and stacked widgets."""
+    def set_pages(self, pages: list[tuple[str, QWidget | None]]) -> None:
+        """Rebuild sidebar entries and stacked widgets.
+
+        A ``None`` widget is a non-selectable section header. Selecting a
+        header moves to the next real page. Headers are not stacked.
+        """
         try:
             self.sidebar.currentRowChanged.disconnect()
         except TypeError:
             pass
 
-        self._pages = list(pages)
+        self._pages = [(title, widget) for title, widget in pages if widget is not None]
+        self._row_to_stack = []
         self.sidebar.clear()
         while self.stack.count():
             w = self.stack.widget(0)
             self.stack.removeWidget(w)
 
-        for title, widget in self._pages:
-            self.stack.addWidget(widget)
-            QListWidgetItem(title, self.sidebar)
+        stack_index = 0
+        first_selectable = -1
+        for title, widget in pages:
+            item = QListWidgetItem(title)
+            if widget is None:
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                self._row_to_stack.append(None)
+            else:
+                self.stack.addWidget(widget)
+                self._row_to_stack.append(stack_index)
+                if first_selectable < 0:
+                    first_selectable = self.sidebar.count()
+                stack_index += 1
+            self.sidebar.addItem(item)
 
-        if self._pages:
-            self.sidebar.setCurrentRow(0)
-            self.stack.setCurrentIndex(0)
+        if first_selectable >= 0:
+            mapped = self._row_to_stack[first_selectable]
+            self.sidebar.setCurrentRow(first_selectable)
+            if mapped is not None:
+                self.stack.setCurrentIndex(mapped)
 
-        self.sidebar.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.sidebar.currentRowChanged.connect(self._select_sidebar_row)
+
+    def _select_sidebar_row(self, row: int) -> None:
+        if row < 0 or row >= len(self._row_to_stack):
+            return
+        mapped = self._row_to_stack[row]
+        if mapped is None:
+            for nxt in range(row + 1, len(self._row_to_stack)):
+                if self._row_to_stack[nxt] is not None:
+                    self.sidebar.setCurrentRow(nxt)
+                    return
+            return
+        self.stack.setCurrentIndex(mapped)

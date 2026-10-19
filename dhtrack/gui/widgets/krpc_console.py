@@ -202,6 +202,7 @@ class KRPConsoleWidget(QWidget):
         self._history_index = -1
         self._msg_filter: str = "all"
         self._log_enabled: bool = True
+        self._table_batch: int = 0
 
         self._setup_ui()
 
@@ -736,9 +737,22 @@ class KRPConsoleWidget(QWidget):
         # Only add to visible data if filter matches
         if self._msg_filter == "all" or msg_type == self._msg_filter:
             self._traffic_data.append(entry.to_dict())
-            self.table_model.set_data(self._traffic_data)
 
-        # Update entry count
+        if self._table_batch:
+            return
+        self.table_model.set_data(self._traffic_data)
+        self.entry_label.setText(f"Entries: {len(self._traffic_log)}")
+
+    def begin_table_batch(self) -> None:
+        """Hold model resets until :meth:`end_table_batch`."""
+        self._table_batch += 1
+
+    def end_table_batch(self) -> None:
+        """Apply one table reset for every row added since the matching begin."""
+        self._table_batch = max(0, self._table_batch - 1)
+        if self._table_batch:
+            return
+        self.table_model.set_data(self._traffic_data)
         self.entry_label.setText(f"Entries: {len(self._traffic_log)}")
 
     def on_incoming_message(

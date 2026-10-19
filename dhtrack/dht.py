@@ -26,7 +26,7 @@ import socket
 import struct
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,7 +44,15 @@ from dhtrack.bep42 import is_address_exempt_from_bep42
 from dhtrack.bep42 import is_valid_node_id as _bep42_valid_node_id
 from dhtrack.bloom_filter import BloomFilter
 from dhtrack.dht_address import is_reserved_ipv6
+from dhtrack.endpoint_swarm_index import EndpointSwarmIndex
 from dhtrack.events import NullEventSink, ProtocolEventSink
+from dhtrack.infohash_index import (
+    EVIDENCE_BEP51_SAMPLE,
+    EVIDENCE_INBOUND_ANNOUNCE_PEER,
+    EVIDENCE_INBOUND_GET_PEERS,
+    InfohashIndex,
+    InfohashWatchlist,
+)
 
 
 @dataclass(frozen=True)
@@ -159,7 +167,21 @@ GET_PEERS_SCRAPE_MAX_INFLIGHT = 64
 WARMUP_PING_QPS = 20.0
 WARMUP_PING_LIMIT = 128
 
-DEFAULT_PEERS_FILE = "peers.dat"
+
+def _default_peers_file() -> str:
+    """Peers file beside the XDG config dir. Falls back to cwd if settings cannot load."""
+    try:
+        from dhtrack.settings import default_peers_file
+
+        return default_peers_file()
+    except Exception:
+        return "peers.dat"
+
+
+DEFAULT_PEERS_FILE = _default_peers_file()
+# Node IDs the routing table refused. Bounded so lookups do not scan every contact.
+# The live contact table itself is capped by ``MAX_PEER_TABLE`` (see above).
+LOOKUP_OVERFLOW_MAX = 256
 # Stable DHT node identity (20-byte id); kept beside peers.dat by default.
 DEFAULT_NODE_STATE_BASENAME = "dht_node.state"
 # peers.dat v2: magic + per-node status/counters (legacy v1: 0x00/0x01 + 26/38 byte rows).
@@ -818,7 +840,7 @@ class KBucket:
 
     @property
     def is_full(self) -> bool:
-        return len(self.nodes) >= BUCKET_SIZE
+        return len(self.nodes) >= int(getattr(self, "bucket_size", BUCKET_SIZE))
 
     @property
     def good_nodes(self) -> list[BucketNode]:
@@ -948,6 +970,9 @@ class KBucket:
 
         left_bucket = KBucket(self.min_id, mid_id)
         right_bucket = KBucket(mid_id, self.max_id)
+        bucket_size = int(getattr(self, "bucket_size", BUCKET_SIZE))
+        left_bucket.bucket_size = bucket_size
+        right_bucket.bucket_size = bucket_size
 
         for node in self.nodes:
             # Inclusive on the left so the shared boundary matches find_bucket,
@@ -1329,6 +1354,8 @@ class DHTPeer:
     # Keep this reasonably large so we can classify duplicates even under high query volume.
     _recent_handled_txids: deque[bytes] = field(default_factory=lambda: deque(maxlen=2048), repr=False)
     _recent_txid_overflow_last_log: float = field(default=0.0, repr=False)
+    # True once a K-bucket accepted this contact. Cap eviction prefers other contacts.
+    in_routing_table: bool = False
 
     def _note_handled_txid(self, txid: bytes) -> None:
         """Record a handled txid and warn if the cache is saturated.
@@ -1368,6 +1395,7 @@ class DHTPeer:
         nid_e = binascii.b2a_hex(self.node_id).decode("ascii") if self.node_id else "unknown"
         logger.debug("Sending %d bytes to peer %s (node_id=%s)", len(data), addr, nid_e)
 
+        self.last_seen = time.time()
         pending = self._last_outgoing_pending
         self._last_outgoing_pending = None
 
@@ -1506,6 +1534,7 @@ class DHTPeer:
         parsed : dict
             The parsed BEncode message.
         """
+        self.last_seen = time.time()
         if self.endpoint.is_ipv6:
             addr = f"[{self.endpoint.ip}]:{self.endpoint.port}"
         else:
@@ -1625,9 +1654,24 @@ class DHTPeer:
                 addr,
                 ih_repr,
             )
+            if len(info_hash) == 20:
+                self.dht_node.note_passive_infohash(
+                    info_hash,
+                    evidence=EVIDENCE_INBOUND_GET_PEERS,
+                    endpoint=self.endpoint,
+                )
             self._handle_get_peers(transaction_id, args)
         elif query_type in (b"announce_peer", b"announce_peer".decode()):
             logger.debug("Processing announce_peer query from peer %s", addr)
+            ann_ih = args.get(b"info_hash", b"")
+            if isinstance(ann_ih, str):
+                ann_ih = ann_ih.encode("latin-1")
+            if isinstance(ann_ih, (bytes, bytearray)) and len(ann_ih) == 20:
+                self.dht_node.note_passive_infohash(
+                    bytes(ann_ih),
+                    evidence=EVIDENCE_INBOUND_ANNOUNCE_PEER,
+                    endpoint=self.endpoint,
+                )
             self._handle_announce_peer(transaction_id, args)
         else:
             nid_e = binascii.b2a_hex(self.node_id).decode("ascii") if self.node_id else "unknown"
@@ -1699,7 +1743,7 @@ class DHTPeer:
         response: dict[bytes, Any] = {b"id": self.dht_node.node_id}
 
         if include_n4:
-            closest_nodes = self.dht_node.routing_table.v4.get_closest_nodes(target, K)
+            closest_nodes = self.dht_node.routing_table.v4.get_closest_nodes(target, self.dht_node.k)
             logger.debug(
                 "find_node response: target=%s, IPv4 closest=%d nodes, node_id=%s",
                 binascii.b2a_hex(target).decode("ascii"),
@@ -1721,7 +1765,7 @@ class DHTPeer:
                 logger.debug("find_node response: NO IPv4 nodes found for target, returning empty nodes")
 
         if include_n6:
-            closest_nodes6 = self.dht_node.routing_table.v6.get_closest_nodes(target, K)
+            closest_nodes6 = self.dht_node.routing_table.v6.get_closest_nodes(target, self.dht_node.k)
             if closest_nodes6:
                 response[b"nodes6"] = b"".join(
                     _compact_node_encode(
@@ -1798,7 +1842,7 @@ class DHTPeer:
                 include_n6 = self.endpoint.is_ipv6
 
             if include_n4:
-                closest_v4 = self.dht_node.routing_table.v4.get_closest_nodes(info_hash, K)
+                closest_v4 = self.dht_node.routing_table.v4.get_closest_nodes(info_hash, self.dht_node.k)
                 if closest_v4:
                     response[b"nodes"] = b"".join(
                         _compact_node_encode(
@@ -1813,7 +1857,7 @@ class DHTPeer:
                     response[b"nodes"] = b""
 
             if include_n6:
-                closest_v6 = self.dht_node.routing_table.v6.get_closest_nodes(info_hash, K)
+                closest_v6 = self.dht_node.routing_table.v6.get_closest_nodes(info_hash, self.dht_node.k)
                 if closest_v6:
                     response[b"nodes6"] = b"".join(
                         _compact_node_encode(
@@ -2242,9 +2286,14 @@ class DHTPeer:
                 interval,
             )
 
-        # BEP 51: record the next permissible re-query timestamp for this peer
+        for ih in infohashes:
+            self.dht_node.note_sampled_infohash(ih, endpoint=self.endpoint, evidence=EVIDENCE_BEP51_SAMPLE)
+
+        # BEP 51: record the next permissible re-query timestamp for this peer.
+        # This overwrites the provisional gap set when the query was sent.
         key = (self.endpoint.ip, self.endpoint.port)
         self.dht_node._sample_next_at[key] = time.time() + interval
+        self.dht_node._prune_sample_schedule()
 
     def _parse_nodes(
         self,
@@ -2700,15 +2749,8 @@ class SocketManager:
         self.loop.call_soon_threadsafe(self.send, endpoint, payload)
 
 
-def extract_gui_message_info_from_datagram(data: bytes) -> dict[str, Any]:
-    """Summarize a bencoded KRPC datagram for GUI / Passive observation.
-
-    For inbound ``y=q`` queries, extracts ``info_hash`` (``get_peers`` / ``announce_peer``)
-    and ``target`` (``find_node``) from the ``a`` dict when present.
-
-    Keys always present align with legacy console expectations; optional keys use
-    empty string when absent: ``info_hash_hex``, ``find_node_target_hex``.
-    """
+def message_info_from_parsed(parsed: Any, *, raw_len: int = 0) -> dict[str, Any]:
+    """Summarize an already-decoded KRPC message. Does not bdecode."""
     result: dict[str, Any] = {
         "msg_type": "unknown",
         "y": "",
@@ -2720,12 +2762,10 @@ def extract_gui_message_info_from_datagram(data: bytes) -> dict[str, Any]:
         "info_hash_hex": "",
         "find_node_target_hex": "",
     }
+    if not isinstance(parsed, dict):
+        result["payload_snippet"] = f"decode_error({raw_len}bytes)"
+        return result
     try:
-        parsed = bencode_module.decode(data)
-        if not isinstance(parsed, dict):
-            result["payload_snippet"] = f"non_dict_after_decode({len(data)}bytes)"
-            return result
-
         y = parsed.get(b"y")
         if isinstance(y, bytes):
             y = y.decode("latin-1")
@@ -2795,9 +2835,26 @@ def extract_gui_message_info_from_datagram(data: bytes) -> dict[str, Any]:
             result["msg_type"] = result["y"]
 
     except Exception:
-        result["payload_snippet"] = f"decode_error({len(data)}bytes)"
+        result["payload_snippet"] = f"decode_error({raw_len}bytes)"
 
     return result
+
+
+def extract_gui_message_info_from_datagram(data: bytes) -> dict[str, Any]:
+    """Summarize a bencoded KRPC datagram for GUI / passive observation.
+
+    Decodes once, then :func:`message_info_from_parsed`. Callers that already
+    decoded the datagram should use that function directly.
+    """
+    try:
+        parsed = bencode_module.decode(data)
+    except Exception:
+        parsed = None
+    if parsed is not None and not isinstance(parsed, dict):
+        info = message_info_from_parsed(None, raw_len=len(data))
+        info["payload_snippet"] = f"non_dict_after_decode({len(data)}bytes)"
+        return info
+    return message_info_from_parsed(parsed, raw_len=len(data))
 
 
 # ---------------------------------------------------------------------------
@@ -2885,12 +2942,30 @@ class DHTNode:
         # Token secret for announce_peer
         self.token_secret = TokenSecret()
 
-        # Peer contact table (for active peers we've communicated with)
+        # Peer contact table. Capped by ``MAX_PEER_TABLE``. Closest-k lookups
+        # use the routing table plus a small overflow of IDs the buckets
+        # refused — they do not scan this dict.
         self.peers: dict[tuple[str, int], DHTPeer] = {}
         # add_peer runs on the asyncio thread and on worker threads (bootstrap,
         # GUI). The lock covers insert/evict; datagram handling does not hold
         # it across KRPC processing.
         self._peers_lock = threading.RLock()
+        self._peers_by_node_id: dict[bytes, DHTPeer] = {}
+        self._lookup_overflow: OrderedDict[bytes, BucketNode] = OrderedDict()
+        self.krpc_timeout: float = float(TIMEOUT)
+        self.k: int = int(K)
+        self.max_pending_per_peer: int = int(MAX_PENDING_PER_PEER)
+        self.max_pending_global: int = int(MAX_PENDING_GLOBAL)
+        self.scrape_qps: float = float(GET_PEERS_SCRAPE_QPS)
+        self.scrape_burst: float = float(GET_PEERS_SCRAPE_BURST)
+        self.scrape_max_inflight: int = int(GET_PEERS_SCRAPE_MAX_INFLIGHT)
+        self.bootstrap_nodes: list[tuple[str, int]] | None = None
+        self.infohash_index: InfohashIndex = InfohashIndex()
+        self.endpoint_swarms: EndpointSwarmIndex = EndpointSwarmIndex()
+        self.watchlist: InfohashWatchlist = InfohashWatchlist()
+        self._sample_cursor: int = 0
+        self._sample_polling_enabled: bool = True
+        self._last_sample_poll: float = 0.0
 
         # Async I/O (asyncio-native; started explicitly via `await start()`)
         self._bind_addr: tuple[str, int] = bind_addr
@@ -3234,7 +3309,7 @@ class DHTNode:
         for p in candidates[: int(limit)]:
             # Backpressure: don't add warmup pings if this peer is already busy.
             try:
-                if len(p.queue) >= max(0, MAX_PENDING_PER_PEER - 4):
+                if len(p.queue) >= max(0, self.max_pending_per_peer - 4):
                     continue
                 p.ping()
                 sent += 1
@@ -3262,6 +3337,13 @@ class DHTNode:
                     else:
                         self._last_peers_save = now
                         self._peers_dirty = False
+
+                if getattr(self, "_sample_polling_enabled", False) and (now - self._last_sample_poll) >= 1.0:
+                    self._last_sample_poll = now
+                    try:
+                        self.poll_sample_infohashes(max_queries=1)
+                    except Exception:
+                        logger.debug("BEP 51 sample poll failed", exc_info=True)
 
                 if now - last_status_update >= 5.0:
                     last_status_update = now
@@ -3312,7 +3394,7 @@ class DHTNode:
         with self._scrape_lock:
             st = self._get_peers_scrape.get(info_hash)
             if st is None:
-                st = _GetPeersScrapeState(tokens=GET_PEERS_SCRAPE_BURST)
+                st = _GetPeersScrapeState(tokens=self.scrape_burst)
                 self._get_peers_scrape[info_hash] = st
             if node_id in st.enqueued:
                 return
@@ -3344,7 +3426,7 @@ class DHTNode:
             total_pending = sum(len(p.queue) for p in list(self.peers.values()))
         except Exception:
             total_pending = 0
-        if total_pending >= int(MAX_PENDING_GLOBAL * 0.75):
+        if total_pending >= int(self.max_pending_global * 0.75):
             return (0, 0)
 
         with self._scrape_lock:
@@ -3355,7 +3437,7 @@ class DHTNode:
             # Token-bucket refill
             dt = max(0.0, now - st.last_refill)
             st.last_refill = now
-            st.tokens = min(GET_PEERS_SCRAPE_BURST, st.tokens + dt * GET_PEERS_SCRAPE_QPS)
+            st.tokens = min(self.scrape_burst, st.tokens + dt * self.scrape_qps)
 
             while st.q and st.tokens >= 1.0 and (sent_v4 + sent_v6) < max_inflight:
                 node_id, peer_key, is_v6 = st.q.popleft()
@@ -3374,7 +3456,7 @@ class DHTNode:
                 if peer is None:
                     continue
                 # Per-peer backpressure: keep headroom for non-scrape queries and responses.
-                if len(peer.queue) >= max(0, MAX_PENDING_PER_PEER - 4):
+                if len(peer.queue) >= max(0, self.max_pending_per_peer - 4):
                     continue
                 try:
                     peer.get_peers(info_hash)
@@ -3397,6 +3479,7 @@ class DHTNode:
         txid_hex: str = "",
         method: str = "",
         note: str = "",
+        parsed: Any = None,
     ) -> None:
         """Log a raw datagram at the wire/protocol level.
 
@@ -3429,6 +3512,11 @@ class DHTNode:
         note : str
             Optional free-form annotation.
         """
+        # Hex dumps and repr() are for operators who turned wire debug on.
+        # Skip them entirely otherwise — this runs on every datagram.
+        if not wire_logger.isEnabledFor(logging.DEBUG):
+            return
+
         ip, port = addr[0], addr[1]
         family_str = "AF_INET6" if is_ipv6 else "AF_INET"
         addr_str = f"[{ip}]:{port}" if is_ipv6 else f"{ip}:{port}"
@@ -3438,15 +3526,19 @@ class DHTNode:
         if len(data) > 80:
             hex_snippet += "..."
 
-        # Attempt BEncode decode
+        # Attempt BEncode decode unless the caller already decoded this datagram.
         decode_ok = False
         decode_error_msg = ""
-        parsed = None
-        try:
-            parsed = bencode_module.decode(data)
+        if parsed is None:
+            try:
+                parsed = bencode_module.decode(data)
+                decode_ok = True
+            except Exception as exc:
+                decode_error_msg = str(exc)
+        elif isinstance(parsed, dict):
             decode_ok = True
-        except Exception as exc:
-            decode_error_msg = str(exc)
+        else:
+            decode_error_msg = "non-dict"
 
         # Build parsed summary fields (only on successful decode)
         field_summary = ""
@@ -3582,12 +3674,14 @@ class DHTNode:
                 return None
             return float(sent)
 
+        timeout = float(getattr(self, "krpc_timeout", TIMEOUT))
+        per_peer_cap = int(getattr(self, "max_pending_per_peer", MAX_PENDING_PER_PEER))
         # 1) TTL expiration
         for peer in list(self.peers.values()):
             stale_txids = []
             for txid, pq in list(peer.queue.items()):
                 sent = _query_sent_at(pq)
-                if sent is None or now - sent > TIMEOUT:
+                if sent is None or now - sent > timeout:
                     stale_txids.append(txid)
             for txid in stale_txids:
                 peer.queue.pop(txid, None)
@@ -3595,7 +3689,7 @@ class DHTNode:
                 logger.debug("Query %s timed out for peer %s", txid, peer.endpoint)
 
             # 2) Per-peer cap: evict oldest by sent_at (not counted as timeout)
-            while len(peer.queue) > MAX_PENDING_PER_PEER:
+            while len(peer.queue) > per_peer_cap:
                 oldest_txid, _oldest_pq = min(
                     peer.queue.items(),
                     key=lambda item: _query_sent_at(item[1]) if _query_sent_at(item[1]) is not None else 0.0,
@@ -3609,7 +3703,8 @@ class DHTNode:
 
         # 3) Global cap: evict globally oldest sent_at
         total_pending = sum(len(p.queue) for p in list(self.peers.values()))
-        while total_pending > MAX_PENDING_GLOBAL:
+        global_cap = int(getattr(self, "max_pending_global", MAX_PENDING_GLOBAL))
+        while total_pending > global_cap:
             candidates: list[tuple[float, DHTPeer, bytes]] = []
             for p in list(self.peers.values()):
                 for txid, pq in list(p.queue.items()):
@@ -3629,17 +3724,13 @@ class DHTNode:
     def _handle_datagram(self, data: bytes, addr: tuple) -> None:
         """Handle an incoming datagram.
 
-        Parameters
-        ----------
-        data : bytes
-            The received data.
-        addr : tuple
-            The sender address (ip, port).
+        The payload is bdecoded once. Unknown senders are admitted only when
+        that decode is a KRPC dict, and the dict is processed (so the first
+        query is answered). Garbage from an unknown address is dropped.
         """
         ip, port = addr[0], addr[1]
         is_ipv6 = self._is_ipv6_addr(addr)
 
-        # Warn about reserved IPv6 addresses (BEP 42 equivalent)
         if is_ipv6 and is_reserved_ipv6(ip):
             logger.warning(
                 "Reserved IPv6 address detected from %s:%d. "
@@ -3649,46 +3740,79 @@ class DHTNode:
                 port,
             )
 
-        # Wire-level datagram logging for incoming packets
-        self._log_datagram(
-            direction="IN",
-            data=data,
-            addr=(ip, port),
-            is_ipv6=is_ipv6,
-            note="incoming_datagram",
-        )
-
-        Endpoint(ip, port)
-
-        # Check if we know this peer
-        peer_key = (ip, port)
-
-        # Check if this is a QUIC packet - parse and handle accordingly
+        payload = data
+        from_quic = False
         if quic_module.is_quic_packet(data):
-            payload = quic_module.parse_quic_packet(data)
-            if payload is not None:
-                # Successfully parsed QUIC packet - process as bencode
+            unwrapped = quic_module.parse_quic_packet(data)
+            if unwrapped is not None:
+                payload = unwrapped
+                from_quic = True
+
+        parsed = self._decode_krpc_dict(payload)
+        peer_key = (ip, port)
+        peer = self.peers.get(peer_key)
+        if isinstance(parsed, dict):
+            if peer is None:
+                peer = self.add_peer(None, ip, port, is_ipv6=is_ipv6)
+            if peer is not None:
                 try:
-                    self._dispatch_krpc(peer_key, ip, port, is_ipv6, payload, from_quic=True)
+                    peer._process_parsed_message(parsed)
                 except Exception:
                     logger.debug(
-                        "Error processing QUIC payload from %s:%d",
+                        "Error handling datagram from %s:%d (quic=%s)",
                         ip,
                         port,
+                        from_quic,
                         exc_info=True,
                     )
-                return
-
-        # Regular UDP DHT datagram
-        try:
-            self._dispatch_krpc(peer_key, ip, port, is_ipv6, data, from_quic=False)
-        except Exception:
+        elif peer is None:
             logger.debug(
-                "Error handling datagram from %s:%d",
+                "Dropping non-KRPC datagram from unknown %s:%d (%d bytes, quic=%s)",
                 ip,
                 port,
-                exc_info=True,
+                len(payload),
+                from_quic,
             )
+        else:
+            logger.debug(
+                "Non-bencode datagram from known peer %s:%d (first byte 0x%02x, size %d, quic=%s)",
+                ip,
+                port,
+                payload[0] if payload else 0,
+                len(payload),
+                from_quic,
+            )
+
+        if wire_logger.isEnabledFor(logging.DEBUG):
+            self._log_datagram(
+                direction="IN",
+                data=payload,
+                addr=(ip, port),
+                is_ipv6=is_ipv6,
+                note="incoming_datagram",
+                parsed=parsed if isinstance(parsed, dict) else None,
+            )
+
+        if self.event_sink is None:
+            return
+        try:
+            msg_info = message_info_from_parsed(
+                parsed if isinstance(parsed, dict) else None,
+                raw_len=len(payload),
+            )
+            self.event_sink.on_incoming_message(
+                msg_info["msg_type"],
+                ip,
+                port,
+                is_ipv6,
+                len(payload),
+                txid=msg_info["t"],
+                status=msg_info["status"],
+            )
+            msg_info["direction"] = "incoming"
+            self.event_sink.on_message_parsed(ip, port, is_ipv6, len(payload), msg_info)
+        except Exception:
+            logger.debug("Error in datagram GUI callback", exc_info=True)
 
     def _decode_krpc_dict(self, data: bytes) -> dict | None:
         """Return a decoded KRPC dict, or None if the datagram is not one."""
@@ -3696,92 +3820,12 @@ class DHTNode:
             parsed = bencode_module.decode(data)
         except bencode_module.DecodeError:
             return None
+        except Exception:
+            logger.debug("Error decoding datagram (%d bytes)", len(data), exc_info=True)
+            return None
         if not isinstance(parsed, dict):
             return None
         return parsed
-
-    def _dispatch_krpc(
-        self,
-        peer_key: tuple[str, int],
-        ip: str,
-        port: int,
-        is_ipv6: bool,
-        data: bytes,
-        *,
-        from_quic: bool,
-    ) -> None:
-        """Deliver one KRPC payload to the contact that sent it.
-
-        Unknown senders are admitted only after the payload decodes as a
-        KRPC dict, and the dict is processed. The previous path inserted the
-        contact and sent a ping, which dropped the first query (so we never
-        answered it) and reflected a ping toward any spoofed source address.
-        """
-        peer = self.peers.get(peer_key)
-        if peer is not None:
-            try:
-                peer._recv_normalized(data)
-            except bencode_module.DecodeError:
-                logger.debug(
-                    "Non-bencode datagram from known peer %s:%d (first byte 0x%02x, size %d, quic=%s)",
-                    ip,
-                    port,
-                    data[0] if data else 0,
-                    len(data),
-                    from_quic,
-                )
-            except Exception:
-                logger.debug(
-                    "Error handling datagram from known peer %s:%d",
-                    ip,
-                    port,
-                    exc_info=True,
-                )
-            self._notify_incoming(ip, port, is_ipv6, data)
-            return
-
-        parsed = self._decode_krpc_dict(data)
-        if parsed is None:
-            logger.debug(
-                "Dropping non-KRPC datagram from unknown %s:%d (%d bytes, quic=%s)",
-                ip,
-                port,
-                len(data),
-                from_quic,
-            )
-            return
-        peer = self.add_peer(None, ip, port, is_ipv6=is_ipv6)
-        if peer is None:
-            return
-        peer._process_parsed_message(parsed)
-        self._notify_incoming(ip, port, is_ipv6, data)
-
-    def _notify_incoming(self, ip: str, port: int, is_ipv6: bool, data: bytes) -> None:
-        """Report one incoming datagram to the GUI event sink, if any."""
-        # Notify GUI about incoming message with extracted message details
-        if self.event_sink is not None:
-            try:
-                msg_info = self._extract_message_info(data)
-                self.event_sink.on_incoming_message(
-                    msg_info["msg_type"],
-                    ip,
-                    port,
-                    is_ipv6,
-                    len(data),
-                    txid=msg_info["t"],
-                    status=msg_info["status"],
-                )
-            except Exception:
-                logger.debug("Error in on_incoming_message callback")
-
-        # Also notify with full message details for the console
-        if self.event_sink is not None:
-            try:
-                msg_info = self._extract_message_info(data)
-                msg_info["direction"] = "incoming"
-                self.event_sink.on_message_parsed(ip, port, is_ipv6, len(data), msg_info)
-            except Exception:
-                logger.debug("Error in on_message_parsed callback")
 
     def _add_self_to_routing_tables(self) -> None:
         """Add this node's own ID to the IPv4 and IPv6 routing tables.
@@ -3968,7 +4012,7 @@ class DHTNode:
             v6_nodes_before,
         )
 
-        nodes = nodes or DEFAULT_BOOTSTRAP_NODES
+        nodes = nodes or getattr(self, "bootstrap_nodes", None) or DEFAULT_BOOTSTRAP_NODES
         total_contacted = 0
         total_skipped = 0
 
@@ -4130,6 +4174,151 @@ class DHTNode:
 
         return result
 
+    def apply_runtime_settings(self, settings: Any) -> None:
+        """Apply a :class:`dhtrack.settings.GuiSettings` onto this node.
+
+        Updates instance fields used by the lookup, timeout, and scrape paths.
+        Does not assign ``dhtrack.dht`` module globals.
+        """
+        self.krpc_timeout = float(getattr(settings, "dht_timeout", self.krpc_timeout))
+        self.k = max(1, int(getattr(settings, "dht_k", self.k)))
+        self.max_pending_per_peer = max(
+            1,
+            int(getattr(settings, "dht_max_pending_per_peer", self.max_pending_per_peer)),
+        )
+        self.max_pending_global = max(
+            1,
+            int(getattr(settings, "dht_max_pending_global", self.max_pending_global)),
+        )
+        self.scrape_qps = float(getattr(settings, "dht_get_peers_scrape_qps", self.scrape_qps))
+        self.scrape_burst = float(getattr(settings, "dht_get_peers_scrape_burst", self.scrape_burst))
+        self.scrape_max_inflight = max(
+            0,
+            int(getattr(settings, "dht_get_peers_scrape_max_inflight", self.scrape_max_inflight)),
+        )
+        self.peers_save_interval = float(getattr(settings, "peers_save_interval", self.peers_save_interval))
+        self.auto_align_bep42_node_id = bool(
+            getattr(settings, "auto_align_bep42_node_id", self.auto_align_bep42_node_id)
+        )
+        self.observed_ip_min_distinct_responders = max(
+            1,
+            int(getattr(settings, "observed_ip_min_distinct_responders", self.observed_ip_min_distinct_responders)),
+        )
+        nodes = getattr(settings, "bootstrap_nodes", None)
+        if nodes:
+            self.bootstrap_nodes = [(str(h), int(p)) for h, p in nodes]
+        per_ih = getattr(settings, "peerstore_max_peers_per_infohash", None)
+        if per_ih is not None and hasattr(self, "peer_store"):
+            self.peer_store._max_peers_per_infohash = max(1, int(per_ih))
+        for table in (self.routing_table.v4, self.routing_table.v6):
+            table.bucket_size = self.k
+            for bucket in table.buckets:
+                bucket.bucket_size = self.k
+
+    def note_passive_infohash(
+        self,
+        info_hash: bytes,
+        *,
+        evidence: str,
+        endpoint: Endpoint | None = None,
+    ) -> None:
+        """Record an infohash seen in an inbound query and mirror it per endpoint."""
+        ep_tuple = (endpoint.ip, endpoint.port) if endpoint is not None else None
+        is_v6 = bool(endpoint.is_ipv6) if endpoint is not None else False
+        self.infohash_index.observe(
+            info_hash,
+            source=evidence,
+            endpoint=ep_tuple,
+            swarm_index=self.endpoint_swarms,
+            is_ipv6=is_v6,
+        )
+
+    def note_sampled_infohash(
+        self,
+        info_hash: bytes,
+        *,
+        endpoint: Endpoint | None = None,
+        evidence: str = EVIDENCE_BEP51_SAMPLE,
+    ) -> None:
+        """Store one infohash from a BEP 51 ``samples`` blob."""
+        self.note_passive_infohash(info_hash, evidence=evidence, endpoint=endpoint)
+
+    def _prune_sample_schedule(self, *, limit: int = 8192) -> None:
+        """Drop expired BEP 51 interval entries so the map cannot grow without bound."""
+        if len(self._sample_next_at) <= limit:
+            return
+        now = time.time()
+        expired = [k for k, ts in self._sample_next_at.items() if ts <= now]
+        for k in expired:
+            self._sample_next_at.pop(k, None)
+        if len(self._sample_next_at) > limit:
+            # Still over cap: drop the soonest deadlines first (they will be relearned).
+            ordered = sorted(self._sample_next_at.items(), key=lambda kv: kv[1])
+            for k, _ts in ordered[: len(self._sample_next_at) - limit]:
+                self._sample_next_at.pop(k, None)
+
+    def poll_sample_infohashes(self, *, max_queries: int = 1) -> int:
+        """Send up to ``max_queries`` BEP 51 samples to routing-table nodes.
+
+        Honours each peer's returned ``interval`` (and a provisional gap set
+        when the query is sent, so a poll loop cannot stampede one endpoint).
+        Sampled infohashes are stored by :meth:`note_sampled_infohash` when
+        the response arrives.
+        """
+        if not self._sample_polling_enabled or max_queries <= 0:
+            return 0
+        candidates: list[BucketNode] = []
+        for table in (self.routing_table.v4, self.routing_table.v6):
+            for bucket in table.buckets:
+                candidates.extend(bucket.nodes)
+        if not candidates:
+            return 0
+        sent = 0
+        start = self._sample_cursor % len(candidates)
+        for i in range(len(candidates)):
+            if sent >= max_queries:
+                break
+            node = candidates[(start + i) % len(candidates)]
+            self._sample_cursor = (start + i + 1) % len(candidates)
+            peer = self.peer_for_bucket_node(node)
+            if peer is None:
+                continue
+            try:
+                sent_one = bool(self.sample_infohashes(target=peer))
+            except Exception:
+                logger.debug("sample_infohashes poll failed for %s", getattr(peer, "endpoint", "?"), exc_info=True)
+                continue
+            if sent_one:
+                sent += 1
+        return sent
+
+    def _index_peer_node_id(self, peer: DHTPeer) -> None:
+        nid = peer.node_id
+        if isinstance(nid, (bytes, bytearray)) and len(nid) == 20:
+            self._peers_by_node_id[bytes(nid)] = peer
+
+    def _remember_lookup_overflow(self, node: BucketNode) -> None:
+        nid = node.node_id
+        if not isinstance(nid, (bytes, bytearray)) or len(nid) != 20:
+            return
+        key = bytes(nid)
+        overflow = self._lookup_overflow
+        if key in overflow:
+            overflow.move_to_end(key)
+        overflow[key] = node
+        while len(overflow) > LOOKUP_OVERFLOW_MAX:
+            overflow.popitem(last=False)
+
+    def _drop_active_peer(self, peer: DHTPeer) -> None:
+        key = (peer.endpoint.ip, peer.endpoint.port)
+        self.peers.pop(key, None)
+        nid = peer.node_id
+        if isinstance(nid, (bytes, bytearray)) and len(nid) == 20:
+            nid_b = bytes(nid)
+            if self._peers_by_node_id.get(nid_b) is peer:
+                self._peers_by_node_id.pop(nid_b, None)
+            self._lookup_overflow.pop(nid_b, None)
+
     def add_peer(
         self,
         node_id: bytes | None,
@@ -4184,6 +4373,10 @@ class DHTNode:
             self._peers_dirty = False
         if not hasattr(self, "_routing_add_reject_count"):
             self._routing_add_reject_count = 0
+        if not hasattr(self, "_peers_by_node_id"):
+            self._peers_by_node_id = {}
+        if not hasattr(self, "_lookup_overflow"):
+            self._lookup_overflow = OrderedDict()
 
         with self._peers_lock:
             return self._add_peer_locked(
@@ -4200,28 +4393,36 @@ class DHTNode:
             )
 
     def _evict_peer_for_cap_locked(self) -> None:
-        """Drop the least useful contact so ``self.peers`` stays bounded."""
+        """Drop a non-routing contact so ``self.peers`` stays at ``MAX_PEER_TABLE``.
+
+        Routing-table members are never removed. Membership is the live
+        K-bucket endpoint, not the ``in_routing_table`` flag (that flag can
+        stay set after ``remove_node``). If every contact is in a bucket, the
+        insert may exceed the cap. Among the rest, prefer an empty RPC queue,
+        then no node id, then the oldest ``last_seen``.
+        """
         if len(self.peers) < MAX_PEER_TABLE:
             return
-        # Contacts without a node id go first, oldest insertion first. The
-        # dict keeps insertion order, so the common case stops early.
-        victim = next((p for p in self.peers.values() if not p.node_id), None)
-        if victim is None:
-            # Never evict a routing-table member: an unsolicited flood must
-            # not be able to drain the table. The routing table holds at most
-            # 2 * 256 * K entries, well under MAX_PEER_TABLE, so a candidate
-            # outside it always exists.
-            in_table: set[tuple[bytes, str, int]] = set()
-            for rt in (self.routing_table.v4, self.routing_table.v6):
-                for bucket in rt.buckets:
-                    for n in bucket.nodes:
-                        in_table.add((n.node_id, n.endpoint.ip, n.endpoint.port))
-            candidates = [p for p in self.peers.values() if (p.node_id, p.endpoint.ip, p.endpoint.port) not in in_table]
-            if not candidates:
-                return
-            victim = min(candidates, key=lambda peer: float(peer.last_seen or 0.0))
-        key = (victim.endpoint.ip, victim.endpoint.port)
-        self.peers.pop(key, None)
+        in_table: set[tuple[str, int]] = set()
+        for rt in (self.routing_table.v4, self.routing_table.v6):
+            for bucket in rt.buckets:
+                for n in bucket.nodes:
+                    ep = n.endpoint
+                    if ep is not None:
+                        in_table.add((ep.ip, ep.port))
+        candidates = [p for p in self.peers.values() if (p.endpoint.ip, p.endpoint.port) not in in_table]
+        if not candidates:
+            return
+
+        def _rank(peer: DHTPeer) -> tuple:
+            return (
+                0 if not getattr(peer, "queue", None) else 1,
+                0 if not peer.node_id else 1,
+                float(getattr(peer, "last_seen", 0.0) or 0.0),
+            )
+
+        victim = min(candidates, key=_rank)
+        self._drop_active_peer(victim)
         self._peers_dirty = True
 
     def _add_peer_locked(
@@ -4260,13 +4461,18 @@ class DHTNode:
                     last_contacted=time.time(),
                 )
                 added_rt = self.routing_table.add_node(bucket_node)
+                self._index_peer_node_id(ex)
                 if added_rt:
+                    ex.in_routing_table = True
+                    self._lookup_overflow.pop(bytes(node_id), None)
                     logger.debug(
                         "Updated peer %s:%d with node_id and added to routing table",
                         ip,
                         port,
                     )
                 else:
+                    ex.in_routing_table = False
+                    self._remember_lookup_overflow(bucket_node)
                     self._routing_add_reject_count += 1
             # Preserve legacy behavior: return None for duplicate add attempts.
             return None
@@ -4303,6 +4509,7 @@ class DHTNode:
             except Exception:
                 pass
         self.peers[peer_key] = peer
+        self._index_peer_node_id(peer)
         self._peers_dirty = True
 
         # Also add to routing table if we have a node_id
@@ -4323,18 +4530,22 @@ class DHTNode:
             )
             added_rt = self.routing_table.add_node(bucket_node)
             if added_rt:
+                peer.in_routing_table = True
+                self._lookup_overflow.pop(bytes(node_id), None)
                 logger.debug(
                     "Added node %s to routing table (address family: %s)",
                     binascii.b2a_hex(node_id).decode("ascii"),
                     "IPv6" if is_ipv6 else "IPv4",
                 )
             else:
+                peer.in_routing_table = False
+                self._remember_lookup_overflow(bucket_node)
                 self._routing_add_reject_count += 1
                 c = self._routing_add_reject_count
                 if c <= 5 or c % 256 == 0:
                     logger.debug(
                         "Routing table rejected node %s at %s:%d (reject #%d); "
-                        "peer remains in self.peers for iterative queries",
+                        "peer remains in the bounded lookup overflow",
                         binascii.b2a_hex(node_id).decode("ascii")[:16],
                         ip,
                         port,
@@ -4358,10 +4569,23 @@ class DHTNode:
                 return p
         nid = getattr(node, "node_id", None)
         if isinstance(nid, (bytes, bytearray)) and len(nid) == 20:
+            index = getattr(self, "_peers_by_node_id", None)
+            if isinstance(index, dict):
+                found = index.get(bytes(nid))
+                if found is not None:
+                    return found
             for p in list(self.peers.values()):
                 if p.node_id == nid:
                     return p
         return None
+
+    def _k_width(self) -> int:
+        """Lookup width. ``__new__`` test nodes fall back to the module ``K``."""
+        width = getattr(self, "k", K)
+        try:
+            return max(1, int(width))
+        except (TypeError, ValueError):
+            return int(K)
 
     def iter_query_candidates(
         self,
@@ -4370,11 +4594,11 @@ class DHTNode:
         *,
         endpoint_family: bool | None = None,
     ) -> list[BucketNode]:
-        """Closest known nodes for *target_id*, merging routing tables + ``self.peers``.
+        """Closest known nodes for *target_id* from the K-buckets.
 
-        Peers discovered on the wire but not inserted into the K-bucket routing
-        table are still included (deduped by ``node_id``, XOR-distance tie-break;
-        routing-table entries win over peer-only on ties).
+        Node IDs the routing table refused are merged from a bounded overflow
+        (``LOOKUP_OVERFLOW_MAX``), not by scanning ``self.peers``. Routing-table
+        entries win XOR-distance ties.
 
         Parameters
         ----------
@@ -4388,7 +4612,7 @@ class DHTNode:
         if len(target_id) != 20:
             raise ValueError("target_id must be 20 bytes")
 
-        scan_rt = max(64, max_nodes * 8, K * 4)
+        scan_rt = max(64, max_nodes * 8, int(getattr(self, "k", K)) * 4)
 
         best: dict[bytes, tuple[BucketNode, int, bool]] = {}
 
@@ -4412,21 +4636,10 @@ class DHTNode:
         for n in self.routing_table.v6.get_closest_nodes(target_id, scan_rt):
             _consider(n, True)
 
-        for p in list(self.peers.values()):
-            pid = p.node_id
-            if not pid or len(pid) != 20:
-                continue
-            pst = getattr(p, "persisted_rt_status", None)
-            st = pst if pst in (NodeStatus.GOOD, NodeStatus.QUESTIONABLE, NodeStatus.BAD) else NodeStatus.GOOD
-            _consider(
-                BucketNode(
-                    node_id=pid,
-                    endpoint=p.endpoint,
-                    status=st,
-                    last_contacted=time.time(),
-                ),
-                False,
-            )
+        overflow = getattr(self, "_lookup_overflow", None)
+        if overflow:
+            for bn in list(overflow.values()):
+                _consider(bn, False)
 
         ordered = sorted(best.values(), key=lambda t: t[1])
         out = [t[0] for t in ordered]
@@ -4731,7 +4944,7 @@ class DHTNode:
             "Starting iterative find_node search for target: %s",
             binascii.b2a_hex(target_id).decode("ascii"),
         )
-        closest_nodes = list(self.iter_query_candidates(target_id, K))
+        closest_nodes = list(self.iter_query_candidates(target_id, self._k_width()))
         logger.debug(
             "Initial closest nodes: %d, current peer count: %d",
             len(closest_nodes),
@@ -4763,7 +4976,7 @@ class DHTNode:
                 self._wait_for_network(0.1)
 
             # Get closer nodes from responses
-            closer = self.iter_query_candidates(target_id, K)
+            closer = self.iter_query_candidates(target_id, self._k_width())
             if not closer or all(n.node_id in queried for n in closer):
                 logger.debug(
                     "Iterative search complete after %d queries. Queried %d nodes.",
@@ -4798,7 +5011,7 @@ class DHTNode:
             "Starting async iterative find_node for target: %s",
             binascii.b2a_hex(target_id).decode("ascii"),
         )
-        closest_nodes = list(self.iter_query_candidates(target_id, K))
+        closest_nodes = list(self.iter_query_candidates(target_id, self._k_width()))
         queried: set[bytes] = set()
 
         query_count = 0
@@ -4825,7 +5038,7 @@ class DHTNode:
                 peer.find_node(target_id)
                 await asyncio.sleep(sleep_interval)
 
-            closer = self.iter_query_candidates(target_id, K)
+            closer = self.iter_query_candidates(target_id, self._k_width())
             if not closer or all(n.node_id in queried for n in closer):
                 logger.debug(
                     "Async iterative search stopping after %d queries, %d node ids queried",
@@ -4958,7 +5171,7 @@ class DHTNode:
             return self.peer_store.get_peers(info_hash)
 
         if nodes is None:
-            nodes = self.iter_query_candidates(info_hash, K)
+            nodes = self.iter_query_candidates(info_hash, self._k_width())
 
         if not nodes:
             logger.debug("iterative_get_peers: no nodes to query")
@@ -5005,7 +5218,7 @@ class DHTNode:
         self._wait_for_network(0.5)
 
         # Get updated closest nodes for next iteration
-        closer_nodes = self.iter_query_candidates(info_hash, K)
+        closer_nodes = self.iter_query_candidates(info_hash, self._k_width())
         closer_nodes = [n for n in closer_nodes if n.node_id not in queried]
 
         if closer_nodes:
@@ -5019,37 +5232,32 @@ class DHTNode:
 
         return self.peer_store.get_peers(info_hash)
 
-    def sample_infohashes(self, target: DHTPeer | None = None) -> list[bytes]:
+    def sample_infohashes(self, target: DHTPeer | None = None) -> bool:
         """Request a sample of infohashes from a DHT node (BEP 51).
 
         Respects the ``interval`` field returned by a previous response for the
-        same peer endpoint — the query is silently skipped if the interval has
-        not yet elapsed.
+        same peer endpoint — the query is skipped if the interval has not yet
+        elapsed. Infohashes from the response are stored by
+        ``_process_sample_infohashes_response``.
 
         Parameters
         ----------
         target : DHTPeer, optional
-            The peer to query. Uses closest nodes if not provided.
+            The peer to query. Uses the closest routing-table node if omitted.
 
         Returns
         -------
-        list[bytes]
-            Always returns an empty list; infohashes are processed asynchronously
-            in ``_process_sample_infohashes_response``.
+        bool
+            True when a query was sent. False when skipped or the send failed.
         """
         if target is None:
-            # Query closest nodes
-            closest = self.routing_table.v4.get_closest_nodes(self.node_id, K)
+            closest = self.routing_table.v4.get_closest_nodes(self.node_id, self._k_width())
             if not closest:
-                return []
-            target_node = closest[0]
-            for p in list(self.peers.values()):
-                if p.node_id == target_node.node_id:
-                    target = p
-                    break
+                return False
+            target = self.peer_for_bucket_node(closest[0])
 
         if target is None:
-            return []
+            return False
 
         # BEP 51: honour the interval from the last response for this endpoint
         key = (target.endpoint.ip, target.endpoint.port)
@@ -5060,15 +5268,17 @@ class DHTNode:
                 key,
                 next_allowed - time.time(),
             )
-            return []
+            return False
 
         try:
             target.sample_infohashes()
         except Exception:
-            pass
+            return False
 
-        # Infohashes are processed in _process_sample_infohashes_response
-        return []
+        # Provisional gap so a poll loop does not re-query this endpoint before
+        # the response records the peer's own interval (which overwrites this).
+        self._sample_next_at[key] = time.time() + 30.0
+        return True
 
     async def async_get_peers(
         self,
@@ -5151,7 +5361,7 @@ class DHTNode:
                 info_hash=info_hash,
                 queried_v4=queried_v4,
                 queried_v6=queried_v6,
-                max_inflight=GET_PEERS_SCRAPE_MAX_INFLIGHT,
+                max_inflight=self.scrape_max_inflight,
             )
             sent_v4 += scrape_sent_v4
             sent_v6 += scrape_sent_v6

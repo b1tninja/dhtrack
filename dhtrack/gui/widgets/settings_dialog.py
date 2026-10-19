@@ -984,8 +984,8 @@ class SettingsDialog(QDialog):
             form,
             "peers_file",
             "Peers file path",
-            "Path to the persisted peers.dat (relative to working directory).",
-            placeholder="peers.dat",
+            "Path to the persisted peers.dat. Leave empty for the default beside settings.json.",
+            placeholder="(default: …/peers.dat next to GUI config)",
             restart=True,
         )
         self._add_str_row(

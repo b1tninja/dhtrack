@@ -45,5 +45,5 @@ def setup_logging(level: int = logging.WARNING) -> None:
     root.addHandler(handler)
 
 
-# Configure on import so logging works out of the box
-setup_logging()
+# Logging is configured by the CLI and GUI. Importing the package must not
+# pin the ``dhtrack`` logger at WARNING, or ``-v`` cannot enable DEBUG.
