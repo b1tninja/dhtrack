@@ -346,8 +346,10 @@ def _apply_dht_module_globals(settings: GuiSettings) -> None:
 
     Lookup, timeout, pending-cap, scrape and bootstrap settings live on the
     node (:meth:`DHTNode.apply_runtime_settings`). Token and secret timing
-    are read from module constants by ``TokenSecret``, so they are still set
-    here, along with the remaining preferences-dialog knobs.
+    are read from module constants by ``TokenSecret``, and the warmup and
+    peers.dat bootstrap limits are read when those run, so they are set here.
+    ``MTU``, ``REPLACEMENT_TIMEOUT`` and ``CONTACT_REFRESH_INTERVAL`` are set
+    too but nothing in ``dhtrack.dht`` reads them yet.
     """
     g = [
         ("WARMUP_PING_QPS", settings.dht_warmup_ping_qps),

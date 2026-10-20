@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 
 from dhtrack.cli import main, setup_logging
 from dhtrack.dht import TIMEOUT, DHTNode
@@ -150,5 +151,25 @@ def test_send_does_not_count_as_heard_from() -> None:
         peer.last_seen = 5.0
         peer.write(b"d1:y1:qe")
         assert peer.last_seen == 5.0
+    finally:
+        node.close()
+
+
+def test_bootstrap_and_warmup_limits_apply_at_call_time(monkeypatch) -> None:
+    import asyncio
+
+    import dhtrack.dht as dht_module
+    from dhtrack.settings import apply_to_runtime
+
+    monkeypatch.setattr(dht_module, "BOOTSTRAP_MAX_PEERS_FILE_TARGETS", dht_module.BOOTSTRAP_MAX_PEERS_FILE_TARGETS)
+    monkeypatch.setattr(dht_module, "WARMUP_PING_LIMIT", dht_module.WARMUP_PING_LIMIT)
+    apply_to_runtime(GuiSettings(bootstrap_max_peers_file_targets=0, dht_warmup_ping_limit=0))
+    node = DHTNode(node_id=b"\x01" * 20, bind_addr=("127.0.0.1", 0), persist_node_identity=False)
+    try:
+        node.add_peer(b"\x22" * 20, "192.0.2.90", 6881)
+        targets: list[tuple[str, int]] = []
+        assert node._append_peers_dat_bootstrap_targets(targets, socket.AF_INET) == 0
+        assert targets == []
+        assert asyncio.run(node.warmup_persisted_peers()) == 0
     finally:
         node.close()

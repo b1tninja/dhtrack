@@ -3289,16 +3289,22 @@ class DHTNode:
     async def warmup_persisted_peers(
         self,
         *,
-        limit: int = WARMUP_PING_LIMIT,
-        qps: float = WARMUP_PING_QPS,
+        limit: int | None = None,
+        qps: float | None = None,
     ) -> int:
         """Ping a bounded subset of loaded peers at startup.
 
         This is intentionally rate-limited to avoid query storms. It improves
         bootstrap behavior after restarts by refreshing previously known routers.
+        ``limit`` and ``qps`` default to ``WARMUP_PING_LIMIT`` / ``WARMUP_PING_QPS``
+        read at call time, so the preferences dialog can change them.
 
         Returns the number of ping queries sent.
         """
+        if limit is None:
+            limit = WARMUP_PING_LIMIT
+        if qps is None:
+            qps = WARMUP_PING_QPS
         if limit <= 0:
             return 0
         if qps <= 0:
@@ -3927,14 +3933,17 @@ class DHTNode:
         all_addresses: list[tuple[str, int]],
         address_family: int,
         *,
-        limit: int = BOOTSTRAP_MAX_PEERS_FILE_TARGETS,
+        limit: int | None = None,
     ) -> int:
         """Extend bootstrap address list with DHT routers from peers.dat (`self.peers`).
 
         load_peers() only registers contacts; unless we enqueue them alongside
         ``DEFAULT_BOOTSTRAP_NODES``, we never send opening ``find_node`` probes
-        to refresh routing state.
+        to refresh routing state. ``limit`` defaults to
+        ``BOOTSTRAP_MAX_PEERS_FILE_TARGETS`` read at call time.
         """
+        if limit is None:
+            limit = BOOTSTRAP_MAX_PEERS_FILE_TARGETS
         if limit <= 0:
             return 0
 
