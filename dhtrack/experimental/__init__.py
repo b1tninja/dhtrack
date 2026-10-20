@@ -4,7 +4,9 @@ These modules are suggestions for discussion. They are not part of the stable
 dhtrack API, and importing them does not change DHT, tracker, or GUI behavior.
 
 See ``docs/proposals/`` for the use case, the fit with the existing
-architecture, and the limitations of each prototype.
+architecture, and the limitations of each prototype. The draft MCP server
+is ``python -m dhtrack.experimental.mcp``; it is documented in
+``docs/proposals/mcp.md`` and is not imported from this package.
 """
 
 from __future__ import annotations

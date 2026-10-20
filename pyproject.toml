@@ -30,6 +30,9 @@ dependencies = []
 [project.optional-dependencies]
 gui = ["PyQt6>=6.6"]
 mongo = ["pymongo>=4.0"]
+# Official MCP Python SDK. Kept out of the core install so dhtrack stays stdlib-only.
+# mcp 2 renamed FastMCP to MCPServer; the extra tracks that major version.
+mcp = ["mcp>=2.0,<3"]
 test = [
     "pytest>=7.0",
     "pytest-cov>=4.0",

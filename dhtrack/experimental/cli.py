@@ -3,10 +3,14 @@
 EXPERIMENTAL PROPOSAL — not part of the stable dhtrack API.
 Run ``python -m dhtrack.experimental --help``.
 
-The subcommands read and write files. They do not join the DHT or contact a
-tracker. That keeps the prototypes runnable in tests and makes the intended
-automation obvious: a scheduler, cron job, or future DHT hook supplies the
-inputs these commands already know how to score and store.
+``catalog-round``, ``watch-observe``, and ``analyze-peers`` read and write
+files. They do not join the DHT or contact a tracker.
+
+The MCP-shaped verbs (``session``, ``catalog``, ``swarm``, ``peer``,
+``send``, ``node``, ``serve``) call the same handlers as the experimental
+MCP server. ``send`` and ``node start`` return a plan unless ``--confirm``
+is passed. Only a confirmed node start binds a socket, and it dials bootstrap
+routers only when ``--bootstrap`` is present.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from dhtrack.experimental.infohash_catalog import (
     loads_reply_map,
     run_sample_round,
 )
+from dhtrack.experimental.mcp.cli import MCP_COMMANDS, add_mcp_subparsers, run_mcp_command
 from dhtrack.experimental.peer_analytics import FINDING_FIELDS, GeoLookup, PeerRecord, analyze_peers
 from dhtrack.experimental.peers import PeerTableRow, parse_peer_table
 from dhtrack.experimental.persist import (
@@ -63,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
     try:
+        if command in MCP_COMMANDS:
+            return run_mcp_command(args)
         if command == "catalog-round":
             return _catalog_round(args)
         if command == "watch-observe":
@@ -82,10 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="dhtrack.experimental",
         description=(
             "EXPERIMENTAL proposals for headless DHT measurement. "
-            "Not a stable interface. These commands do not open the network."
+            "Not a stable interface. catalog-round, watch-observe, and analyze-peers "
+            "do not open the network. send and node start do nothing until --confirm."
         ),
     )
     subparsers = parser.add_subparsers(dest="command")
+    add_mcp_subparsers(subparsers)
 
     catalog = subparsers.add_parser(
         "catalog-round",
