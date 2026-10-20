@@ -10,6 +10,7 @@ unless ``confirm`` is true. ``write_`` refuses to replace a file unless
 
 from __future__ import annotations
 
+import ipaddress
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -32,6 +33,10 @@ from dhtrack.experimental.swarm_watch import (
     TrackerSnapshot,
     WatchThresholds,
 )
+
+# Upper bound on any list or map an agent passes in (peers, endpoints,
+# replies, geo labels). Paging bounds the output; this bounds the work.
+MAX_INPUT_ITEMS = 20000
 
 HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {}
 
@@ -321,6 +326,7 @@ def dhtrack_send_catalog_sample_round(
         return dry_run(plan)
     transport = _sample_transport
     if transport is None and replies is not None:
+        _cap(replies, "replies")
         try:
             transport = MapTransport(loads_reply_map(replies))
         except (TypeError, ValueError) as exc:
@@ -505,12 +511,13 @@ def dhtrack_node_status() -> dict[str, Any]:
 def dhtrack_node_start(
     bootstrap: list[dict[str, Any]] | None = None,
     port: int = 0,
-    bind_host: str = "0.0.0.0",
+    bind_host: str = "127.0.0.1",
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Plan a UDP bind. confirm=true binds. Routers are contacted only when bootstrap is passed.
 
-    The public DHT bootstrap list is not used implicitly.
+    The public DHT bootstrap list is not used implicitly. The default bind is
+    loopback; pass bind_host='0.0.0.0' to accept inbound DHT traffic.
     Example: dhtrack_node_start(port=0, confirm=false).
     """
     routers = _bootstrap(bootstrap)
@@ -525,8 +532,16 @@ def dhtrack_node_start(
         "bootstrap": [{"ip": ip, "port": item_port} for ip, item_port in routers],
         "outbound": bool(routers),
         "binds_udp": True,
+        "accepts_inbound": not _is_loopback(bind_host),
         "default_bootstrap": False,
-        "note": "No bootstrap list means the bind does not dial DHT routers.",
+        "note": (
+            "No bootstrap list means the bind does not dial DHT routers. "
+            + (
+                "Loopback bind: only this machine can reach the node."
+                if _is_loopback(bind_host)
+                else f"Bound on {bind_host}: remote DHT nodes can query it and it will answer."
+            )
+        ),
     }
     if not confirm:
         payload = dry_run(plan)
@@ -568,12 +583,12 @@ def dhtrack_send_get_peers(
     }
     if not confirm:
         return dry_run(plan)
-    rows = controller.get_peers(raw_hash)
+    rows, sent = controller.get_peers(raw_hash)
     _store_runtime_peers(session_id, raw_hash.hex(), rows)
     window = page([_echo_peer(row) for row in rows], limit, offset)
     return {
         "confirmed": True,
-        "sent": True,
+        "sent": sent,
         "infohash": raw_hash.hex(),
         "total": window["total"],
         "limit": window["limit"],
@@ -610,7 +625,7 @@ def dhtrack_send_sample_infohashes(confirm: bool = False, session_id: str | None
         session = _session(session_id)
         session.mark_sample(time.time())
         session.flush()
-    return {"confirmed": True, "sent": True, **result}
+    return {"confirmed": True, **result, "sent": bool(result.get("sent", True))}
 
 
 def _session(session_id: str | None) -> Session:
@@ -681,9 +696,27 @@ def _sections(sections: list[str] | str | None, valid: tuple[str, ...], default:
     return list(dict.fromkeys(wanted))
 
 
+def _is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host.strip()).is_loopback
+    except ValueError:
+        return host.strip().lower() == "localhost"
+
+
+def _cap(items: Any, label: str, limit: int = MAX_INPUT_ITEMS) -> None:
+    """Refuse oversized agent input before any parsing or analysis runs."""
+    if isinstance(items, (list, dict)) and len(items) > limit:
+        raise ToolError(
+            f"{label} has {len(items)} entries; the limit is {limit}",
+            code="input_too_large",
+            hint="Split the input across calls, or use the experimental CLI on a file.",
+        )
+
+
 def _endpoints(payload: object) -> list[tuple[str, int]]:
     if not isinstance(payload, list) or not payload:
         raise ToolError("endpoints must be a non-empty list of {ip, port}", code="invalid_argument")
+    _cap(payload, "endpoints")
     found: list[tuple[str, int]] = []
     for index, item in enumerate(payload):
         if not isinstance(item, dict):
@@ -700,6 +733,7 @@ def _bootstrap(items: object) -> list[tuple[str, int]]:
         return []
     if not isinstance(items, list):
         raise ToolError("bootstrap must be a list of {host, port}", code="invalid_argument")
+    _cap(items, "bootstrap", 64)
     found: list[tuple[str, int]] = []
     for index, item in enumerate(items):
         if not isinstance(item, dict):
@@ -713,6 +747,7 @@ def _bootstrap(items: object) -> list[tuple[str, int]]:
 
 
 def _peer_rows(payload: object) -> list[PeerTableRow]:
+    _cap(payload, "peers")
     try:
         return parse_peer_table(payload)
     except ValueError as exc:
@@ -800,6 +835,7 @@ def _geo(labels: dict[str, str] | None) -> Any:
         return None
     if not isinstance(labels, dict):
         raise ToolError("geo_labels must be an object of ip -> label", code="invalid_argument")
+    _cap(labels, "geo_labels")
     cleaned: dict[str, str] = {}
     for key, value in labels.items():
         if not isinstance(key, str) or not isinstance(value, str):

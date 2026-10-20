@@ -34,10 +34,14 @@ class NodeRuntime(Protocol):
         """Current bind state. Must not send a query."""
 
     def get_peers(self, info_hash: bytes) -> list[dict[str, Any]]:
-        """One iterative lookup. Each row may include ``node_id`` bytes."""
+        """One iterative lookup. Each row may include ``node_id`` bytes.
+
+        A runtime may set ``last_lookup_sent`` to False when the lookup had
+        nobody to query; callers treat a missing attribute as True.
+        """
 
     def sample_infohashes(self) -> dict[str, Any]:
-        """One BEP 51 query. No follow-up loop."""
+        """One BEP 51 query. No follow-up loop. May include ``sent`` (default True)."""
 
 
 def stopped_status() -> dict[str, Any]:
@@ -70,6 +74,7 @@ class LiveNodeRuntime:
         self._port: int | None = None
         self._bootstrap: list[tuple[str, int]] = []
         self._outbound = False
+        self.last_lookup_sent = False
 
     def start(self, *, port: int, bootstrap: list[tuple[str, int]], bind_host: str) -> dict[str, Any]:
         if self._node is not None:
@@ -152,30 +157,41 @@ class LiveNodeRuntime:
 
     def get_peers(self, info_hash: bytes) -> list[dict[str, Any]]:
         node = self._require()
+        # With an empty routing table the lookup queries nobody; say so
+        # rather than report a send that never happened.
+        table = getattr(node, "routing_table", None)
+        if table is None:
+            self.last_lookup_sent = True
+        else:
+            self.last_lookup_sent = any(b.nodes for rt in (table.v4, table.v6) for b in rt.buckets)
         rows: list[dict[str, Any]] = []
         for peer in node.iterative_get_peers(info_hash):
             node_id = getattr(peer, "node_id", None)
+            is_seed = getattr(peer, "is_seed", None)
             rows.append(
                 {
                     "ip": peer.ip,
                     "port": int(peer.port),
                     "node_id": node_id if isinstance(node_id, bytes) else None,
-                    "is_seeder": None,
+                    "is_seeder": is_seed if isinstance(is_seed, bool) else None,
                 }
             )
         return rows
 
     def sample_infohashes(self) -> dict[str, Any]:
         node = self._require()
-        returned = node.sample_infohashes()
-        count = len(returned) if isinstance(returned, list) else 0
+        # DHTNode.sample_infohashes returns True when a query went out, and
+        # False when it was skipped (interval not elapsed, no routing node)
+        # or the send failed. Samples arrive later through the response path.
+        sent = node.sample_infohashes()
         return {
             "calls": 1,
-            "returned_infohashes": count,
+            "sent": bool(sent) if isinstance(sent, bool) else True,
+            "returned_infohashes": 0,
             "respects_interval": True,
             "autonomous_loop": False,
             "note": (
-                "DHTNode.sample_infohashes sends at most one query and returns []. "
+                "DHTNode.sample_infohashes sends at most one query; sent is False when it was skipped. "
                 "The node itself skips the send when the peer's BEP 51 interval has not elapsed. "
                 "Replies are not ingested here; pass captured replies to "
                 "dhtrack_send_catalog_sample_round."
@@ -228,6 +244,7 @@ class NodeController:
     def __init__(self, factory: Callable[[], NodeRuntime] | None = None) -> None:
         self._factory: Callable[[], NodeRuntime] = factory or LiveNodeRuntime
         self._runtime: NodeRuntime | None = None
+        self._starting = False
         self._lock = threading.Lock()
 
     def set_factory(self, factory: Callable[[], NodeRuntime]) -> None:
@@ -248,16 +265,21 @@ class NodeController:
 
     def start(self, *, port: int, bootstrap: list[tuple[str, int]], bind_host: str) -> dict[str, Any]:
         with self._lock:
-            if self._runtime is not None:
+            # _starting reserves the slot while the bind runs outside the
+            # lock, so two concurrent starts cannot both bind and orphan one.
+            if self._runtime is not None or self._starting:
                 raise ToolError(
                     "node already running",
                     code="node_already_running",
                     hint="Call dhtrack_node_stop before starting another one.",
                 )
+            self._starting = True
             runtime = self._factory()
         try:
             status = runtime.start(port=port, bootstrap=bootstrap, bind_host=bind_host)
         except Exception:
+            with self._lock:
+                self._starting = False
             try:
                 runtime.stop()
             except Exception:
@@ -265,6 +287,7 @@ class NodeController:
             raise
         with self._lock:
             self._runtime = runtime
+            self._starting = False
         return status
 
     def stop(self) -> dict[str, Any]:
@@ -275,9 +298,11 @@ class NodeController:
             return stopped_status()
         return runtime.stop()
 
-    def get_peers(self, info_hash: bytes) -> list[dict[str, Any]]:
+    def get_peers(self, info_hash: bytes) -> tuple[list[dict[str, Any]], bool]:
+        """Rows from one lookup, and whether it actually queried anyone."""
         runtime = self._require()
-        return runtime.get_peers(info_hash)
+        rows = runtime.get_peers(info_hash)
+        return rows, bool(getattr(runtime, "last_lookup_sent", True))
 
     def sample_infohashes(self) -> dict[str, Any]:
         runtime = self._require()

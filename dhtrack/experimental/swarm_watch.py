@@ -411,7 +411,10 @@ class SwarmWatch:
         """Restore spike baselines from a state file. Missing file is a no-op."""
         if not path.exists():
             return
-        raw = load_json(path)
+        self.load_state(load_json(path))
+
+    def load_state(self, raw: object) -> None:
+        """Restore spike baselines and firing alerts from :meth:`to_dict` output."""
         if not isinstance(raw, dict):
             raise ValueError("watch state must be an object")
         if raw.get("version") != WATCH_VERSION:

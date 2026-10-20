@@ -571,3 +571,148 @@ def test_output_path_refuses_an_existing_different_file(tmp_path) -> None:
     opened = call_tool("dhtrack_session_open", {"path": str(source), "output_path": str(copied)})
     assert opened["durable"] is True
     assert copied.exists()
+
+
+# --- review follow-ups --------------------------------------------------------
+
+
+@pytest.fixture
+def write_root(tmp_path) -> Any:
+    from dhtrack.experimental.mcp.gates import set_write_root
+
+    root = set_write_root(tmp_path)
+    yield root
+    set_write_root(None)
+
+
+def test_writes_are_confined_to_the_root(write_root) -> None:
+    outside = write_root.parent / "escape.json"
+    for target in (str(outside), "../escape.json"):
+        refused = call_tool("dhtrack_write_peer_report", {"output_path": target, "peers": _peers()})
+        assert refused["code"] == "path_outside_root"
+    assert not outside.exists()
+    done = call_tool("dhtrack_write_peer_report", {"output_path": "sub/report.json", "peers": _peers()})
+    assert done["path"] == str(write_root / "sub" / "report.json")
+    refused = call_tool("dhtrack_session_open", {"path": str(outside.with_suffix(".sqlite"))})
+    assert refused["code"] == "path_outside_root"
+
+
+def test_session_open_refuses_empty_files_duplicates_and_stray_sources(tmp_path) -> None:
+    empty = tmp_path / "placeholder.lock"
+    empty.write_bytes(b"")
+    assert call_tool("dhtrack_session_open", {"path": str(empty)})["code"] == "invalid_session_file"
+    assert empty.read_bytes() == b""
+    missing = tmp_path / "new" / "a.sqlite"
+    copy = tmp_path / "b.sqlite"
+    refused = call_tool("dhtrack_session_open", {"path": str(missing), "output_path": str(copy)})
+    assert refused["code"] == "invalid_session_file"
+    assert not missing.exists() and not missing.parent.exists() and not copy.exists()
+    first = call_tool("dhtrack_session_open", {"path": str(tmp_path / "s.sqlite")})
+    again = call_tool("dhtrack_session_open", {"path": str(tmp_path / "s.sqlite")})
+    assert again["code"] == "session_already_open"
+    assert first["session_id"] in again["hint"]
+
+
+def test_session_survives_tool_calls_on_different_threads(tmp_path) -> None:
+    import threading
+
+    from dhtrack.experimental.mcp.server import _wrap
+    from dhtrack.experimental.mcp.service import HANDLERS
+
+    opened = json.loads(_wrap(HANDLERS["dhtrack_session_open"])(path=str(tmp_path / "t.sqlite")))
+    result: dict[str, Any] = {}
+
+    def observe() -> None:
+        result["out"] = json.loads(
+            _wrap(HANDLERS["dhtrack_swarm_observe"])(infohash=INFOHASH, peers=_peers(), session_id=opened["session_id"])
+        )
+
+    worker = threading.Thread(target=observe)
+    worker.start()
+    worker.join()
+    assert "error" not in result["out"], result["out"]
+    assert result["out"]["session_id"] == opened["session_id"]
+
+
+def test_concurrent_starts_bind_once() -> None:
+    import threading
+
+    gate = threading.Event()
+    starts: list[int] = []
+
+    class SlowRuntime(FakeRuntime):
+        def start(self, **kwargs: Any) -> dict[str, Any]:
+            starts.append(1)
+            gate.wait(timeout=5)
+            return super().start(**kwargs)
+
+    install_node_runtime(SlowRuntime())
+    results: list[dict[str, Any]] = []
+    first = threading.Thread(target=lambda: results.append(call_tool("dhtrack_node_start", {"confirm": True})))
+    first.start()
+    while not starts:
+        pass
+    second = call_tool("dhtrack_node_start", {"confirm": True})
+    gate.set()
+    first.join()
+    assert second["code"] == "node_already_running"
+    assert results[0]["started"] is True
+    assert len(starts) == 1
+
+
+def test_node_start_defaults_to_loopback_and_flags_inbound() -> None:
+    plan = call_tool("dhtrack_node_start", {})
+    assert plan["plan"]["bind_host"] == "127.0.0.1"
+    assert plan["plan"]["accepts_inbound"] is False
+    public = call_tool("dhtrack_node_start", {"bind_host": "0.0.0.0"})
+    assert public["plan"]["accepts_inbound"] is True
+    assert "answer" in public["plan"]["note"]
+
+
+def test_live_runtime_reports_skipped_sends_and_seeders(monkeypatch) -> None:
+    class StoredPeer:
+        ip = "198.51.100.9"
+        port = 6881
+        node_id = None
+        is_seed = True
+
+    class Table:
+        buckets: list[Any] = []
+
+    class FakeNode:
+        def __init__(self, **kwargs: Any) -> None:
+            self.node_id = b"\x22" * 20
+            self.sock = None
+            self.routing_table = type("RT", (), {"v4": Table(), "v6": Table()})()
+
+        async def start(self) -> None:
+            return None
+
+        async def close_async(self) -> None:
+            return None
+
+        def sample_infohashes(self, target: Any = None) -> bool:
+            return False
+
+        def iterative_get_peers(self, info_hash: bytes, **kwargs: Any) -> list[Any]:
+            return [StoredPeer()]
+
+    monkeypatch.setattr("dhtrack.dht.DHTNode", FakeNode)
+    runtime = LiveNodeRuntime()
+    install_node_runtime(runtime)
+    try:
+        call_tool("dhtrack_node_start", {"confirm": True})
+        sampled = call_tool("dhtrack_send_sample_infohashes", {"confirm": True})
+        assert sampled["sent"] is False
+        peers = call_tool("dhtrack_send_get_peers", {"infohash": INFOHASH, "confirm": True})
+        assert peers["sent"] is False
+        assert peers["peers"][0]["is_seeder"] is True
+    finally:
+        call_tool("dhtrack_node_stop")
+
+
+def test_oversized_agent_input_is_refused() -> None:
+    from dhtrack.experimental.mcp.service import MAX_INPUT_ITEMS
+
+    huge = [{"ip": "203.0.113.1", "port": 1}] * (MAX_INPUT_ITEMS + 1)
+    assert call_tool("dhtrack_peer_report", {"peers": huge})["code"] == "input_too_large"

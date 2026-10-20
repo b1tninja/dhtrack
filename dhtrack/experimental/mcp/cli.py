@@ -122,7 +122,9 @@ def add_mcp_subparsers(subparsers: argparse._SubParsersAction) -> None:
     node_nouns.add_parser("status", help="dhtrack_node_status")
     start = node_nouns.add_parser("start", help="dhtrack_node_start")
     start.add_argument("--port", type=int, default=0)
-    start.add_argument("--bind-host", default="0.0.0.0")
+    start.add_argument(
+        "--bind-host", default="127.0.0.1", help="Default is loopback; 0.0.0.0 accepts inbound DHT traffic"
+    )
     start.add_argument("--bootstrap", nargs=2, action="append", metavar=("HOST", "PORT"))
     start.add_argument("--confirm", action="store_true")
     node_nouns.add_parser("stop", help="dhtrack_node_stop")

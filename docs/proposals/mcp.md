@@ -53,11 +53,15 @@ The handlers call the prototypes that already landed on master. They do not reim
 
 ## Confirm and write gates
 
-`dhtrack_node_start` without `confirm=true` returns the bind plan: host, port, and the bootstrap list you passed. `default_bootstrap` is false. Omitting `bootstrap` means the confirmed start binds a UDP port and does not call `DHTNode.bootstrap`, so the public router list in `DEFAULT_BOOTSTRAP_NODES` is not contacted. Passing `bootstrap` is the only way that call dials out.
+`dhtrack_node_start` without `confirm=true` returns the bind plan: host, port, and the bootstrap list you passed. `default_bootstrap` is false. Omitting `bootstrap` means the confirmed start binds a UDP port and does not call `DHTNode.bootstrap`, so the public router list in `DEFAULT_BOOTSTRAP_NODES` is not contacted. Passing `bootstrap` is the only way that call dials out. The default `bind_host` is `127.0.0.1`; the plan's `accepts_inbound` is true for any non-loopback bind, because the node then answers remote DHT queries.
 
 `dhtrack_send_get_peers` and `dhtrack_send_sample_infohashes` without `confirm=true` return a plan and do not touch the node. With `confirm=true` they require a node that is already running; they do not start one. Each call is a single lookup. There is no follow-up loop. The node still enforces the BEP 51 interval inside `sample_infohashes`.
 
 `dhtrack_write_catalog_snapshot`, `dhtrack_write_swarm_alerts`, and `dhtrack_write_peer_report` leave an existing file untouched unless `overwrite=true`. The error code is `output_exists`.
+
+When run as the MCP server, every file a tool writes or opens (write targets and session sqlite files) must resolve under one directory: `DHTRACK_MCP_ROOT` if set, otherwise the directory the server was started in. Relative paths are taken from there, and anything outside is refused with `path_outside_root`. The CLI has no such limit, since a person types its paths.
+
+Tool calls run one at a time (the SDK runs sync tools on worker threads), so session sqlite connections and the node controller are never used concurrently. Agent-supplied lists and maps are capped at 20000 entries (`input_too_large`), and at most 32 sessions can be open at once. A session file cannot be opened twice.
 
 Tool results page peer lists and findings (default 50, cap 200). Peer ids and node ids in those results are an 8-hex prefix. The session sqlite and a `write_` file keep the full values.
 

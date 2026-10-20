@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import tempfile
 from pathlib import Path
 from typing import Any
 
 from dhtrack.experimental.infohash_catalog import CatalogState
 from dhtrack.experimental.mcp.errors import ToolError
+from dhtrack.experimental.mcp.gates import confine
 from dhtrack.experimental.persist import expect_int, expect_number
 from dhtrack.experimental.swarm_watch import Alert, SwarmWatch, WatchThresholds
 
@@ -25,6 +25,9 @@ SESSION_KIND = "dhtrack.experimental.mcp.session"
 SESSION_VERSION = 1
 MAX_STORED_PEERS = 500
 MAX_STORED_ALERTS = 1000
+# Each open session holds a sqlite connection (a file descriptor for a file
+# session); an agent looping session_open must not exhaust them.
+MAX_OPEN_SESSIONS = 32
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -54,13 +57,16 @@ def _dumps(payload: object) -> str:
 
 
 def _connect(location: str) -> sqlite3.Connection:
-    connection = sqlite3.connect(location)
+    # The MCP server runs tools on worker threads but serializes every call
+    # (server._TOOL_LOCK), so a connection may be used from any one thread
+    # at a time.
+    connection = sqlite3.connect(location, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     return connection
 
 
 class Session:
-    """One open index. Not thread-safe; the MCP server calls it from one task."""
+    """One open index. Not thread-safe; the MCP server runs one tool call at a time."""
 
     def __init__(
         self,
@@ -226,6 +232,13 @@ class Registry:
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
+    def find_path(self, path: str) -> Session | None:
+        """The open session backed by ``path``, if any."""
+        for session in self._sessions.values():
+            if session.path == path:
+                return session
+        return None
+
     def pop(self, session_id: str) -> Session | None:
         return self._sessions.pop(session_id, None)
 
@@ -255,6 +268,23 @@ def open_session(*, path: str | None = None, output_path: str | None = None) -> 
     """
     source = _resolve_optional(path, "path")
     sink = _resolve_optional(output_path, "output_path")
+    if len(registry.values()) >= MAX_OPEN_SESSIONS:
+        raise ToolError(
+            f"too many open sessions (limit {MAX_OPEN_SESSIONS})",
+            code="too_many_sessions",
+            hint="Close one with dhtrack_session_close, or reuse an open session_id.",
+        )
+    # Two Session objects on one file would each flush their own in-memory
+    # catalog and watch state over the other's.
+    for candidate in (source, sink):
+        if candidate is not None:
+            already = registry.find_path(str(candidate))
+            if already is not None:
+                raise ToolError(
+                    f"session file is already open as {already.id}: {candidate}",
+                    code="session_already_open",
+                    hint=f"Pass session_id={already.id!r}, or close it first.",
+                )
     created = False
     if source is None and sink is None:
         connection = _connect(":memory:")
@@ -262,6 +292,12 @@ def open_session(*, path: str | None = None, output_path: str | None = None) -> 
         location = None
         created = True
     elif source is not None and sink is not None and source != sink:
+        if not source.exists():
+            raise ToolError(
+                f"path does not exist: {source}",
+                code="invalid_session_file",
+                hint="path= copies an existing session into output_path. Omit path to start a new one there.",
+            )
         if sink.exists():
             raise ToolError(
                 f"output_path already exists: {sink}",
@@ -290,15 +326,23 @@ def open_session(*, path: str | None = None, output_path: str | None = None) -> 
 def _resolve_optional(value: str | None, label: str) -> Path | None:
     if value is None or not str(value).strip():
         return None
-    path = Path(value).expanduser().resolve()
+    path = confine(Path(value).expanduser(), label).resolve()
     if path.exists() and path.is_dir():
         raise ToolError(f"{label} is a directory: {path}", code="invalid_session_file", hint="Pass a sqlite file path.")
     return path
 
 
 def _open_file(path: Path) -> tuple[sqlite3.Connection, bool]:
+    if path.exists() and path.stat().st_size == 0:
+        # Not something this server wrote: refuse rather than turn an
+        # unrelated empty file (a lock file, a placeholder) into a database.
+        raise ToolError(
+            f"session file exists but is empty: {path}",
+            code="invalid_session_file",
+            hint="Pass a new path, or a session previously written by dhtrack_session_open.",
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
-    created = not path.exists() or path.stat().st_size == 0
+    created = not path.exists()
     try:
         connection = _connect(str(path))
         _initialize(connection, created=created or not _has_tables(connection))
@@ -367,14 +411,8 @@ def _load_models(connection: sqlite3.Connection) -> tuple[CatalogState, SwarmWat
 
 
 def _load_watch(watch: SwarmWatch, payload: object) -> None:
-    """Restore spike baselines through :meth:`SwarmWatch.load_latest`."""
-    with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False) as handle:
-        json.dump(payload, handle)
-        name = handle.name
-    try:
-        watch.load_latest(Path(name))
-    finally:
-        Path(name).unlink(missing_ok=True)
+    """Restore spike baselines and firing alerts from a stored watch state."""
+    watch.load_state(payload)
 
 
 def _meta(connection: sqlite3.Connection, key: str) -> str | None:

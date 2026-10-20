@@ -11,12 +11,56 @@ Names tell the effect, matching hardly's authoring rule:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 from dhtrack.experimental.mcp.errors import ToolError
 
 CONFIRM_HINT = "Nothing was sent. Tell the person what will happen, then repeat the same call with confirm=true."
+
+
+# Set by the MCP server. When set, every file a tool writes or opens must
+# resolve inside it, so an agent (or text injected into its context) cannot
+# aim a write at ~/.bashrc or an autostart directory. The CLI leaves it unset:
+# there a person types the path.
+_write_root: Path | None = None
+
+WRITE_ROOT_ENV = "DHTRACK_MCP_ROOT"
+
+
+def set_write_root(root: str | os.PathLike[str] | None) -> Path | None:
+    """Confine tool file access to ``root`` (``None`` lifts the limit). Returns the resolved root."""
+    global _write_root
+    _write_root = None if root is None else Path(root).expanduser().resolve()
+    return _write_root
+
+
+def write_root() -> Path | None:
+    """The directory tool file access is confined to, if any."""
+    return _write_root
+
+
+def confine(path: Path, label: str) -> Path:
+    """Resolve ``path`` and refuse it when it falls outside the write root.
+
+    Relative paths are taken relative to the root, so ``report.json`` lands
+    inside it rather than in whatever the process working directory is.
+    """
+    root = _write_root
+    if root is None:
+        return path
+    candidate = path if path.is_absolute() else root / path
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise ToolError(
+            f"{label} is outside the allowed directory {root}: {resolved}",
+            code="path_outside_root",
+            hint=f"Pass a path under {root}. The server's operator sets it with {WRITE_ROOT_ENV}.",
+        ) from None
+    return resolved
 
 
 def dry_run(plan: dict[str, Any]) -> dict[str, Any]:
@@ -32,7 +76,7 @@ def prepare_write(output_path: str | None, overwrite: bool) -> Path:
             code="missing_argument",
             hint="write_ tools never choose a path. Pass output_path=<file>.",
         )
-    path = Path(output_path).expanduser()
+    path = confine(Path(output_path).expanduser(), "output_path")
     if path.exists() and path.is_dir():
         raise ToolError(
             f"output_path is a directory: {path}",

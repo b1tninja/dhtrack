@@ -15,10 +15,14 @@ from __future__ import annotations
 
 import functools
 import json
+import os
+import sqlite3
+import threading
 from typing import Any
 
 from dhtrack.experimental.mcp.capabilities import SURFACE_VERSION, TOOLS
 from dhtrack.experimental.mcp.errors import ToolError
+from dhtrack.experimental.mcp.gates import WRITE_ROOT_ENV, set_write_root
 from dhtrack.experimental.mcp.service import HANDLERS
 
 INSTRUCTIONS = """\
@@ -53,15 +57,24 @@ def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, indent=2, sort_keys=True, default=str)
 
 
+# MCPServer runs sync tools on anyio worker threads, so two calls can overlap
+# and land on different threads. Sessions, the session registry, and the node
+# controller are single-threaded state, so tool calls run one at a time.
+_TOOL_LOCK = threading.Lock()
+
+
 def _wrap(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
-            return _json(fn(*args, **kwargs))
+            with _TOOL_LOCK:
+                return _json(fn(*args, **kwargs))
         except ToolError as exc:
             return _json(exc.to_dict())
         except (OSError, ValueError, KeyError) as exc:
             return _json({"error": str(exc), "code": "invalid_argument"})
+        except sqlite3.Error as exc:
+            return _json({"error": str(exc), "code": "session_storage_error"})
 
     return wrapper
 
@@ -87,4 +100,7 @@ def serve(transport: str = "stdio") -> None:
     """Block, speaking MCP on stdio."""
     if transport != "stdio":
         raise ToolError(f"unsupported transport {transport!r}", code="invalid_argument", hint="Use stdio.")
+    # Tool file access stays under one directory: the operator's choice, or
+    # the directory the server was launched from.
+    set_write_root(os.environ.get(WRITE_ROOT_ENV) or os.getcwd())
     build_server().run(transport="stdio")
